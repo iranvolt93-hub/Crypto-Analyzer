@@ -522,7 +522,7 @@ async def do_analysis(update, symbol):
                 [InlineKeyboardButton("🔄 تحلیل مجدد", callback_data=f"an:{symbol}")],
                 [InlineKeyboardButton("➖ حذف از واچ‌لیست", callback_data=f"rm:{symbol}")],
                 [InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")]
-            ])
+            ]))
     except Exception as e:
         log.exception("analysis error")
         await q.edit_message_text(
