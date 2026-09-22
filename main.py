@@ -107,7 +107,7 @@ def ensure_user(tg_user):
     now = datetime.now(timezone.utc).isoformat()
     con.execute("""
       INSERT INTO users(user_id,username,first_name,created_at)
-      VALUES(?,?,?,?,?)
+      VALUES(?,?,?,?)
       ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
       first_name=excluded.first_name,is_active=1
     """, (tg_user.id, tg_user.username or "", tg_user.first_name or "", now))
