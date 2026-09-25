@@ -1,59 +1,47 @@
-import os, sqlite3, logging, asyncio, re
+import os
+import re
+import sqlite3
+import logging
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
 import numpy as np
 import pandas as pd
-
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 
 # ============================================================
-# CONFIG
+# CONFIG — simple Railway variables
 # ============================================================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "crypto_bot.db")
-
-COINGECKO = "https://api.coingecko.com/api/v3"
-YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X"
-GOLD18_URL = os.getenv(
-    "GOLD18_URL", "https://www.tgju.org/profile/geram18"
-)
-
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
-MAX_WATCHLIST = int(os.getenv("MAX_WATCHLIST", "100"))
-ALERT_SECONDS = int(os.getenv("ALERT_SECONDS", "900"))
-
-ADMIN_IDS = {
-    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-}
+DB_PATH = os.getenv("DB_PATH", "crypto_bot.db").strip() or "crypto_bot.db"
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "").strip()
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "").strip().lstrip("@")
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
+ALERT_SECONDS = int(os.getenv("ALERT_SECONDS", "900"))
+
+COINGECKO = "https://api.coingecko.com/api/v3"
+YAHOO_XAU = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X"
+GOLD18_URL = os.getenv("GOLD18_URL", "https://www.tgju.org/profile/geram18")
 
 PLANS = {
-    "30": {"days": 30, "price": 200000, "title": "۱ ماهه"},
-    "90": {"days": 90, "price": 350000, "title": "۳ ماهه"},
-    "180": {"days": 180, "price": 500000, "title": "۶ ماهه"},
+    "30": (30, 200000, "۱ ماهه"),
+    "90": (90, 350000, "۳ ماهه"),
+    "180": (180, 500000, "۶ ماهه"),
 }
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-log = logging.getLogger("crypto-analyzer")
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("crypto-analyzer-v5")
 
 # ============================================================
-# DATABASE
+# DATABASE — additive / upgrade safe
 # ============================================================
-def db():
+def conn():
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
@@ -61,46 +49,45 @@ def db():
     return c
 
 
-def col_exists(c, table, col):
-    return any(x["name"] == col for x in
-               c.execute(f"PRAGMA table_info({table})").fetchall())
+def now():
+    return datetime.now(timezone.utc)
+
+
+def iso(dt):
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 def init_db():
-    c = db()
+    c = conn()
     c.executescript("""
     CREATE TABLE IF NOT EXISTS users(
         user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        created_at TEXT,
+        username TEXT DEFAULT '',
+        first_name TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
         is_blocked INTEGER DEFAULT 0,
         last_seen_at TEXT
     );
-
     CREATE TABLE IF NOT EXISTS watchlist(
         user_id INTEGER NOT NULL,
-        coin_id TEXT NOT NULL,
+        asset_key TEXT NOT NULL,
         symbol TEXT NOT NULL,
         name TEXT NOT NULL,
-        asset_type TEXT DEFAULT 'crypto',
-        added_at TEXT NOT NULL,
-        PRIMARY KEY(user_id, coin_id)
+        asset_type TEXT NOT NULL DEFAULT 'crypto',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(user_id, asset_key)
     );
-
     CREATE TABLE IF NOT EXISTS settings(
         user_id INTEGER PRIMARY KEY,
         alerts_enabled INTEGER DEFAULT 0
     );
-
     CREATE TABLE IF NOT EXISTS alert_state(
-        user_id INTEGER,
-        coin_id TEXT,
-        last_signal TEXT,
+        user_id INTEGER NOT NULL,
+        asset_key TEXT NOT NULL,
+        last_signal TEXT DEFAULT '',
         updated_at TEXT,
-        PRIMARY KEY(user_id, coin_id)
+        PRIMARY KEY(user_id, asset_key)
     );
-
     CREATE TABLE IF NOT EXISTS subscriptions(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -115,20 +102,18 @@ def init_db():
         payment_request_id INTEGER,
         created_at TEXT NOT NULL
     );
-
     CREATE TABLE IF NOT EXISTS payment_requests(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
         plan_code TEXT NOT NULL,
         amount INTEGER NOT NULL,
         receipt_file_id TEXT,
-        receipt_type TEXT,
+        receipt_type TEXT DEFAULT 'photo',
         status TEXT NOT NULL DEFAULT 'pending',
         admin_note TEXT DEFAULT '',
         created_at TEXT NOT NULL,
         reviewed_at TEXT
     );
-
     CREATE TABLE IF NOT EXISTS admin_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         admin_id INTEGER NOT NULL,
@@ -137,1863 +122,525 @@ def init_db():
         details TEXT DEFAULT '',
         created_at TEXT NOT NULL
     );
-
-    CREATE INDEX IF NOT EXISTS idx_sub_user_end
-      ON subscriptions(user_id, ends_at);
-
-    CREATE INDEX IF NOT EXISTS idx_payment_status
-      ON payment_requests(status);
+    CREATE INDEX IF NOT EXISTS idx_sub_user_end ON subscriptions(user_id, ends_at);
+    CREATE INDEX IF NOT EXISTS idx_pay_status ON payment_requests(status);
     """)
-
-    # Additive migrations: never delete old data.
-    if not col_exists(c, "watchlist", "asset_type"):
-        c.execute(
-            "ALTER TABLE watchlist ADD COLUMN asset_type TEXT DEFAULT 'crypto'"
-        )
-    if not col_exists(c, "users", "is_blocked"):
-        c.execute(
-            "ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0"
-        )
-    if not col_exists(c, "users", "last_seen_at"):
-        c.execute(
-            "ALTER TABLE users ADD COLUMN last_seen_at TEXT"
-        )
-
-    c.commit()
-    c.close()
-
-
-def now():
-    return datetime.now(timezone.utc)
+    # Safe migration from V4 watchlist schema (user_id, coin_id, symbol, name, asset_type, added_at).
+    cols = {r[1] for r in c.execute("PRAGMA table_info(watchlist)")}
+    if "coin_id" in cols and "asset_key" not in cols:
+        c.execute("ALTER TABLE watchlist RENAME TO watchlist_v4_old")
+        c.execute("""CREATE TABLE watchlist(
+            user_id INTEGER NOT NULL, asset_key TEXT NOT NULL, symbol TEXT NOT NULL,
+            name TEXT NOT NULL, asset_type TEXT NOT NULL DEFAULT 'crypto',
+            created_at TEXT NOT NULL, PRIMARY KEY(user_id, asset_key)
+        )""")
+        oldrows=c.execute("SELECT user_id,coin_id,symbol,name,COALESCE(asset_type,'crypto'),COALESCE(added_at,?) FROM watchlist_v4_old",(iso(now()),)).fetchall()
+        c.executemany("INSERT OR IGNORE INTO watchlist(user_id,asset_key,symbol,name,asset_type,created_at) VALUES(?,?,?,?,?,?)", oldrows)
+        c.execute("DROP TABLE watchlist_v4_old")
+    else:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(watchlist)")}
+        if "created_at" not in cols:
+            c.execute("ALTER TABLE watchlist ADD COLUMN created_at TEXT")
+            c.execute("UPDATE watchlist SET created_at=? WHERE created_at IS NULL", (iso(now()),))
+    c.commit(); c.close()
 
 
-def iso(dt):
-    return dt.astimezone(timezone.utc).isoformat()
+def ensure_user(user):
+    c = conn(); t = iso(now())
+    c.execute("""INSERT INTO users(user_id,username,first_name,created_at,is_blocked,last_seen_at)
+                 VALUES(?,?,?,?,0,?)
+                 ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
+                 first_name=excluded.first_name,last_seen_at=excluded.last_seen_at""",
+              (user.id, user.username or "", user.first_name or "", t, t))
+    c.execute("INSERT INTO settings(user_id,alerts_enabled) VALUES(?,0) ON CONFLICT(user_id) DO NOTHING", (user.id,))
+    c.commit(); c.close()
 
 
-def ensure_user(u):
-    c = db()
-    n = iso(now())
-    c.execute("""
-        INSERT INTO users(
-            user_id,username,first_name,created_at,is_blocked,last_seen_at
-        )
-        VALUES(?,?,?,?,0,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name,
-            last_seen_at=excluded.last_seen_at
-    """, (u.id, u.username or "", u.first_name or "", n, n))
-    c.execute("""
-        INSERT INTO settings(user_id,alerts_enabled)
-        VALUES(?,0)
-        ON CONFLICT(user_id) DO NOTHING
-    """, (u.id,))
-    c.commit()
-    c.close()
+def is_admin(uid): return uid in ADMIN_IDS
 
 
-def is_admin(uid):
-    return uid in ADMIN_IDS
+def is_blocked(uid):
+    c=conn(); r=c.execute("SELECT is_blocked FROM users WHERE user_id=?",(uid,)).fetchone(); c.close()
+    return bool(r and r[0])
 
 
-def blocked(uid):
-    c = db()
-    r = c.execute(
-        "SELECT is_blocked FROM users WHERE user_id=?", (uid,)
-    ).fetchone()
-    c.close()
-    return bool(r and r["is_blocked"])
-
-
-def admin_log(admin, action, target=None, details=""):
-    c = db()
-    c.execute("""
-        INSERT INTO admin_log(
-            admin_id,action,target_user_id,details,created_at
-        ) VALUES(?,?,?,?,?)
-    """, (admin, action, target, details, iso(now())))
-    c.commit()
-    c.close()
-
+def log_admin(admin_id, action, target=None, details=""):
+    c=conn(); c.execute("INSERT INTO admin_log(admin_id,action,target_user_id,details,created_at) VALUES(?,?,?,?,?)",
+                       (admin_id,action,target,details,iso(now()))); c.commit(); c.close()
 
 # ============================================================
-# SUBSCRIPTIONS
+# SUBSCRIPTIONS / PAYMENTS
 # ============================================================
 def active_sub(uid):
-    c = db()
-    r = c.execute("""
-        SELECT * FROM subscriptions
-        WHERE user_id=? AND status='active' AND ends_at>?
-        ORDER BY ends_at DESC LIMIT 1
-    """, (uid, iso(now()))).fetchone()
-    c.close()
-    return r
+    c=conn(); r=c.execute("""SELECT * FROM subscriptions WHERE user_id=? AND status='active' AND ends_at>?
+                             ORDER BY ends_at DESC LIMIT 1""",(uid,iso(now()))).fetchone(); c.close(); return r
 
 
-def has_sub(uid):
-    return active_sub(uid) is not None
+def has_sub(uid): return active_sub(uid) is not None
 
 
 def sub_text(uid):
-    s = active_sub(uid)
-    if not s:
-        return (
-            "📅 <b>وضعیت اشتراک</b>\n\n"
-            "❌ اشتراک فعال ندارید."
-        )
-    end = datetime.fromisoformat(s["ends_at"])
-    days = max(0, (end - now()).days)
-    return (
-        "📅 <b>وضعیت اشتراک</b>\n\n"
-        f"📦 پلن: <b>{s['plan_title']}</b>\n"
-        f"📆 شروع: {s['starts_at'][:10]}\n"
-        f"⏳ پایان: {s['ends_at'][:10]}\n"
-        f"🔹 حدود {days} روز باقی‌مانده"
-    )
+    s=active_sub(uid)
+    if not s: return "❌ اشتراک فعال ندارید."
+    end=datetime.fromisoformat(s["ends_at"])
+    days=max(0,(end-now()).days)
+    return f"✅ اشتراک {s['plan_title']}\n📅 پایان: {end.strftime('%Y-%m-%d %H:%M')} UTC\n⏳ باقی‌مانده: {days} روز"
 
 
-def extend_sub(uid, code, amount=None, source="manual",
-               payment_request_id=None, admin_id=None):
-    p = PLANS[code]
-    c = db()
-    t = now()
-
-    r = c.execute("""
-        SELECT ends_at FROM subscriptions
-        WHERE user_id=? AND status='active' AND ends_at>?
-        ORDER BY ends_at DESC LIMIT 1
-    """, (uid, iso(t))).fetchone()
-
-    start = datetime.fromisoformat(r["ends_at"]) if r else t
-    end = start + timedelta(days=p["days"])
-
-    c.execute("""
-        INSERT INTO subscriptions(
-            user_id,plan_code,plan_title,days,amount,
-            starts_at,ends_at,status,source,payment_request_id,created_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        uid, code, p["title"], p["days"],
-        amount if amount is not None else p["price"],
-        iso(start), iso(end), "active", source,
-        payment_request_id, iso(t)
-    ))
-    sid = c.lastrowid
-
-    if payment_request_id:
-        c.execute("""
-            UPDATE payment_requests
-            SET status='approved',reviewed_at=?
-            WHERE id=? AND status='pending'
-        """, (iso(t), payment_request_id))
-
-    c.commit()
-    c.close()
-
-    if admin_id:
-        admin_log(
-            admin_id, "approve_subscription", uid,
-            f"plan={code},subscription_id={sid}"
-        )
-    return end
-
+def add_subscription(uid, code, payment_id=None, source="manual"):
+    days, amount, title=PLANS[code]
+    c=conn(); current=active_sub(uid)
+    start=max(now(), datetime.fromisoformat(current["ends_at"])) if current else now()
+    end=start+timedelta(days=days)
+    c.execute("""INSERT INTO subscriptions(user_id,plan_code,plan_title,days,amount,starts_at,ends_at,status,source,payment_request_id,created_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+              (uid,code,title,days,amount,iso(start),iso(end),'active',source,payment_id,iso(now())))
+    c.commit(); c.close(); return end
 
 # ============================================================
-# MENUS
+# KEYBOARDS
 # ============================================================
-def bottom(uid):
-    rows = [
-        [KeyboardButton("📋 واچ‌لیست"), KeyboardButton("➕ افزودن ارز")],
-        [KeyboardButton("📊 تحلیل"), KeyboardButton("📡 سیگنال‌ها")],
-        [KeyboardButton("💳 خرید اشتراک"), KeyboardButton("📅 وضعیت اشتراک")],
-        [KeyboardButton("🔔 هشدار"), KeyboardButton("ℹ️ راهنما")],
+def main_kb(admin=False):
+    rows=[
+        ["➕ افزودن ارز", "📋 واچ‌لیست"],
+        ["📊 تحلیل", "📡 سیگنال‌ها"],
+        ["💳 خرید اشتراک", "📅 وضعیت اشتراک"],
+        ["🔔 هشدار", "ℹ️ راهنما"],
     ]
-    if is_admin(uid):
-        rows.append([KeyboardButton("🛠 پنل مدیریت")])
-    return ReplyKeyboardMarkup(
-        rows, resize_keyboard=True, is_persistent=True
-    )
+    if admin: rows.append(["🛠 پنل مدیریت"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
-def home():
+def admin_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 واچ‌لیست", callback_data="watch"),
-         InlineKeyboardButton("➕ افزودن ارز", callback_data="add")],
-        [InlineKeyboardButton("📊 تحلیل", callback_data="analyze"),
-         InlineKeyboardButton("📡 سیگنال‌ها", callback_data="signals")],
-        [InlineKeyboardButton("💳 خرید اشتراک", callback_data="buy"),
-         InlineKeyboardButton("📅 اشتراک", callback_data="substatus")],
-        [InlineKeyboardButton("🔔 هشدار", callback_data="alerts"),
-         InlineKeyboardButton("ℹ️ راهنما", callback_data="help")]
-    ])
-
-
-def admin_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 آمار", callback_data="adm:stats"),
-         InlineKeyboardButton("👥 کاربران", callback_data="adm:users")],
-        [InlineKeyboardButton("💳 پرداخت‌ها", callback_data="adm:payments")],
+        [InlineKeyboardButton("📊 آمار", callback_data="adm:stats"), InlineKeyboardButton("👥 کاربران", callback_data="adm:users")],
+        [InlineKeyboardButton("💳 پرداخت‌های در انتظار", callback_data="adm:payments")],
         [InlineKeyboardButton("➕ تمدید دستی", callback_data="adm:extend")],
         [InlineKeyboardButton("🚫 مسدود/رفع", callback_data="adm:block")],
         [InlineKeyboardButton("📣 پیام همگانی", callback_data="adm:broadcast")],
-        [InlineKeyboardButton("🏠 منو", callback_data="home")]
     ])
 
 
-# ============================================================
-# HTTP
-# ============================================================
-async def get_json(url, params=None):
-    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-    headers = {
-        "User-Agent": "CryptoAnalyzerBot/4.0",
-        "Accept": "application/json"
-    }
-    async with aiohttp.ClientSession(
-        timeout=timeout, headers=headers
-    ) as s:
-        async with s.get(url, params=params) as r:
-            text = await r.text()
-            if r.status != 200:
-                raise RuntimeError(f"HTTP {r.status}: {text[:120]}")
-            return await r.json()
-
-
-async def get_text(url):
-    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-    headers = {"User-Agent": "Mozilla/5.0 CryptoAnalyzerBot/4.0"}
-    async with aiohttp.ClientSession(
-        timeout=timeout, headers=headers
-    ) as s:
-        async with s.get(url) as r:
-            text = await r.text()
-            if r.status != 200:
-                raise RuntimeError(f"HTTP {r.status}")
-            return text
-
+def plans_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("۱ ماهه — ۲۰۰,۰۰۰ تومان", callback_data="plan:30")],
+        [InlineKeyboardButton("۳ ماهه — ۳۵۰,۰۰۰ تومان", callback_data="plan:90")],
+        [InlineKeyboardButton("۶ ماهه — ۵۰۰,۰۰۰ تومان", callback_data="plan:180")],
+    ])
 
 # ============================================================
-# ASSETS
+# MARKET DATA
 # ============================================================
-def normalize(x):
-    return (
-        x.strip().lower()
-        .replace(" ", "")
-        .replace("/", "")
-        .replace("-", "")
-    )
+async def get_json(session, url, params=None):
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT), headers={"User-Agent":"Mozilla/5.0"}) as r:
+            if r.status != 200: return None
+            return await r.json(content_type=None)
+    except Exception as e:
+        log.warning("HTTP %s: %s", url, e); return None
 
 
 async def search_crypto(q):
-    qn = normalize(q)
-    if qn in {"xau", "xauusd", "gold", "goldusd", "طلای جهانی"}:
-        return [{
-            "id": "xauusd",
-            "symbol": "XAU",
-            "name": "طلای جهانی",
-            "asset_type": "xau"
-        }]
-    if qn in {
-        "geram18", "gold18", "18k", "18karat",
-        "طلای18", "طلای18عیار", "طلا18"
-    }:
-        return [{
-            "id": "geram18",
-            "symbol": "18K",
-            "name": "طلای ۱۸ عیار ایران",
-            "asset_type": "gold18"
-        }]
-
-    data = await get_json(
-        COINGECKO + "/search", {"query": q.strip()}
-    )
-    coins = data.get("coins", [])
-    coins = sorted(
-        coins,
-        key=lambda x: (
-            0 if normalize(x.get("symbol", "")) == qn else 1,
-            x.get("market_cap_rank") or 999999
-        )
-    )
-    return [{
-        "id": x["id"],
-        "symbol": x.get("symbol", "").upper(),
-        "name": x.get("name", ""),
-        "asset_type": "crypto"
-    } for x in coins[:8]]
+    q=q.strip().lower().replace("usdt","").replace("/","")
+    async with aiohttp.ClientSession() as s:
+        data=await get_json(s,COINGECKO+"/search",{"query":q})
+    out=[]
+    for x in (data or {}).get("coins",[])[:10]:
+        out.append({"id":x.get("id",""),"symbol":x.get("symbol","" ).upper(),"name":x.get("name","")})
+    return out
 
 
-async def crypto_history(cid, days=120):
-    data = await get_json(
-        f"{COINGECKO}/coins/{cid}/market_chart",
-        {"vs_currency": "usd", "days": str(days), "interval": "daily"}
-    )
-    p = data.get("prices", [])
-    if len(p) < 60:
-        raise RuntimeError("داده تاریخی کافی نیست")
-    df = pd.DataFrame(p, columns=["ts", "close"])
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    return df.dropna()[["ts", "close"]]
+async def crypto_history(asset_id):
+    async with aiohttp.ClientSession() as s:
+        d=await get_json(s,COINGECKO+f"/coins/{asset_id}/market_chart",{"vs_currency":"usd","days":"90","interval":"daily"})
+    prices=(d or {}).get("prices",[])
+    if len(prices)<35: return None
+    return pd.DataFrame(prices,columns=["ts","close"])
 
 
 async def xau_history():
-    data = await get_json(
-        YAHOO_CHART,
-        {"range": "6mo", "interval": "1d"}
-    )
-    result = data["chart"]["result"][0]
-    ts = result["timestamp"]
-    close = result["indicators"]["quote"][0]["close"]
-    df = pd.DataFrame({"ts": ts, "close": close})
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    return df.dropna()
+    async with aiohttp.ClientSession() as s:
+        d=await get_json(s,YAHOO_XAU,{"range":"3mo","interval":"1d"})
+    try:
+        q=d["chart"]["result"][0]; closes=q["indicators"]["quote"][0]["close"]
+        vals=[float(x) for x in closes if x is not None]
+        if len(vals)<35:return None
+        return pd.DataFrame({"close":vals})
+    except Exception:return None
 
 
-def parse_number(s):
-    s = (
-        s.replace(",", "")
-        .replace("٬", "")
-        .replace("٫", ".")
-        .replace(" ", "")
-    )
-    persian = "۰۱۲۳۴۵۶۷۸۹"
-    arabic = "٠١٢٣٤٥٦٧٨٩"
-    for a, b in zip(persian, "0123456789"):
-        s = s.replace(a, b)
-    for a, b in zip(arabic, "0123456789"):
-        s = s.replace(a, b)
-    m = re.search(r"\d+(?:\.\d+)?", s)
-    return float(m.group()) if m else None
-
-
-async def gold18_current():
-    html = await get_text(GOLD18_URL)
-
-    # Common TGJU current-price patterns.
-    patterns = [
-        r'id=["\']l-geram18["\'][^>]*>\s*([\d,٬]+)',
-        r'id=["\']geram18["\'][^>]*>\s*([\d,٬]+)',
-        r'data-field=["\']geram18["\'][^>]*>\s*([\d,٬]+)',
-    ]
-
-    value = None
-    for pattern in patterns:
-        m = re.search(pattern, html, re.I | re.S)
+async def gold18_price():
+    async with aiohttp.ClientSession() as s:
+        try:
+            async with s.get(GOLD18_URL,timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT),headers={"User-Agent":"Mozilla/5.0"}) as r:
+                text=await r.text(errors="ignore")
+        except Exception as e:
+            log.warning("gold18: %s",e); return None
+    # TGJU pages commonly contain l-geram18 or data-field values. Pick plausible rial/toman price.
+    patterns=[r'id=["\']l-geram18["\'][^>]*>\s*([0-9,]+)',r'data-field=["\']geram18["\'][^>]*>\s*([0-9,]+)',r'id=["\']geram18["\'][^>]*>\s*([0-9,]+)']
+    for p in patterns:
+        m=re.search(p,text,re.I|re.S)
         if m:
-            value = parse_number(m.group(1))
-            break
-
-    if value is None:
-        # Fallback: look around "گرم طلای 18 عیار".
-        m = re.search(
-            r'(?:طلای ۱۸ عیار|طلای 18 عیار).*?([\d,٬]{7,})',
-            html, re.I | re.S
-        )
-        if m:
-            value = parse_number(m.group(1))
-
-    if value is None or value <= 0:
-        raise RuntimeError("قیمت طلای ۱۸ عیار پیدا نشد")
-
-    # TGJU may expose the value in rial. Convert to toman when
-    # the value is in the usual rial-sized range.
-    if value >= 100_000_000:
-        value /= 10
-
-    return value
+            raw=int(m.group(1).replace(",",""))
+            if 100_000_000<=raw<=1_000_000_000: raw//=10
+            if 1_000_000<=raw<=2_000_000_000:return raw
+    return None
 
 
 async def gold18_history():
-    # TGJU's current page is used only for the current price.
-    # We intentionally do not invent historical candles.
-    price = await gold18_current()
-    return pd.DataFrame({
-        "ts": [int(now().timestamp() * 1000)],
-        "close": [price]
-    })
+    p=await gold18_price()
+    if p is None:return None
+    # A single live quote is not enough for a technical signal; deliberately refuse fake history.
+    return None
 
+
+async def analysis_for(asset_key, asset_type, name):
+    if asset_type=="crypto":
+        df=await crypto_history(asset_key)
+    elif asset_type=="xau":
+        df=await xau_history()
+    else:
+        df=await gold18_history()
+    if df is None or len(df)<35:
+        return {"ok":False,"name":name,"reason":"داده کافی برای تحلیل مطمئن در دسترس نیست."}
+    close=df["close"].astype(float)
+    ema20=close.ewm(span=20,adjust=False).mean(); ema50=close.ewm(span=50,adjust=False).mean()
+    delta=close.diff(); gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean()
+    rs=gain/loss.replace(0,np.nan); rsi=(100-(100/(1+rs))).fillna(50)
+    ema12=close.ewm(span=12,adjust=False).mean(); ema26=close.ewm(span=26,adjust=False).mean(); macd=ema12-ema26; sig=macd.ewm(span=9,adjust=False).mean()
+    score=50.0
+    score += 15 if close.iloc[-1]>ema20.iloc[-1] else -15
+    score += 15 if ema20.iloc[-1]>ema50.iloc[-1] else -15
+    score += 12 if macd.iloc[-1]>sig.iloc[-1] else -12
+    score += max(-8,min(8,(float(rsi.iloc[-1])-50)*0.32))
+    score=max(0,min(100,score))
+    signal="BUY" if score>=62 else "SELL" if score<=38 else "WAIT"
+    strength=round(abs(score-50)*2,1)
+    probability=round(50+abs(score-50)*0.55,1)
+    ret7=(close.iloc[-1]/close.iloc[-8]-1)*100
+    ret30=(close.iloc[-1]/close.iloc[-31]-1)*100
+    return {"ok":True,"name":name,"price":float(close.iloc[-1]),"signal":signal,"score":round(score,1),"strength":strength,"probability":probability,"rsi":round(float(rsi.iloc[-1]),1),"ema20":float(ema20.iloc[-1]),"ema50":float(ema50.iloc[-1]),"ret7":ret7,"ret30":ret30}
 
 # ============================================================
-# INDICATORS / ANALYSIS
+# UI HELPERS
 # ============================================================
-def ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
+async def send_analysis(update, asset):
+    if not has_sub(update.effective_user.id):
+        await update.message.reply_text("🔒 تحلیل و سیگنال نیاز به اشتراک فعال دارد.\n\n💳 از «خرید اشتراک» استفاده کنید.", reply_markup=main_kb(is_admin(update.effective_user.id))); return
+    a=await analysis_for(asset["asset_key"],asset["asset_type"],asset["name"])
+    if not a["ok"]:
+        await update.message.reply_text(f"⚠️ {a['name']}\n{a['reason']}",reply_markup=main_kb(is_admin(update.effective_user.id))); return
+    sym=asset["symbol"]
+    await update.message.reply_text(
+        f"📊 تحلیل {a['name']} ({sym})\n\n"
+        f"💰 قیمت: {a['price']:,.4f}\n"
+        f"🎯 سیگنال: {a['signal']}\n"
+        f"💪 قدرت سیگنال: {a['strength']}٪\n"
+        f"📈 احتمال مدل: {a['probability']}٪\n\n"
+        f"RSI14: {a['rsi']}\nEMA20: {a['ema20']:,.4f}\nEMA50: {a['ema50']:,.4f}\n"
+        f"📅 تغییر ۷ روزه: {a['ret7']:+.2f}%\n📅 تغییر ۳۰ روزه: {a['ret30']:+.2f}%\n\n"
+        f"ℹ️ این خروجی تحلیل داده است و توصیه مالی شخصی نیست.", reply_markup=main_kb(is_admin(update.effective_user.id)))
+
+# ============================================================
+# COMMANDS / MAIN MESSAGES
+# ============================================================
+async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user)
+    if is_blocked(update.effective_user.id):
+        await update.effective_message.reply_text("🚫 دسترسی شما مسدود است."); return
+    await update.effective_message.reply_text("سلام 👋\nربات تحلیل بازار آماده است.\n\nاز منوی زیر انتخاب کنید:",reply_markup=main_kb(is_admin(update.effective_user.id)))
 
 
-def rsi(s, n=14):
-    d = s.diff()
-    up = d.clip(lower=0)
-    down = -d.clip(upper=0)
-    au = up.ewm(alpha=1/n, adjust=False).mean()
-    ad = down.ewm(alpha=1/n, adjust=False).mean()
-    rs = au / ad.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+async def message_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    u=update.effective_user; ensure_user(u)
+    if is_blocked(u.id): return
+    text=(update.message.text or "").strip()
+    state=context.user_data
 
+    if state.get("mode")=="search":
+        state.pop("mode",None)
+        if text in ("لغو","❌ لغو"): await update.message.reply_text("لغو شد.",reply_markup=main_kb(is_admin(u.id))); return
+        if text in ("XAU","طلا جهانی","طلای جهانی"):
+            add_asset(u.id,"xau","XAU","طلای جهانی","xau")
+            await update.message.reply_text("✅ طلای جهانی به واچ‌لیست اضافه شد.",reply_markup=main_kb(is_admin(u.id))); return
+        if text in ("طلای ۱۸ عیار","طلا ۱۸","GOLD18"):
+            add_asset(u.id,"gold18","GOLD18","طلای ۱۸ عیار","gold18")
+            await update.message.reply_text("✅ طلای ۱۸ عیار به واچ‌لیست اضافه شد.",reply_markup=main_kb(is_admin(u.id))); return
+        await update.message.reply_text("🔎 در حال جستجو...")
+        results=await search_crypto(text)
+        if not results: await update.message.reply_text("❌ ارز پیدا نشد. نماد دیگری بفرستید.",reply_markup=main_kb(is_admin(u.id))); return
+        buttons=[[InlineKeyboardButton(f"{x['symbol']} — {x['name']}",callback_data=f"add:{x['id']}:{x['symbol']}")] for x in results]
+        await update.message.reply_text("ارز موردنظر را انتخاب کنید:",reply_markup=InlineKeyboardMarkup(buttons)); return
 
-def macd(s):
-    m = ema(s, 12) - ema(s, 26)
-    sig = ema(m, 9)
-    return m, sig, m - sig
+    if state.get("mode")=="receipt":
+        if text=="❌ لغو": state.clear(); await update.message.reply_text("لغو شد.",reply_markup=main_kb(is_admin(u.id))); return
+        await update.message.reply_text("لطفاً تصویر رسید را به صورت عکس ارسال کنید."); return
 
+    if state.get("mode") in ("extend","extend_plan","block","broadcast"):
+        await admin_state_message(update,context); return
 
-def model_probability(c, signal):
-    # Simple historical directional hit-rate.
-    # It is deliberately separate from current trend strength.
-    if len(c) < 50 or signal == "WAIT":
-        return 50.0
-
-    hits = []
-    for i in range(35, len(c) - 5):
-        e20 = ema(c.iloc[:i], 20).iloc[-1]
-        e50 = ema(c.iloc[:i], 50).iloc[-1]
-        m, _, h = macd(c.iloc[:i])
-        direction = 1 if (
-            c.iloc[i-1] > e20 and e20 > e50 and h.iloc[-1] > 0
-        ) else -1
-
-        future = float(c.iloc[i+4] / c.iloc[i-1] - 1)
-        if direction == 1:
-            hits.append(future > 0)
-        else:
-            hits.append(future < 0)
-
-    if not hits:
-        return 50.0
-
-    rate = sum(hits) / len(hits)
-    return round(50 + (rate - 0.5) * 100, 1)
-
-
-def analyze(df):
-    c = df["close"].astype(float).reset_index(drop=True)
-
-    if len(c) < 40:
-        raise RuntimeError("داده تاریخی کافی نیست")
-
-    price = float(c.iloc[-1])
-    e20 = float(ema(c, 20).iloc[-1])
-    e50 = float(ema(c, 50).iloc[-1])
-    rv = float(rsi(c).iloc[-1])
-
-    ml, ms, hist = macd(c)
-    mh = float(hist.iloc[-1])
-
-    ret7 = float((c.iloc[-1] / c.iloc[-8] - 1) * 100)
-    ret30 = float((c.iloc[-1] / c.iloc[-31] - 1) * 100)
-
-    score = 50.0
-    reasons = []
-
-    if price > e20:
-        score += 10
-        reasons.append("قیمت بالای EMA20")
-    else:
-        score -= 10
-        reasons.append("قیمت زیر EMA20")
-
-    if e20 > e50:
-        score += 12
-        reasons.append("EMA20 بالای EMA50")
-    else:
-        score -= 12
-        reasons.append("EMA20 زیر EMA50")
-
-    if mh > 0:
-        score += 12
-        reasons.append("MACD مثبت")
-    else:
-        score -= 12
-        reasons.append("MACD منفی")
-
-    if 50 <= rv <= 68:
-        score += 8
-        reasons.append("RSI در محدوده مثبت")
-    elif rv > 72:
-        score -= 5
-        reasons.append("RSI داغ")
-    elif rv < 30:
-        score += 3
-        reasons.append("RSI اشباع فروش")
-    elif rv < 45:
-        score -= 6
-        reasons.append("RSI ضعیف")
-
-    if ret7 > 2:
-        score += 4
-    elif ret7 < -2:
-        score -= 4
-
-    if ret30 > 5:
-        score += 4
-    elif ret30 < -5:
-        score -= 4
-
-    score = max(0, min(100, score))
-    signal = "BUY" if score >= 62 else "SELL" if score <= 38 else "WAIT"
-
-    # Strength = current technical agreement.
-    strength = max(
-        45,
-        min(100, 50 + abs(score - 50) * 1.7)
-    )
-
-    # Probability = historical model hit-rate, not the strength score.
-    probability = model_probability(c, signal)
-
-    volatility = float(c.pct_change().rolling(14).std().iloc[-1])
-    if not np.isfinite(volatility) or volatility <= 0:
-        volatility = 0.02
-
-    move = max(price * volatility, price * 0.01)
-
-    if signal == "BUY":
-        stop = price - 1.5 * move
-        targets = [
-            price + move,
-            price + 2 * move,
-            price + 3 * move
-        ]
-    elif signal == "SELL":
-        stop = price + 1.5 * move
-        targets = [
-            price - move,
-            price - 2 * move,
-            price - 3 * move
-        ]
-    else:
-        stop = price
-        targets = [price + move, price - move]
-
-    return {
-        "price": price,
-        "ema20": e20,
-        "ema50": e50,
-        "rsi": rv,
-        "macd": mh,
-        "ret7": ret7,
-        "ret30": ret30,
-        "score": score,
-        "signal": signal,
-        "strength": strength,
-        "probability": probability,
-        "stop": stop,
-        "targets": targets,
-        "reasons": reasons
-    }
-
-
-def fp(x):
-    if x >= 1000:
-        return f"{x:,.2f}"
-    if x >= 1:
-        return f"{x:,.4f}"
-    if x >= 0.01:
-        return f"{x:,.6f}"
-    return f"{x:.8f}"
-
-
-async def asset_history(asset_type, asset_id):
-    if asset_type == "crypto":
-        return await crypto_history(asset_id)
-    if asset_type == "xau":
-        return await xau_history()
-    if asset_type == "gold18":
-        return await gold18_history()
-    raise RuntimeError("دارایی ناشناخته")
-
-
-async def analyze_asset(asset_type, asset_id):
-    df = await asset_history(asset_type, asset_id)
-    if asset_type == "gold18":
-        # One live price is not enough for a trustworthy trend signal.
-        raise RuntimeError(
-            "برای طلای ۱۸ عیار فعلاً داده تاریخی کافی برای سیگنال وجود ندارد"
-        )
-    return analyze(df)
-
+    if text=="➕ افزودن ارز":
+        state["mode"]="search"; await update.message.reply_text("نماد ارز را بفرستید.\nمثال: BTC\n\nبرای طلا: XAU یا «طلای ۱۸ عیار»",reply_markup=ReplyKeyboardMarkup([["❌ لغو"]],resize_keyboard=True)); return
+    if text=="📋 واچ‌لیست": await show_watchlist(update); return
+    if text=="📊 تحلیل": await choose_analysis(update); return
+    if text=="📡 سیگنال‌ها": await choose_analysis(update); return
+    if text=="💳 خرید اشتراک": await update.message.reply_text("پلن اشتراک را انتخاب کنید:",reply_markup=plans_kb()); return
+    if text=="📅 وضعیت اشتراک": await update.message.reply_text(sub_text(u.id),reply_markup=main_kb(is_admin(u.id))); return
+    if text=="🔔 هشدار": await toggle_alerts(update); return
+    if text=="ℹ️ راهنما": await update.message.reply_text("ℹ️ راهنما\n\n➕ ارز را به واچ‌لیست اضافه کنید.\n📊 برای تحلیل باید اشتراک فعال داشته باشید.\n💳 پرداخت به صورت دستی و با ارسال رسید انجام می‌شود.\n\n⚠️ سیگنال‌ها تضمین سود نیستند.",reply_markup=main_kb(is_admin(u.id))); return
+    if text=="🛠 پنل مدیریت":
+        if is_admin(u.id): await update.message.reply_text("🛠 پنل مدیریت",reply_markup=admin_kb())
+        else: await update.message.reply_text("⛔ دسترسی ندارید.",reply_markup=main_kb(False))
+        return
+    await update.message.reply_text("از منوی پایین انتخاب کنید.",reply_markup=main_kb(is_admin(u.id)))
 
 # ============================================================
 # WATCHLIST
 # ============================================================
-def watch(uid):
-    c = db()
-    rows = c.execute("""
-        SELECT * FROM watchlist
-        WHERE user_id=? ORDER BY added_at
-    """, (uid,)).fetchall()
-    c.close()
-    return rows
+def add_asset(uid,key,symbol,name,atype):
+    c=conn(); c.execute("INSERT OR IGNORE INTO watchlist(user_id,asset_key,symbol,name,asset_type,created_at) VALUES(?,?,?,?,?,?)",
+                       (uid,key,symbol,name,atype,iso(now()))); c.commit(); c.close()
 
+
+def get_assets(uid):
+    c=conn(); rows=c.execute("SELECT * FROM watchlist WHERE user_id=? ORDER BY created_at",(uid,)).fetchall(); c.close(); return rows
+
+
+async def show_watchlist(update):
+    rows=get_assets(update.effective_user.id)
+    if not rows: await update.message.reply_text("📋 واچ‌لیست خالی است.",reply_markup=main_kb(is_admin(update.effective_user.id))); return
+    kb=[]
+    for r in rows[:100]: kb.append([InlineKeyboardButton(f"{r['symbol']} — {r['name']}",callback_data=f"asset:{r['asset_key']}")])
+    await update.message.reply_text("📋 واچ‌لیست شما:",reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def choose_analysis(update):
+    rows=get_assets(update.effective_user.id)
+    if not rows: await update.message.reply_text("اول از «➕ افزودن ارز» یک دارایی اضافه کنید.",reply_markup=main_kb(is_admin(update.effective_user.id))); return
+    kb=[[InlineKeyboardButton(f"{r['symbol']} — {r['name']}",callback_data=f"analysis:{r['asset_key']}")] for r in rows[:50]]
+    await update.message.reply_text("دارایی برای تحلیل را انتخاب کنید:",reply_markup=InlineKeyboardMarkup(kb))
 
 # ============================================================
-# USER FLOW
+# CALLBACKS
 # ============================================================
-async def start(update, ctx):
-    ensure_user(update.effective_user)
-
-    if blocked(update.effective_user.id):
-        await update.message.reply_text("⛔ دسترسی شما مسدود است.")
-        return
-
-    await update.message.reply_text(
-        "🚀 <b>Crypto Analyzer V4</b>\n\n"
-        "کریپتو، طلای جهانی و طلای ۱۸ عیار را مدیریت کن.\n"
-        "از منوی پایین یک گزینه انتخاب کن.",
-        parse_mode="HTML",
-        reply_markup=bottom(update.effective_user.id)
-    )
-
-
-async def add_prompt(update, ctx):
-    ctx.user_data["mode"] = "add"
-    await update.message.reply_text(
-        "➕ نماد یا نام دارایی را بفرست.\n\n"
-        "مثال:\n"
-        "BTC\nZEC\nSolana\nXAU\nطلای ۱۸ عیار"
-    )
-
-
-async def search_text(update, ctx):
-    ensure_user(update.effective_user)
-
-    if blocked(update.effective_user.id):
-        await update.message.reply_text("⛔ دسترسی شما مسدود است.")
-        return
-
-    mode = ctx.user_data.get("mode")
-
-    if mode == "payment_receipt":
-        await update.message.reply_text(
-            "📎 لطفاً عکس رسید را ارسال کن."
-        )
-        return
-
-    if mode in {
-        "admin_extend_user", "admin_block_user", "admin_broadcast"
-    }:
-        await admin_text(update, ctx)
-        return
-
-    if mode != "add":
-        await update.message.reply_text(
-            "از منوی پایین یک گزینه انتخاب کن.",
-            reply_markup=bottom(update.effective_user.id)
-        )
-        return
-
+async def callback(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; uid=q.from_user.id
+    await q.answer()
+    ensure_user(q.from_user)
+    data=q.data or ""
     try:
-        results = await search_crypto(update.message.text.strip())
-        if not results:
-            await update.message.reply_text("❌ دارایی پیدا نشد.")
+        if data.startswith("add:"):
+            _,aid,sym=data.split(":",2); add_asset(uid,aid,sym,sym,"crypto")
+            await q.edit_message_text(f"✅ {sym} به واچ‌لیست اضافه شد.")
             return
-
-        ctx.user_data["results"] = {
-            str(i): x for i, x in enumerate(results)
-        }
-
-        buttons = []
-        for i, x in enumerate(results):
-            buttons.append([InlineKeyboardButton(
-                f"{x['name']} ({x['symbol']})"[:55],
-                callback_data=f"coin:{i}"
-            )])
-        buttons.append([InlineKeyboardButton(
-            "❌ لغو", callback_data="home"
-        )])
-
-        await update.message.reply_text(
-            "🔎 دارایی را انتخاب کن:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        ctx.user_data["mode"] = "select"
-
-    except Exception:
-        log.exception("search failed")
-        await update.message.reply_text(
-            "⚠️ سرویس بازار فعلاً پاسخ نمی‌دهد."
-        )
-
-
-async def select_coin(update, ctx, idx):
-    x = ctx.user_data.get("results", {}).get(str(idx))
-    if not x:
-        await update.callback_query.edit_message_text(
-            "نتیجه منقضی شده. دوباره جستجو کن.",
-            reply_markup=home()
-        )
-        return
-
-    uid = update.effective_user.id
-    c = db()
-
-    count = c.execute(
-        "SELECT COUNT(*) n FROM watchlist WHERE user_id=?",
-        (uid,)
-    ).fetchone()["n"]
-
-    if count >= MAX_WATCHLIST:
-        c.close()
-        await update.callback_query.edit_message_text(
-            f"حداکثر {MAX_WATCHLIST} دارایی مجاز است.",
-            reply_markup=home()
-        )
-        return
-
-    try:
-        c.execute("""
-            INSERT INTO watchlist(
-                user_id,coin_id,symbol,name,asset_type,added_at
-            ) VALUES(?,?,?,?,?,?)
-        """, (
-            uid, x["id"], x["symbol"], x["name"],
-            x["asset_type"], iso(now())
-        ))
-        c.commit()
-        msg = f"✅ {x['name']} ({x['symbol']}) اضافه شد."
-    except sqlite3.IntegrityError:
-        msg = f"ℹ️ {x['name']} قبلاً در واچ‌لیست است."
-    finally:
-        c.close()
-
-    ctx.user_data.clear()
-    await update.callback_query.edit_message_text(
-        msg, reply_markup=home()
-    )
-
-
-async def show_watch(update, ctx):
-    rows = watch(update.effective_user.id)
-    if not rows:
-        text = "📋 واچ‌لیست خالی است."
-    else:
-        lines = ["📋 <b>واچ‌لیست شما</b>\n"]
-        for r in rows:
-            icon = {
-                "crypto": "🪙",
-                "xau": "🥇",
-                "gold18": "🟡"
-            }.get(r["asset_type"], "•")
-            lines.append(
-                f"{icon} {r['name']} ({r['symbol']})"
-            )
-        text = "\n".join(lines)
-
-    await update.message.reply_text(
-        text, parse_mode="HTML",
-        reply_markup=bottom(update.effective_user.id)
-    )
-
-
-async def analysis_menu(update, ctx):
-    if not has_sub(update.effective_user.id):
-        await update.message.reply_text(
-            "🔒 برای تحلیل اشتراک فعال لازم است.",
-            reply_markup=bottom(update.effective_user.id)
-        )
-        return
-
-    rows = watch(update.effective_user.id)
-    if not rows:
-        await update.message.reply_text("ابتدا یک دارایی اضافه کن.")
-        return
-
-    buttons = [[InlineKeyboardButton(
-        f"{r['name']} ({r['symbol']})"[:55],
-        callback_data=f"an:{r['coin_id']}"
-    )] for r in rows]
-    buttons.append([InlineKeyboardButton(
-        "🏠 منو", callback_data="home"
-    )])
-
-    await update.message.reply_text(
-        "📊 دارایی را انتخاب کن:",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-async def do_analysis(update, ctx, cid):
-    uid = update.effective_user.id
-
-    if not has_sub(uid):
-        await update.callback_query.edit_message_text(
-            "🔒 اشتراک فعال لازم است.",
-            reply_markup=home()
-        )
-        return
-
-    row = next(
-        (r for r in watch(uid) if r["coin_id"] == cid), None
-    )
-    if not row:
-        await update.callback_query.edit_message_text(
-            "دارایی در واچ‌لیست نیست.", reply_markup=home()
-        )
-        return
-
-    await update.callback_query.edit_message_text(
-        "⏳ در حال تحلیل..."
-    )
-
-    try:
-        a = await analyze_asset(row["asset_type"], cid)
-
-        signal_text = {
-            "BUY": "🟢 خرید",
-            "SELL": "🔴 فروش",
-            "WAIT": "🟡 انتظار"
-        }[a["signal"]]
-
-        targets = "\n".join(
-            f"{i+1}) {fp(v)}"
-            for i, v in enumerate(a["targets"])
-        )
-
-        text = (
-            f"📊 <b>{row['name']} ({row['symbol']})</b>\n\n"
-            f"💰 قیمت: <code>{fp(a['price'])} USD</code>\n"
-            f"📡 سیگنال: <b>{signal_text}</b>\n\n"
-            f"💪 قدرت روند: <b>{a['strength']:.0f}%</b>\n"
-            f"🎯 احتمال مدل: <b>{a['probability']:.0f}%</b>\n\n"
-            f"RSI: <code>{a['rsi']:.1f}</code>\n"
-            f"MACD: <code>{a['macd']:.6g}</code>\n"
-            f"EMA20: <code>{fp(a['ema20'])}</code>\n"
-            f"EMA50: <code>{fp(a['ema50'])}</code>\n"
-            f"بازده 7 روزه: <code>{a['ret7']:.2f}%</code>\n"
-            f"بازده 30 روزه: <code>{a['ret30']:.2f}%</code>\n\n"
-            f"🛑 حد ضرر تحلیلی: <code>{fp(a['stop'])}</code>\n"
-            f"🎯 اهداف:\n{targets}\n\n"
-            "🧠 دلایل:\n" +
-            "\n".join("• " + x for x in a["reasons"]) +
-            "\n\n⚠️ تحلیل آماری است و تضمین سود نیست."
-        )
-
-        await update.callback_query.edit_message_text(
-            text, parse_mode="HTML", reply_markup=home()
-        )
-
+        if data.startswith("asset:"):
+            key=data.split(":",1)[1]
+            c=conn(); r=c.execute("SELECT * FROM watchlist WHERE user_id=? AND asset_key=?",(uid,key)).fetchone(); c.close()
+            if not r: await q.edit_message_text("❌ دارایی پیدا نشد."); return
+            kb=InlineKeyboardMarkup([[InlineKeyboardButton("📊 تحلیل",callback_data=f"analysis:{key}")],[InlineKeyboardButton("🗑 حذف",callback_data=f"del:{key}")]])
+            await q.edit_message_text(f"{r['symbol']} — {r['name']}",reply_markup=kb); return
+        if data.startswith("del:"):
+            key=data.split(":",1)[1]; c=conn(); c.execute("DELETE FROM watchlist WHERE user_id=? AND asset_key=?",(uid,key)); c.commit(); c.close(); await q.edit_message_text("🗑 از واچ‌لیست حذف شد."); return
+        if data.startswith("analysis:"):
+            key=data.split(":",1)[1]
+            c=conn(); r=c.execute("SELECT * FROM watchlist WHERE user_id=? AND asset_key=?",(uid,key)).fetchone(); c.close()
+            if not r: await q.edit_message_text("❌ دارایی پیدا نشد."); return
+            atype,sym,name=r['asset_type'],r['symbol'],r['name']
+            if not has_sub(uid): await q.edit_message_text("🔒 برای تحلیل اشتراک فعال لازم است."); return
+            a=await analysis_for(key,atype,name)
+            if not a["ok"]: await q.edit_message_text("⚠️ "+a["reason"]); return
+            await q.edit_message_text(f"📊 {name} ({sym})\n\n💰 قیمت: {a['price']:,.4f}\n🎯 سیگنال: {a['signal']}\n💪 قدرت سیگنال: {a['strength']}٪\n📈 احتمال مدل: {a['probability']}٪\n\nRSI14: {a['rsi']}\nEMA20: {a['ema20']:,.4f}\nEMA50: {a['ema50']:,.4f}\n۷ روز: {a['ret7']:+.2f}%\n۳۰ روز: {a['ret30']:+.2f}%")
+            return
+        if data.startswith("plan:"):
+            code=data.split(":",1)[1]
+            if code not in PLANS: return
+            days,amount,title=PLANS[code]
+            context.user_data["pending_plan"]=code
+            card=PAYMENT_CARD or "شماره کارت در Railway تنظیم نشده است"
+            await q.edit_message_text(f"💳 پلن {title}\n💰 مبلغ: {amount:,} تومان\n\nشماره کارت:\n{card}\n\nپس از پرداخت، عکس رسید را همین‌جا ارسال کنید.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📷 ارسال رسید",callback_data=f"receipt:{code}")]])); return
+        if data.startswith("receipt:"):
+            code=data.split(":",1)[1]
+            if code not in PLANS:return
+            context.user_data["mode"]="receipt"; context.user_data["pending_plan"]=code
+            await q.edit_message_text("📷 حالا عکس رسید را ارسال کنید.\nبرای لغو: «❌ لغو»")
+            return
+        if data.startswith("payok:") or data.startswith("payno:"):
+            if not is_admin(uid): await q.answer("دسترسی ندارید",show_alert=True); return
+            ok=data.startswith("payok:"); pid=int(data.split(":",1)[1]); await review_payment(q,pid,ok); return
+        if data.startswith("adm:"):
+            if not is_admin(uid): await q.answer("دسترسی ندارید ⛔",show_alert=True); return
+            action=data.split(":",1)[1]; await admin_action(q,context,action); return
     except Exception as e:
-        log.warning("analysis unavailable: %s", e)
-        await update.callback_query.edit_message_text(
-            "⚪ برای این دارایی فعلاً داده تاریخی کافی برای "
-            "صدور سیگنال معتبر وجود ندارد.",
-            reply_markup=home()
-        )
+        log.exception("callback failed: %s",data)
+        try: await q.edit_message_text("⚠️ خطای داخلی. دوباره تلاش کنید.")
+        except Exception: pass
+
+# ============================================================
+# RECEIPTS / ADMIN
+# ============================================================
+async def photo_handler(update,context):
+    u=update.effective_user; ensure_user(u)
+    if context.user_data.get("mode")!="receipt": return
+    code=context.user_data.get("pending_plan")
+    if code not in PLANS: await update.message.reply_text("پلن مشخص نیست. دوباره از خرید اشتراک شروع کنید."); context.user_data.clear(); return
+    pid=await save_payment(u.id,code,update.message.photo[-1].file_id,"photo")
+    context.user_data.clear()
+    await update.message.reply_text(f"✅ رسید ثبت شد.\n🧾 شماره درخواست: #{pid}\n\nپس از بررسی مدیر، نتیجه اعلام می‌شود.",reply_markup=main_kb(is_admin(u.id)))
+    await notify_admins(context,pid)
 
 
-async def signals(update, ctx):
-    uid = update.effective_user.id
+async def save_payment(uid,code,file_id,typ):
+    amount=PLANS[code][1]; c=conn(); cur=c.execute("INSERT INTO payment_requests(user_id,plan_code,amount,receipt_file_id,receipt_type,status,created_at) VALUES(?,?,?,?,?,?,?)",
+                         (uid,code,amount,file_id,typ,"pending",iso(now()))); pid=cur.lastrowid; c.commit(); c.close(); return pid
 
-    if not has_sub(uid):
-        await update.message.reply_text(
-            "🔒 برای سیگنال اشتراک فعال لازم است.",
-            reply_markup=bottom(uid)
-        )
-        return
 
-    rows = watch(uid)
-    if not rows:
-        await update.message.reply_text("واچ‌لیست خالی است.")
-        return
-
-    await update.message.reply_text("⏳ در حال بررسی واچ‌لیست...")
-
-    out = ["📡 <b>سیگنال‌های واچ‌لیست</b>\n"]
-
-    for r in rows:
+async def notify_admins(context,pid):
+    c=conn(); r=c.execute("""SELECT p.*,u.username,u.first_name FROM payment_requests p LEFT JOIN users u ON u.user_id=p.user_id WHERE p.id=?""",(pid,)).fetchone(); c.close()
+    if not r:return
+    for aid in ADMIN_IDS:
         try:
-            a = await analyze_asset(r["asset_type"], r["coin_id"])
-            icon = {"BUY": "🟢", "SELL": "🔴",
-                    "WAIT": "🟡"}[a["signal"]]
-            out.append(
-                f"{icon} <b>{r['symbol']}</b> — {a['signal']}\n"
-                f"   قدرت {a['strength']:.0f}% | "
-                f"احتمال مدل {a['probability']:.0f}%"
-            )
-        except Exception:
-            out.append(
-                f"⚪ <b>{r['symbol']}</b> — "
-                "داده کافی نیست"
-            )
+            text=f"💳 درخواست پرداخت #{pid}\n\n👤 {r['first_name']}\n🆔 {r['user_id']}\n💰 {r['amount']:,} تومان\n📦 پلن: {PLANS[r['plan_code']][2]}"
+            kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید",callback_data=f"payok:{pid}"),InlineKeyboardButton("❌ رد",callback_data=f"payno:{pid}")]])
+            if r["receipt_type"]=="photo": await context.bot.send_photo(aid,r["receipt_file_id"],caption=text,reply_markup=kb)
+        except Exception as e: log.warning("notify admin %s: %s",aid,e)
 
-        await asyncio.sleep(0.1)
 
-    await update.message.reply_text(
-        "\n".join(out),
-        parse_mode="HTML",
-        reply_markup=bottom(uid)
-    )
+async def review_payment(q,pid,approve):
+    c=conn(); r=c.execute("SELECT * FROM payment_requests WHERE id=?",(pid,)).fetchone()
+    if not r: c.close(); await q.edit_message_text("❌ درخواست پیدا نشد."); return
+    if r["status"]!="pending": c.close(); await q.edit_message_text(f"ℹ️ این درخواست قبلاً بررسی شده: {r['status']}"); return
+    status="approved" if approve else "rejected"
+    c.execute("UPDATE payment_requests SET status=?,reviewed_at=? WHERE id=?",(status,iso(now()),pid)); c.commit(); c.close()
+    if approve:
+        end=add_subscription(r["user_id"],r["plan_code"],pid,"manual")
+        msg=f"✅ پرداخت #{pid} تأیید شد.\nاشتراک {PLANS[r['plan_code']][2]} فعال شد.\n📅 پایان: {end.strftime('%Y-%m-%d %H:%M')} UTC"
+    else: msg=f"❌ پرداخت #{pid} رد شد.\nبرای بررسی مجدد با پشتیبانی تماس بگیرید."
+    try: await q.edit_message_reply_markup(reply_markup=None); await q.message.reply_text(""+msg)
+    except Exception: pass
+    try: await q.get_bot().send_message(r["user_id"],msg,reply_markup=main_kb(False))
+    except Exception as e: log.warning("user notify failed: %s",e)
+    log_admin(q.from_user.id,status,r["user_id"],f"payment={pid}")
 
+
+async def admin_action(q,context,action):
+    if action=="stats":
+        c=conn(); users=c.execute("SELECT COUNT(*) n FROM users").fetchone()[0]; active=c.execute("SELECT COUNT(*) n FROM subscriptions WHERE status='active' AND ends_at> ?",(iso(now()),)).fetchone()[0]; pending=c.execute("SELECT COUNT(*) n FROM payment_requests WHERE status='pending'").fetchone()[0]; c.close()
+        await q.edit_message_text(f"📊 آمار\n\n👥 کاربران: {users}\n💳 اشتراک فعال: {active}\n⏳ پرداخت در انتظار: {pending}",reply_markup=admin_kb()); return
+    if action=="users":
+        c=conn(); rows=c.execute("SELECT user_id,first_name,username,is_blocked FROM users ORDER BY last_seen_at DESC LIMIT 20").fetchall(); c.close()
+        txt="👥 آخرین کاربران:\n\n"+"\n".join(f"{r['user_id']} — {r['first_name']} {'🚫' if r['is_blocked'] else '✅'}" for r in rows) if rows else "کاربری نیست."
+        await q.edit_message_text(txt,reply_markup=admin_kb()); return
+    if action=="payments":
+        c=conn(); rows=c.execute("SELECT p.*,u.first_name FROM payment_requests p LEFT JOIN users u ON u.user_id=p.user_id WHERE p.status='pending' ORDER BY p.id DESC LIMIT 10").fetchall(); c.close()
+        if not rows: await q.edit_message_text("✅ پرداخت در انتظاری نیست.",reply_markup=admin_kb()); return
+        buttons=[[InlineKeyboardButton(f"#{r['id']} | {r['amount']:,} | {r['first_name']}",callback_data=f"pview:{r['id']}")] for r in rows]
+        await q.edit_message_text("💳 پرداخت‌های در انتظار:",reply_markup=InlineKeyboardMarkup(buttons+[[InlineKeyboardButton("🔙 پنل",callback_data="adm:home")]])); return
+    if action=="extend":
+        context.user_data["mode"]="extend"; await q.edit_message_text("🆔 شناسه کاربر را بفرستید."); return
+    if action=="block":
+        context.user_data["mode"]="block"; await q.edit_message_text("🆔 شناسه کاربر را بفرستید؛ سپس مسدود/رفع می‌کنیم."); return
+    if action=="broadcast":
+        context.user_data["mode"]="broadcast"; await q.edit_message_text("متن پیام همگانی را بفرستید."); return
+    if action=="home": await q.edit_message_text("🛠 پنل مدیریت",reply_markup=admin_kb()); return
+
+
+async def admin_state_message(update,context):
+    uid=update.effective_user.id
+    if not is_admin(uid): context.user_data.clear(); return
+    mode=context.user_data.get("mode"); text=update.message.text.strip()
+    if mode=="extend":
+        if not text.isdigit(): await update.message.reply_text("شناسه عددی بفرستید."); return
+        context.user_data["target"] = int(text); context.user_data["mode"]="extend_plan"
+        await update.message.reply_text("کد پلن را بفرستید: 30 یا 90 یا 180"); return
+    if mode=="extend_plan":
+        code=text
+        target=context.user_data.get("target")
+        if code not in PLANS: await update.message.reply_text("کد اشتباه است."); return
+        end=add_subscription(target,code,None,"admin_manual"); log_admin(uid,"manual_extend",target,code); context.user_data.clear()
+        await update.message.reply_text(f"✅ تمدید انجام شد.\n📅 پایان: {end.strftime('%Y-%m-%d %H:%M')} UTC",reply_markup=main_kb(True));
+        try: await context.bot.send_message(target,"✅ اشتراک شما توسط مدیریت تمدید شد.")
+        except Exception: pass
+        return
+    if mode=="block":
+        if not text.isdigit(): await update.message.reply_text("شناسه عددی بفرستید."); return
+        target=int(text); c=conn(); r=c.execute("SELECT is_blocked FROM users WHERE user_id=?",(target,)).fetchone()
+        if not r: c.close(); await update.message.reply_text("کاربر پیدا نشد."); return
+        new=0 if r[0] else 1; c.execute("UPDATE users SET is_blocked=? WHERE user_id=?",(new,target)); c.commit(); c.close(); log_admin(uid,"block_toggle",target,str(new)); context.user_data.clear()
+        await update.message.reply_text(("🚫 مسدود شد." if new else "✅ رفع مسدودی شد."),reply_markup=main_kb(True)); return
+    if mode=="broadcast":
+        context.user_data.clear(); c=conn(); ids=[r[0] for r in c.execute("SELECT user_id FROM users WHERE is_blocked=0").fetchall()]; c.close(); sent=0
+        for target in ids:
+            try: await context.bot.send_message(target,text); sent+=1
+            except Exception: pass
+            await asyncio.sleep(.04)
+        log_admin(uid,"broadcast",None,f"sent={sent}"); await update.message.reply_text(f"📣 ارسال شد: {sent}",reply_markup=main_kb(True))
+
+# payment pending detail callback
+async def payment_view(update,context):
+    q=update.callback_query
+    if not q.data.startswith("pview:"): return False
+    if not is_admin(q.from_user.id): await q.answer("دسترسی ندارید",show_alert=True); return True
+    pid=int(q.data.split(":",1)[1]); c=conn(); r=c.execute("SELECT p.*,u.first_name,u.username FROM payment_requests p LEFT JOIN users u ON u.user_id=p.user_id WHERE p.id=?",(pid,)).fetchone(); c.close()
+    if not r: await q.answer("پیدا نشد",show_alert=True); return True
+    if r["receipt_file_id"]:
+        caption=f"💳 درخواست #{pid}\n👤 {r['first_name']}\n🆔 {r['user_id']}\n💰 {r['amount']:,} تومان\n📦 {PLANS[r['plan_code']][2]}"
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید",callback_data=f"payok:{pid}"),InlineKeyboardButton("❌ رد",callback_data=f"payno:{pid}")]])
+        await q.message.reply_photo(r["receipt_file_id"],caption=caption,reply_markup=kb)
+    return True
 
 # ============================================================
 # ALERTS
 # ============================================================
-async def toggle_alerts(update, ctx):
-    uid = update.effective_user.id
-    c = db()
-    r = c.execute(
-        "SELECT alerts_enabled FROM settings WHERE user_id=?",
-        (uid,)
-    ).fetchone()
-    new = 0 if r and r["alerts_enabled"] else 1
-    c.execute(
-        "UPDATE settings SET alerts_enabled=? WHERE user_id=?",
-        (new, uid)
-    )
-    c.commit()
-    c.close()
-
-    await update.message.reply_text(
-        f"🔔 هشدارها: <b>{'فعال' if new else 'خاموش'}</b>\n\n"
-        "هشدار فقط هنگام تغییر سیگنال ارسال می‌شود.",
-        parse_mode="HTML",
-        reply_markup=bottom(uid)
-    )
+async def toggle_alerts(update):
+    uid=update.effective_user.id; c=conn(); r=c.execute("SELECT alerts_enabled FROM settings WHERE user_id=?",(uid,)).fetchone(); new=0 if r and r[0] else 1; c.execute("UPDATE settings SET alerts_enabled=? WHERE user_id=?",(new,uid)); c.commit(); c.close()
+    await update.message.reply_text(("🔔 هشدارها فعال شد." if new else "🔕 هشدارها غیرفعال شد."),reply_markup=main_kb(is_admin(uid)))
 
 
 async def alert_loop(app):
     while True:
         try:
-            c = db()
-            users = c.execute("""
-                SELECT user_id FROM settings
-                WHERE alerts_enabled=1
-            """).fetchall()
-            c.close()
-
-            for u in users:
-                uid = u["user_id"]
-                if not has_sub(uid) or blocked(uid):
-                    continue
-
-                for r in watch(uid):
-                    try:
-                        a = await analyze_asset(
-                            r["asset_type"], r["coin_id"]
-                        )
-                    except Exception:
-                        continue
-
-                    c = db()
-                    old = c.execute("""
-                        SELECT last_signal FROM alert_state
-                        WHERE user_id=? AND coin_id=?
-                    """, (uid, r["coin_id"])).fetchone()
-
-                    old_signal = old["last_signal"] if old else None
-
-                    c.execute("""
-                        INSERT INTO alert_state(
-                            user_id,coin_id,last_signal,updated_at
-                        ) VALUES(?,?,?,?)
-                        ON CONFLICT(user_id,coin_id) DO UPDATE SET
-                            last_signal=excluded.last_signal,
-                            updated_at=excluded.updated_at
-                    """, (
-                        uid, r["coin_id"], a["signal"], iso(now())
-                    ))
-                    c.commit()
-                    c.close()
-
-                    # Do not spam on first scan.
-                    if old_signal and old_signal != a["signal"]:
-                        icon = {
-                            "BUY": "🟢",
-                            "SELL": "🔴",
-                            "WAIT": "🟡"
-                        }[a["signal"]]
-
-                        await app.bot.send_message(
-                            chat_id=uid,
-                            text=(
-                                f"🔔 <b>تغییر سیگنال</b>\n\n"
-                                f"{r['name']} ({r['symbol']})\n"
-                                f"{icon} <b>{a['signal']}</b>\n"
-                                f"💪 قدرت: {a['strength']:.0f}%\n"
-                                f"🎯 احتمال مدل: "
-                                f"{a['probability']:.0f}%"
-                            ),
-                            parse_mode="HTML"
-                        )
-
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            log.exception("alert loop error")
-
-        await asyncio.sleep(max(120, ALERT_SECONDS))
-
+            c=conn(); users=c.execute("SELECT user_id FROM settings WHERE alerts_enabled=1").fetchall(); c.close()
+            for row in users:
+                uid=row[0]
+                if not has_sub(uid): continue
+                for asset in get_assets(uid)[:20]:
+                    a=await analysis_for(asset["asset_key"],asset["asset_type"],asset["name"])
+                    if not a.get("ok") or a["signal"]=="WAIT": continue
+                    c=conn(); old=c.execute("SELECT last_signal FROM alert_state WHERE user_id=? AND asset_key=?",(uid,asset["asset_key"])).fetchone(); prev=old[0] if old else ""
+                    if prev!=a["signal"]:
+                        c.execute("INSERT INTO alert_state(user_id,asset_key,last_signal,updated_at) VALUES(?,?,?,?) ON CONFLICT(user_id,asset_key) DO UPDATE SET last_signal=excluded.last_signal,updated_at=excluded.updated_at",(uid,asset["asset_key"],a["signal"],iso(now()))); c.commit(); c.close()
+                        try: await app.bot.send_message(uid,f"🔔 هشدار {asset['symbol']}\n🎯 {a['signal']}\n💪 قدرت: {a['strength']}٪")
+                        except Exception: pass
+        except Exception as e: log.exception("alert loop: %s",e)
+        await asyncio.sleep(ALERT_SECONDS)
 
 # ============================================================
-# PAYMENTS
+# CALLBACK DISPATCH WRAPPER
 # ============================================================
-async def buy(update, ctx):
-    buttons = [[InlineKeyboardButton(
-        f"💳 {p['title']} — {p['price']:,} تومان",
-        callback_data=f"plan:{code}"
-    )] for code, p in PLANS.items()]
-    buttons.append([InlineKeyboardButton(
-        "🏠 منو", callback_data="home"
-    )])
-
-    await update.message.reply_text(
-        "💳 <b>خرید اشتراک</b>\n\nپلن را انتخاب کن:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-async def plan_selected(update, ctx, code):
-    if code not in PLANS:
-        return
-
-    p = PLANS[code]
-    ctx.user_data["payment_plan"] = code
-    ctx.user_data["mode"] = "payment_receipt"
-
-    await update.callback_query.edit_message_text(
-        f"💳 <b>{p['title']}</b>\n"
-        f"💰 مبلغ: <b>{p['price']:,} تومان</b>\n\n"
-        f"🏦 شماره کارت:\n<code>{PAYMENT_CARD or 'تنظیم نشده'}</code>\n\n"
-        "بعد از پرداخت، عکس رسید را همین‌جا ارسال کن.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ لغو", callback_data="home")]
-        ])
-    )
-
-
-async def receipt(update, ctx):
-    uid = update.effective_user.id
-
-    if ctx.user_data.get("mode") != "payment_receipt":
-        await update.message.reply_text(
-            "ابتدا یک پلن را انتخاب کن.",
-            reply_markup=bottom(uid)
-        )
-        return
-
-    code = ctx.user_data.get("payment_plan")
-    if code not in PLANS:
-        ctx.user_data.clear()
-        await update.message.reply_text("درخواست منقضی شد.")
-        return
-
-    p = PLANS[code]
-    photo = update.message.photo[-1]
-
-    c = db()
-    cur = c.execute("""
-        INSERT INTO payment_requests(
-            user_id,plan_code,amount,receipt_file_id,receipt_type,
-            status,created_at
-        ) VALUES(?,?,?,?,?,?,?)
-    """, (
-        uid, code, p["price"], photo.file_id, "photo",
-        "pending", iso(now())
-    ))
-    rid = cur.lastrowid
-    c.commit()
-    c.close()
-
-    ctx.user_data.clear()
-
-    await update.message.reply_text(
-        f"✅ رسید دریافت شد.\nشماره درخواست: #{rid}\n"
-        "پس از بررسی مدیریت، نتیجه اعلام می‌شود.",
-        reply_markup=bottom(uid)
-    )
-
-    for admin in ADMIN_IDS:
-        try:
-            await ctx.bot.send_photo(
-                chat_id=admin,
-                photo=photo.file_id,
-                caption=(
-                    f"💳 <b>درخواست #{rid}</b>\n"
-                    f"👤 User ID: <code>{uid}</code>\n"
-                    f"👤 {update.effective_user.first_name or '-'}\n"
-                    f"📦 {p['title']}\n"
-                    f"💰 {p['price']:,} تومان"
-                ),
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "✅ تأیید", callback_data=f"payok:{rid}"
-                    ),
-                    InlineKeyboardButton(
-                        "❌ رد", callback_data=f"payno:{rid}"
-                    )
-                ]])
-            )
-        except Exception:
-            log.exception("receipt notify failed")
-
+async def callback_router(update,context):
+    if await payment_view(update,context): await update.callback_query.answer(); return
+    await callback(update,context)
 
 # ============================================================
-# ADMIN
+# APP
 # ============================================================
-async def admin_panel(update, ctx):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
-        return
-    await update.message.reply_text(
-        "🛠 <b>پنل مدیریت</b>",
-        parse_mode="HTML",
-        reply_markup=admin_menu()
-    )
+def validate_config():
+    if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+    if not ADMIN_IDS: log.warning("ADMIN_IDS is empty — admin panel will be inaccessible")
 
-
-async def admin_stats(update, ctx):
-    if not is_admin(update.effective_user.id):
-        return
-    c = db()
-    users = c.execute(
-        "SELECT COUNT(*) n FROM users"
-    ).fetchone()["n"]
-    active = c.execute("""
-        SELECT COUNT(DISTINCT user_id) n
-        FROM subscriptions
-        WHERE status='active' AND ends_at>?
-    """, (iso(now()),)).fetchone()["n"]
-    pending = c.execute("""
-        SELECT COUNT(*) n FROM payment_requests
-        WHERE status='pending'
-    """).fetchone()["n"]
-    c.close()
-
-    await update.callback_query.edit_message_text(
-        "📊 <b>آمار</b>\n\n"
-        f"👥 کاربران: {users}\n"
-        f"✅ اشتراک فعال: {active}\n"
-        f"⏳ پرداخت در انتظار: {pending}",
-        parse_mode="HTML",
-        reply_markup=admin_menu()
-    )
-
-
-async def admin_payments(update, ctx):
-    if not is_admin(update.effective_user.id):
-        return
-
-    c = db()
-    rows = c.execute("""
-        SELECT p.*,u.first_name
-        FROM payment_requests p
-        LEFT JOIN users u ON u.user_id=p.user_id
-        WHERE p.status='pending'
-        ORDER BY p.created_at DESC
-        LIMIT 30
-    """).fetchall()
-    c.close()
-
-    if not rows:
-        await update.callback_query.edit_message_text(
-            "✅ پرداخت در انتظاری نیست.",
-            reply_markup=admin_menu()
-        )
-        return
-
-    buttons = [[InlineKeyboardButton(
-        f"#{r['id']} | {r['amount']:,} | "
-        f"{r['first_name'] or r['user_id']}",
-        callback_data=f"payview:{r['id']}"
-    )] for r in rows]
-
-    buttons.append([InlineKeyboardButton(
-        "🔙 مدیریت", callback_data="admin"
-    )])
-
-    await update.callback_query.edit_message_text(
-        "💳 <b>پرداخت‌های در انتظار</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-async def payment_view(update, ctx, rid):
-    if not is_admin(update.effective_user.id):
-        return
-
-    c = db()
-    r = c.execute(
-        "SELECT * FROM payment_requests WHERE id=?", (rid,)
-    ).fetchone()
-    c.close()
-
-    if not r:
-        await update.callback_query.answer(
-            "درخواست پیدا نشد.", show_alert=True
-        )
-        return
-
-    p = PLANS.get(r["plan_code"], {})
-    text = (
-        f"💳 <b>درخواست #{rid}</b>\n\n"
-        f"👤 User ID: <code>{r['user_id']}</code>\n"
-        f"📦 {p.get('title', r['plan_code'])}\n"
-        f"💰 {r['amount']:,} تومان\n"
-        f"📅 {r['status']}"
-    )
-
-    if r["receipt_file_id"]:
-        try:
-            await ctx.bot.send_photo(
-                chat_id=update.effective_user.id,
-                photo=r["receipt_file_id"],
-                caption=text,
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-    await update.callback_query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "✅ تأیید", callback_data=f"payok:{rid}"
-            ),
-            InlineKeyboardButton(
-                "❌ رد", callback_data=f"payno:{rid}"
-            )
-        ], [
-            InlineKeyboardButton(
-                "🔙 پرداخت‌ها", callback_data="adm:payments"
-            )
-        ]])
-    )
-
-
-async def approve_payment(update, ctx, rid):
-    admin = update.effective_user.id
-    if not is_admin(admin):
-        return
-
-    c = db()
-    r = c.execute(
-        "SELECT * FROM payment_requests WHERE id=?", (rid,)
-    ).fetchone()
-    c.close()
-
-    if not r:
-        await update.callback_query.answer(
-            "درخواست پیدا نشد.", show_alert=True
-        )
-        return
-
-    if r["status"] != "pending":
-        await update.callback_query.answer(
-            "این درخواست قبلاً بررسی شده.", show_alert=True
-        )
-        return
-
-    end = extend_sub(
-        r["user_id"], r["plan_code"],
-        amount=r["amount"],
-        source="manual_payment",
-        payment_request_id=rid,
-        admin_id=admin
-    )
-
-    await update.callback_query.answer(
-        "اشتراک فعال شد.", show_alert=True
-    )
-    await update.callback_query.edit_message_text(
-        f"✅ درخواست #{rid} تأیید شد.\n"
-        f"📅 اعتبار تا: {end.date()}",
-        reply_markup=admin_menu()
-    )
-
-    try:
-        await ctx.bot.send_message(
-            chat_id=r["user_id"],
-            text=(
-                "🎉 <b>اشتراک شما فعال شد.</b>\n\n"
-                f"📦 {PLANS[r['plan_code']]['title']}\n"
-                f"📅 اعتبار تا: {end.date()}"
-            ),
-            parse_mode="HTML",
-            reply_markup=bottom(r["user_id"])
-        )
-    except Exception:
-        log.exception("approval notify failed")
-
-
-async def reject_payment(update, ctx, rid):
-    admin = update.effective_user.id
-    if not is_admin(admin):
-        return
-
-    c = db()
-    r = c.execute(
-        "SELECT * FROM payment_requests WHERE id=?", (rid,)
-    ).fetchone()
-
-    if not r:
-        c.close()
-        await update.callback_query.answer(
-            "درخواست پیدا نشد.", show_alert=True
-        )
-        return
-
-    c.execute("""
-        UPDATE payment_requests
-        SET status='rejected',reviewed_at=?
-        WHERE id=? AND status='pending'
-    """, (iso(now()), rid))
-    c.commit()
-    c.close()
-
-    admin_log(admin, "reject_payment", r["user_id"], f"request={rid}")
-
-    await update.callback_query.answer(
-        "درخواست رد شد.", show_alert=True
-    )
-    await update.callback_query.edit_message_text(
-        f"❌ درخواست #{rid} رد شد.",
-        reply_markup=admin_menu()
-    )
-
-    try:
-        await ctx.bot.send_message(
-            chat_id=r["user_id"],
-            text=(
-                f"❌ درخواست پرداخت #{rid} تأیید نشد.\n"
-                "در صورت نیاز رسید معتبر ارسال کن."
-            ),
-            reply_markup=bottom(r["user_id"])
-        )
-    except Exception:
-        pass
-
-
-async def admin_extend_start(update, ctx):
-    if not is_admin(update.effective_user.id):
-        return
-    ctx.user_data["mode"] = "admin_extend_user"
-    await update.callback_query.edit_message_text(
-        "User ID کاربر را بفرست:"
-    )
-
-
-async def admin_block_start(update, ctx):
-    if not is_admin(update.effective_user.id):
-        return
-    ctx.user_data["mode"] = "admin_block_user"
-    await update.callback_query.edit_message_text(
-        "User ID کاربر را بفرست:"
-    )
-
-
-async def admin_broadcast_start(update, ctx):
-    if not is_admin(update.effective_user.id):
-        return
-    ctx.user_data["mode"] = "admin_broadcast"
-    await update.callback_query.edit_message_text(
-        "متن پیام همگانی را بفرست:"
-    )
-
-
-async def admin_text(update, ctx):
-    admin = update.effective_user.id
-    if not is_admin(admin):
-        return
-
-    mode = ctx.user_data.get("mode")
-    value = update.message.text.strip()
-
-    if mode == "admin_broadcast":
-        ctx.user_data.clear()
-        c = db()
-        users = c.execute(
-            "SELECT user_id FROM users WHERE is_blocked=0"
-        ).fetchall()
-        c.close()
-
-        sent = 0
-        for u in users:
-            try:
-                await ctx.bot.send_message(
-                    chat_id=u["user_id"],
-                    text=value,
-                    reply_markup=bottom(u["user_id"])
-                )
-                sent += 1
-                await asyncio.sleep(.04)
-            except Exception:
-                pass
-
-        admin_log(admin, "broadcast", details=f"sent={sent}")
-        await update.message.reply_text(
-            f"📣 ارسال شد: {sent}",
-            reply_markup=bottom(admin)
-        )
-        return
-
-    if mode == "admin_extend_user":
-        if not value.isdigit():
-            await update.message.reply_text("User ID عددی بفرست.")
-            return
-
-        target = int(value)
-        c = db()
-        r = c.execute(
-            "SELECT user_id FROM users WHERE user_id=?", (target,)
-        ).fetchone()
-        c.close()
-
-        if not r:
-            await update.message.reply_text("کاربر پیدا نشد.")
-            return
-
-        ctx.user_data["admin_target"] = target
-        ctx.user_data["mode"] = "admin_extend_plan"
-
-        buttons = [[InlineKeyboardButton(
-            f"{p['title']} — {p['price']:,}",
-            callback_data=f"admextend:{code}"
-        )] for code, p in PLANS.items()]
-
-        await update.message.reply_text(
-            f"کاربر {target} انتخاب شد:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        return
-
-    if mode == "admin_block_user":
-        if not value.isdigit():
-            await update.message.reply_text("User ID عددی بفرست.")
-            return
-
-        target = int(value)
-        c = db()
-        r = c.execute(
-            "SELECT is_blocked FROM users WHERE user_id=?", (target,)
-        ).fetchone()
-
-        if not r:
-            c.close()
-            await update.message.reply_text("کاربر پیدا نشد.")
-            return
-
-        new = 0 if r["is_blocked"] else 1
-        c.execute(
-            "UPDATE users SET is_blocked=? WHERE user_id=?",
-            (new, target)
-        )
-        c.commit()
-        c.close()
-
-        admin_log(admin, "block_toggle", target, f"is_blocked={new}")
-        ctx.user_data.clear()
-
-        await update.message.reply_text(
-            f"کاربر {target}: "
-            f"{'مسدود شد' if new else 'رفع مسدودی شد'}",
-            reply_markup=bottom(admin)
-        )
-
-
-async def admin_extend_plan(update, ctx, code):
-    admin = update.effective_user.id
-    if not is_admin(admin) or code not in PLANS:
-        return
-
-    target = ctx.user_data.get("admin_target")
-    if not target:
-        await update.callback_query.edit_message_text(
-            "کاربر مشخص نیست.", reply_markup=admin_menu()
-        )
-        return
-
-    end = extend_sub(
-        target, code, source="admin_manual", admin_id=admin
-    )
-    ctx.user_data.clear()
-
-    await update.callback_query.edit_message_text(
-        f"✅ اشتراک کاربر {target} تمدید شد.\n"
-        f"📦 {PLANS[code]['title']}\n"
-        f"📅 تا {end.date()}",
-        reply_markup=admin_menu()
-    )
-
-    try:
-        await ctx.bot.send_message(
-            chat_id=target,
-            text=(
-                "🎉 اشتراک شما توسط مدیریت فعال/تمدید شد.\n"
-                f"📦 {PLANS[code]['title']}\n"
-                f"📅 تا {end.date()}"
-            ),
-            reply_markup=bottom(target)
-        )
-    except Exception:
-        pass
-
-
-# ============================================================
-# CALLBACK ROUTER
-# ============================================================
-async def callback(update, ctx):
-    q = update.callback_query
-    await q.answer()
-    ensure_user(q.from_user)
-
-    if blocked(q.from_user.id) and not is_admin(q.from_user.id):
-        await q.edit_message_text("⛔ دسترسی شما مسدود است.")
-        return
-
-    d = q.data
-
-    if d == "home":
-        ctx.user_data.clear()
-        await q.edit_message_text(
-            "🏠 منوی اصلی", reply_markup=home()
-        )
-
-    elif d == "add":
-        ctx.user_data["mode"] = "add"
-        await q.edit_message_text(
-            "➕ نام یا نماد را بفرست.\n"
-            "BTC / ZEC / XAU / طلای ۱۸ عیار"
-        )
-
-    elif d == "watch":
-        rows = watch(q.from_user.id)
-        if not rows:
-            text = "📋 واچ‌لیست خالی است."
-        else:
-            text = "📋 <b>واچ‌لیست</b>\n\n" + "\n".join(
-                f"• {r['name']} ({r['symbol']})" for r in rows
-            )
-        await q.edit_message_text(
-            text, parse_mode="HTML", reply_markup=home()
-        )
-
-    elif d == "analyze":
-        if not has_sub(q.from_user.id):
-            await q.edit_message_text(
-                "🔒 اشتراک فعال لازم است.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "💳 خرید اشتراک", callback_data="buy"
-                    )
-                ], [
-                    InlineKeyboardButton(
-                        "🏠 منو", callback_data="home"
-                    )
-                ]])
-            )
-            return
-
-        rows = watch(q.from_user.id)
-        if not rows:
-            await q.edit_message_text(
-                "ابتدا دارایی اضافه کن.", reply_markup=home()
-            )
-            return
-
-        buttons = [[InlineKeyboardButton(
-            f"{r['name']} ({r['symbol']})"[:55],
-            callback_data=f"an:{r['coin_id']}"
-        )] for r in rows]
-
-        await q.edit_message_text(
-            "📊 دارایی را انتخاب کن:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-    elif d == "signals":
-        await q.delete_message()
-        fake = type("Obj", (), {})()
-        # Easier: use the bot directly without constructing Update.
-        uid = q.from_user.id
-        if not has_sub(uid):
-            await ctx.bot.send_message(
-                chat_id=uid, text="🔒 اشتراک فعال لازم است.",
-                reply_markup=bottom(uid)
-            )
-            return
-
-        rows = watch(uid)
-        if not rows:
-            await ctx.bot.send_message(
-                chat_id=uid, text="واچ‌لیست خالی است."
-            )
-            return
-
-        out = ["📡 <b>سیگنال‌های واچ‌لیست</b>\n"]
-        for r in rows:
-            try:
-                a = await analyze_asset(r["asset_type"], r["coin_id"])
-                icon = {"BUY": "🟢", "SELL": "🔴",
-                        "WAIT": "🟡"}[a["signal"]]
-                out.append(
-                    f"{icon} <b>{r['symbol']}</b> — {a['signal']} | "
-                    f"قدرت {a['strength']:.0f}% | "
-                    f"احتمال {a['probability']:.0f}%"
-                )
-            except Exception:
-                out.append(
-                    f"⚪ <b>{r['symbol']}</b> — داده کافی نیست"
-                )
-
-        await ctx.bot.send_message(
-            chat_id=uid,
-            text="\n".join(out),
-            parse_mode="HTML",
-            reply_markup=bottom(uid)
-        )
-
-    elif d == "alerts":
-        uid = q.from_user.id
-        c = db()
-        r = c.execute(
-            "SELECT alerts_enabled FROM settings WHERE user_id=?",
-            (uid,)
-        ).fetchone()
-        new = 0 if r["alerts_enabled"] else 1
-        c.execute(
-            "UPDATE settings SET alerts_enabled=? WHERE user_id=?",
-            (new, uid)
-        )
-        c.commit()
-        c.close()
-
-        await q.edit_message_text(
-            f"🔔 هشدارها: <b>{'فعال' if new else 'خاموش'}</b>",
-            parse_mode="HTML", reply_markup=home()
-        )
-
-    elif d == "help":
-        support = (
-            f"\n📞 پشتیبانی: @{SUPPORT_USERNAME}"
-            if SUPPORT_USERNAME else ""
-        )
-        await q.edit_message_text(
-            "ℹ️ <b>راهنما</b>\n\n"
-            "🪙 هر ارز را به واچ‌لیست اضافه کن.\n"
-            "🥇 XAU = طلای جهانی.\n"
-            "🟡 18K = طلای ۱۸ عیار ایران.\n"
-            "📊 تحلیل و سیگنال نیاز به اشتراک دارند.\n"
-            "🔔 هشدار با تغییر سیگنال ارسال می‌شود."
-            + support,
-            parse_mode="HTML", reply_markup=home()
-        )
-
-    elif d == "buy":
-        buttons = [[InlineKeyboardButton(
-            f"💳 {p['title']} — {p['price']:,} تومان",
-            callback_data=f"plan:{code}"
-        )] for code, p in PLANS.items()]
-        await q.edit_message_text(
-            "💳 <b>خرید اشتراک</b>\n\nپلن را انتخاب کن:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-    elif d == "substatus":
-        await q.edit_message_text(
-            sub_text(q.from_user.id),
-            parse_mode="HTML", reply_markup=home()
-        )
-
-    elif d.startswith("plan:"):
-        await plan_selected(
-            update, ctx, d.split(":", 1)[1]
-        )
-
-    elif d.startswith("coin:"):
-        await select_coin(
-            update, ctx, d.split(":", 1)[1]
-        )
-
-    elif d.startswith("an:"):
-        await do_analysis(
-            update, ctx, d.split(":", 1)[1]
-        )
-
-    # ---------------- ADMIN ----------------
-    elif d == "admin":
-        if is_admin(q.from_user.id):
-            await q.edit_message_text(
-                "🛠 <b>پنل مدیریت</b>",
-                parse_mode="HTML", reply_markup=admin_menu()
-            )
-
-    elif d == "adm:stats":
-        await admin_stats(update, ctx)
-
-    elif d == "adm:payments":
-        await admin_payments(update, ctx)
-
-    elif d == "adm:extend":
-        await admin_extend_start(update, ctx)
-
-    elif d == "adm:block":
-        await admin_block_start(update, ctx)
-
-    elif d == "adm:broadcast":
-        await admin_broadcast_start(update, ctx)
-
-    elif d.startswith("payview:"):
-        await payment_view(
-            update, ctx, int(d.split(":", 1)[1])
-        )
-
-    elif d.startswith("payok:"):
-        await approve_payment(
-            update, ctx, int(d.split(":", 1)[1])
-        )
-
-    elif d.startswith("payno:"):
-        await reject_payment(
-            update, ctx, int(d.split(":", 1)[1])
-        )
-
-    elif d.startswith("admextend:"):
-        await admin_extend_plan(
-            update, ctx, d.split(":", 1)[1]
-        )
-
-
-# ============================================================
-# RELIABLE PAYMENT CALLBACKS
-# ============================================================
-async def reliable_approve(update, ctx):
-    q = update.callback_query
-    try:
-        rid = int(q.data.split(":", 1)[1])
-        await approve_payment(update, ctx, rid)
-    except Exception as e:
-        log.exception("PAYMENT APPROVE FAILED")
-        try:
-            await q.answer("خطا در تأیید؛ لاگ Railway را بررسی کنید.", show_alert=True)
-        except Exception:
-            pass
-
-
-async def reliable_reject(update, ctx):
-    q = update.callback_query
-    try:
-        rid = int(q.data.split(":", 1)[1])
-        await reject_payment(update, ctx, rid)
-    except Exception as e:
-        log.exception("PAYMENT REJECT FAILED")
-        try:
-            await q.answer("خطا در رد؛ لاگ Railway را بررسی کنید.", show_alert=True)
-        except Exception:
-            pass
-
-
-# ============================================================
-# TEXT / PHOTO ROUTERS
-# ============================================================
-async def text_router(update, ctx):
-    ensure_user(update.effective_user)
-
-    if blocked(update.effective_user.id) and not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ دسترسی شما مسدود است.")
-        return
-
-    t = (update.message.text or "").strip()
-
-    if t == "📋 واچ‌لیست":
-        await show_watch(update, ctx)
-    elif t == "➕ افزودن ارز":
-        await add_prompt(update, ctx)
-    elif t == "📊 تحلیل":
-        await analysis_menu(update, ctx)
-    elif t == "📡 سیگنال‌ها":
-        await signals(update, ctx)
-    elif t == "💳 خرید اشتراک":
-        await buy(update, ctx)
-    elif t == "📅 وضعیت اشتراک":
-        await update.message.reply_text(
-            sub_text(update.effective_user.id),
-            parse_mode="HTML",
-            reply_markup=bottom(update.effective_user.id)
-        )
-    elif t == "🔔 هشدار":
-        await toggle_alerts(update, ctx)
-    elif t == "ℹ️ راهنما":
-        await update.message.reply_text(
-            "ℹ️ BTC/ZEC/SOL یا هر ارز قابل جستجو را اضافه کن.\n"
-            "XAU برای طلای جهانی است.\n"
-            "طلای ۱۸ عیار را با «طلای ۱۸ عیار» جستجو کن.\n"
-            "تحلیل و سیگنال نیاز به اشتراک دارند.",
-            reply_markup=bottom(update.effective_user.id)
-        )
-    elif t == "🛠 پنل مدیریت":
-        await admin_panel(update, ctx)
-    else:
-        await search_text(update, ctx)
-
-
-async def photo_router(update, ctx):
-    ensure_user(update.effective_user)
-
-    if blocked(update.effective_user.id) and not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ دسترسی شما مسدود است.")
-        return
-
-    await receipt(update, ctx)
-
-
-# ============================================================
-# APP LIFECYCLE
-# ============================================================
 async def post_init(app):
-    app.bot_data["alert_task"] = asyncio.create_task(
-        alert_loop(app)
-    )
-    log.info("Alert worker started")
-
-
-async def post_shutdown(app):
-    task = app.bot_data.get("alert_task")
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    init_db()
+    app.create_task(alert_loop(app))
+    log.info("V5 started | admins=%s", sorted(ADMIN_IDS))
 
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    validate_config(); init_db()
+    app=Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_handler(MessageHandler(filters.PHOTO,photo_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,message_handler))
+    app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
 
-    init_db()
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    # Handle payment buttons before the general callback router.
-    app.add_handler(CallbackQueryHandler(reliable_approve, pattern=r"^payok:\d+$"))
-    app.add_handler(CallbackQueryHandler(reliable_reject, pattern=r"^payno:\d+$"))
-    app.add_handler(CallbackQueryHandler(callback))
-    app.add_handler(MessageHandler(
-        filters.PHOTO, photo_router
-    ))
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, text_router
-    ))
-
-    log.info(
-        "Crypto Analyzer V4 started | DB=%s | admins=%s",
-        DB_PATH, sorted(ADMIN_IDS)
-    )
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
