@@ -30,7 +30,7 @@ ADMIN_IDS = {
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "").strip().lstrip("@")
 PAYMENT_CARD = os.getenv(
     "PAYMENT_CARD",
-    "شماره کارت را در Railway Variables قرار دهید"
+    ""
 ).strip()
 
 PLANS = {
