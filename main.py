@@ -1860,6 +1860,35 @@ async def callback(update, ctx):
 
 
 # ============================================================
+# RELIABLE PAYMENT CALLBACKS
+# ============================================================
+async def reliable_approve(update, ctx):
+    q = update.callback_query
+    try:
+        rid = int(q.data.split(":", 1)[1])
+        await approve_payment(update, ctx, rid)
+    except Exception as e:
+        log.exception("PAYMENT APPROVE FAILED")
+        try:
+            await q.answer("خطا در تأیید؛ لاگ Railway را بررسی کنید.", show_alert=True)
+        except Exception:
+            pass
+
+
+async def reliable_reject(update, ctx):
+    q = update.callback_query
+    try:
+        rid = int(q.data.split(":", 1)[1])
+        await reject_payment(update, ctx, rid)
+    except Exception as e:
+        log.exception("PAYMENT REJECT FAILED")
+        try:
+            await q.answer("خطا در رد؛ لاگ Railway را بررسی کنید.", show_alert=True)
+        except Exception:
+            pass
+
+
+# ============================================================
 # TEXT / PHOTO ROUTERS
 # ============================================================
 async def text_router(update, ctx):
@@ -1948,6 +1977,9 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    # Handle payment buttons before the general callback router.
+    app.add_handler(CallbackQueryHandler(reliable_approve, pattern=r"^payok:\d+$"))
+    app.add_handler(CallbackQueryHandler(reliable_reject, pattern=r"^payno:\d+$"))
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler(
         filters.PHOTO, photo_router
