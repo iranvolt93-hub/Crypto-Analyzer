@@ -60,7 +60,7 @@ ADMIN_IDS = {
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "").strip()
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "").strip()
 
-DB_PATH = os.getenv("DB_PATH", "/app/data/crypto_bot.db").strip()
+DB_PATH = os.getenv("DB_PATH", "/data/crypto_bot.db").strip()
 MAX_WATCHLIST = max(1, int(os.getenv("MAX_WATCHLIST", "100")))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 
@@ -132,6 +132,38 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    """Add a missing column to a legacy SQLite database without destroying data."""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    existing = {str(r[1]) for r in rows}
+    if column not in existing:
+        logger.warning("DB migration: adding %s.%s", table, column)
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def migrate_legacy_db(conn: sqlite3.Connection) -> None:
+    """Bring older Crypto Analyzer databases forward in-place.
+
+    Railway volumes survive deployments, so a newer bot must be able to use
+    a database created by an older version.  In particular, older versions
+    did not have users.blocked, which caused every incoming message to crash.
+    """
+    ensure_column(conn, "users", "username", "TEXT DEFAULT ''")
+    ensure_column(conn, "users", "first_name", "TEXT DEFAULT ''")
+    ensure_column(conn, "users", "created_at", "TEXT DEFAULT ''")
+    ensure_column(conn, "users", "last_seen_at", "TEXT")
+    ensure_column(conn, "users", "blocked", "INTEGER NOT NULL DEFAULT 0")
+
+    ensure_column(conn, "subscriptions", "source", "TEXT NOT NULL DEFAULT 'manual'")
+
+    ensure_column(conn, "payment_requests", "receipt_file_id", "TEXT")
+    ensure_column(conn, "payment_requests", "status", "TEXT NOT NULL DEFAULT 'pending'")
+    ensure_column(conn, "payment_requests", "reviewed_at", "TEXT")
+    ensure_column(conn, "payment_requests", "reviewed_by", "INTEGER")
+
+    conn.commit()
+
+
 def init_db() -> None:
     conn = db_connect()
     try:
@@ -199,6 +231,7 @@ def init_db() -> None:
             );
             """
         )
+        migrate_legacy_db(conn)
         conn.commit()
     finally:
         conn.close()
