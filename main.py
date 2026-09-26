@@ -36,6 +36,7 @@ import sqlite3
 import asyncio
 import logging
 import time
+import shutil
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -103,7 +104,9 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton("➕ افزودن دارایی"), KeyboardButton("📋 واچ‌لیست")],
         [KeyboardButton("📊 تحلیل"), KeyboardButton("🚨 سیگنال‌ها")],
         [KeyboardButton("💳 خرید اشتراک"), KeyboardButton("👤 وضعیت اشتراک")],
-        [KeyboardButton("🔔 هشدارها"), KeyboardButton("ℹ️ راهنما")],
+        [KeyboardButton("🔔 هشدارها"), KeyboardButton("🪙 ارزهای بیشتر")],
+        [KeyboardButton("📨 ارتباط با پشتیبان"), KeyboardButton("ℹ️ راهنما")],
+        [KeyboardButton("👨‍💼 پنل مدیریت")],
     ],
     resize_keyboard=True,
 )
@@ -123,6 +126,45 @@ def db():
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def verify_storage():
+    """Warn loudly when Railway Volume is not mounted.
+
+    SQLite data can only survive a Railway redeploy when DB_PATH points to a
+    persistent Volume. The bot never deletes/recreates the database itself.
+    """
+    if DB_PATH.startswith("/data/") and not os.path.ismount("/data"):
+        log.warning(
+            "PERSISTENCE WARNING: /data is not a mounted Railway Volume. "
+            "User/subscription data may be lost on redeploy. Mount a Volume at /data."
+        )
+
+
+def backup_database():
+    if not os.path.exists(DB_PATH):
+        return None
+    backup_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "backups")
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        target = os.path.join(backup_dir, f"crypto_bot_{stamp}.db")
+        shutil.copy2(DB_PATH, target)
+        # Keep the newest 10 local backups. They live on the same persistent Volume.
+        files = sorted(
+            [os.path.join(backup_dir, x) for x in os.listdir(backup_dir) if x.endswith(".db")],
+            key=lambda x: os.path.getmtime(x),
+            reverse=True,
+        )
+        for old in files[10:]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        return target
+    except Exception:
+        log.exception("Database backup failed")
+        return None
 
 
 def init_db():
@@ -200,6 +242,23 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_alert_user_symbol
             ON alert_events(user_id, symbol, id);
+
+        CREATE TABLE IF NOT EXISTS support_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            admin_id INTEGER,
+            direction TEXT NOT NULL DEFAULT 'user_to_admin',
+            message TEXT NOT NULL,
+            telegram_message_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL,
+            replied_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_support_user
+            ON support_messages(user_id, id);
+        CREATE INDEX IF NOT EXISTS idx_support_status
+            ON support_messages(status, id);
         """
     )
 
@@ -214,6 +273,10 @@ def init_db():
             "ALTER TABLE alert_events "
             "ADD COLUMN signal_key TEXT NOT NULL DEFAULT ''"
         )
+
+    # Legacy installations: keep every existing table and record.
+    # Never DROP or recreate user/subscription/payment tables.
+    conn.execute("PRAGMA user_version = 4")
 
     conn.commit()
     conn.close()
@@ -492,7 +555,43 @@ CRYPTO_ALIASES = {
     "FIL": "filecoin",
     "ARB": "arbitrum",
     "OP": "optimism",
+    "MKR": "maker", "AAVE": "aave", "CRV": "curve-dao-token",
+    "MATIC": "matic-network", "POL": "polygon-ecosystem-token",
+    "PEPE": "pepe", "SHIB": "shiba-inu", "WIF": "dogwifhat",
+    "BONK": "bonk", "FLOKI": "floki", "SEI": "sei-network",
+    "INJ": "injective-protocol", "TIA": "celestia", "IMX": "immutable-x",
+    "RUNE": "thorchain", "EGLD": "elrond-erd-2", "ALGO": "algorand",
+    "VET": "vechain", "ICP": "internet-computer", "HBAR": "hedera-hashgraph",
+    "XLM": "stellar", "XMR": "monero", "EOS": "eos",
+    "XTZ": "tezos", "MANA": "decentraland", "SAND": "the-sandbox",
+    "AXS": "axie-infinity", "GRT": "the-graph", "THETA": "theta-token",
+    "FLOW": "flow", "QNT": "quant-network", "KAS": "kaspa",
+    "JASMY": "jasmycoin", "LDO": "lido-staked-ether", "STX": "stacks",
+    "FET": "fetch-ai", "RENDER": "render-token", "RNDR": "render-token",
+    "TAO": "bittensor", "AR": "arweave", "KAVA": "kava",
+    "GALA": "gala", "APE": "apecoin", "CHZ": "chiliz",
+    "ENJ": "enjincoin", "SNX": "havven", "COMP": "compound-governance-token",
+    "SUSHI": "sushi", "1INCH": "1inch", "BAT": "basic-attention-token",
+    "ZIL": "zilliqa", "ONE": "harmony", "IOTA": "iota",
+    "MINA": "mina-protocol", "ROSE": "oasis-network", "CELO": "celo",
+    "WLD": "worldcoin-wld", "STRK": "starknet", "JUP": "jupiter-exchange-solana",
+    "PYTH": "pyth-network", "ONDO": "ondo-finance", "ENA": "ethena",
+    "NOT": "notcoin", "DOGS": "dogs-2", "EIGEN": "eigenlayer",
 }
+
+POPULAR_CRYPTO_TEXT = (
+    "🪙 ارزهای قابل استفاده\n\n"
+    "BTC  ETH  ZEC  SOL  XRP  BNB  DOGE  ADA\n"
+    "TRX  TON  DOT  AVAX  LINK  LTC  BCH  ETC\n"
+    "ATOM  NEAR  UNI  APT  SUI  FIL  ARB  OP\n"
+    "MKR  AAVE  CRV  MATIC  POL  PEPE  SHIB  WIF\n"
+    "BONK  FLOKI  SEI  INJ  TIA  IMX  RUNE  ALGO\n"
+    "VET  ICP  HBAR  XLM  XMR  EOS  XTZ  MANA\n"
+    "SAND  AXS  GRT  THETA  FLOW  QNT  KAS  LDO\n"
+    "STX  FET  RENDER  TAO  AR  GALA  APE  CHZ\n\n"
+    "یا تقریباً هر نماد دیگری را ارسال کنید؛ ربات آن را در CoinGecko جست‌وجو می‌کند.\n"
+    "مثال: LINK یا RENDER"
+)
 
 
 async def resolve_coingecko_id(symbol):
@@ -1628,8 +1727,217 @@ async def alert_worker(application):
 
 
 # ============================================================
+# USER SUPPORT
+# ============================================================
+
+async def support_prompt(update, context):
+    context.user_data["support_mode"] = True
+    await update.message.reply_text(
+        "📨 ارتباط با پشتیبان\n\n"
+        "پیام خود را ارسال کنید. پیام مستقیماً برای مدیران ربات ارسال می‌شود.\n"
+        "برای خروج، «لغو» را بفرستید."
+    )
+
+
+async def forward_support_message(update, context):
+    ensure_user(update.effective_user)
+    text = clean_text(update.message.text)
+    if text == "لغو":
+        context.user_data.pop("support_mode", None)
+        await update.message.reply_text("لغو شد.", reply_markup=MAIN_MENU)
+        return True
+
+    conn = db()
+    cur = conn.execute(
+        """INSERT INTO support_messages(
+            user_id, direction, message, telegram_message_id, status, created_at
+        ) VALUES(?,?,?,?,?,?)""",
+        (update.effective_user.id, "user_to_admin", text,
+         update.message.message_id, "open", now_iso()),
+    )
+    ticket_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    context.user_data.pop("support_mode", None)
+
+    user = update.effective_user
+    caption = (
+        f"📨 پیام پشتیبانی #{ticket_id}\n"
+        f"👤 {user.first_name or ''} @{user.username or '-'}\n"
+        f"🆔 {user.id}\n\n{text}"
+    )
+    for admin_id in ADMIN_IDS:
+        await safe_send(
+            context.bot, admin_id, caption,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "↩️ پاسخ به کاربر", callback_data=f"support:reply:{user.id}:{ticket_id}"
+            )]])
+        )
+    await update.message.reply_text(
+        "✅ پیام شما برای پشتیبان ارسال شد.\n"
+        f"کد پیگیری: #{ticket_id}"
+    )
+    return True
+
+
+async def support_reply_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("⛔ دسترسی ندارید.")
+        return
+    _, _, user_id, ticket_id = query.data.split(":", 3)
+    context.user_data["admin_reply_to"] = (int(user_id), int(ticket_id))
+    await query.message.reply_text(
+        f"✍️ پاسخ به کاربر {user_id}\n"
+        "متن پاسخ را ارسال کنید."
+    )
+
+
+async def send_admin_reply(update, context):
+    target = context.user_data.get("admin_reply_to")
+    if not target:
+        return False
+    user_id, ticket_id = target
+    text = clean_text(update.message.text)
+    if not text:
+        return True
+    sent = await safe_send(context.bot, user_id, "📩 پاسخ پشتیبانی:\n\n" + text)
+    conn = db()
+    conn.execute(
+        """INSERT INTO support_messages(
+            user_id, admin_id, direction, message, status, created_at, replied_at
+        ) VALUES(?,?,?,?,?,?,?)""",
+        (user_id, update.effective_user.id, "admin_to_user", text,
+         "closed" if sent else "open", now_iso(), now_iso() if sent else None),
+    )
+    conn.execute(
+        "UPDATE support_messages SET status='closed', replied_at=? WHERE id=?",
+        (now_iso(), ticket_id),
+    )
+    conn.commit()
+    conn.close()
+    context.user_data.pop("admin_reply_to", None)
+    await update.message.reply_text(
+        "✅ پاسخ ارسال شد." if sent else "❌ ارسال پاسخ ناموفق بود. احتمالاً کاربر ربات را بلاک کرده است."
+    )
+    return True
+
+
+# ============================================================
+# ADMIN PANEL
+# ============================================================
+
+async def admin_panel(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ دسترسی ندارید.")
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 آمار کامل", callback_data="adm:stats"),
+         InlineKeyboardButton("👥 کاربران", callback_data="adm:users:0")],
+        [InlineKeyboardButton("💳 پرداخت‌ها", callback_data="adm:payments"),
+         InlineKeyboardButton("📨 پیام‌ها", callback_data="adm:support")],
+        [InlineKeyboardButton("📢 ارسال همگانی", callback_data="adm:broadcast"),
+         InlineKeyboardButton("👤 پیام به کاربر", callback_data="adm:message")],
+        [InlineKeyboardButton("🚫 مسدود/رفع مسدودی", callback_data="adm:block")],
+    ])
+    await update.message.reply_text("👨‍💼 پنل مدیریت حرفه‌ای", reply_markup=keyboard)
+
+
+async def admin_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("⛔ دسترسی ندارید.")
+        return
+    data = query.data
+    if data == "adm:stats":
+        conn=db()
+        vals={
+            "users": conn.execute("SELECT COUNT(*) n FROM users").fetchone()["n"],
+            "active": conn.execute("SELECT COUNT(*) n FROM subscriptions WHERE status='active' AND end_at>?",(now_iso(),)).fetchone()["n"],
+            "pending": conn.execute("SELECT COUNT(*) n FROM payment_requests WHERE status='pending'").fetchone()["n"],
+            "watch": conn.execute("SELECT COUNT(*) n FROM watchlist").fetchone()["n"],
+            "alerts": conn.execute("SELECT COUNT(*) n FROM alert_preferences WHERE enabled=1").fetchone()["n"],
+            "open": conn.execute("SELECT COUNT(*) n FROM support_messages WHERE status='open'").fetchone()["n"],
+        }
+        conn.close()
+        await query.message.reply_text(
+            "📊 آمار کامل\n\n"
+            f"👥 کاربران: {vals['users']}\n"
+            f"🟢 اشتراک فعال: {vals['active']}\n"
+            f"💳 پرداخت در انتظار: {vals['pending']}\n"
+            f"📋 آیتم‌های واچ‌لیست: {vals['watch']}\n"
+            f"🔔 هشدار فعال: {vals['alerts']}\n"
+            f"📨 پیام باز: {vals['open']}"
+        )
+        return
+    if data.startswith("adm:users:"):
+        page=int(data.rsplit(":",1)[1]); per=10; offset=page*per
+        conn=db(); rows=conn.execute("SELECT user_id,first_name,username,last_seen,blocked FROM users ORDER BY last_seen DESC LIMIT ? OFFSET ?",(per,offset)).fetchall(); total=conn.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]; conn.close()
+        if not rows:
+            await query.message.reply_text("کاربری در این صفحه نیست."); return
+        lines=["👥 کاربران:\n"]
+        for r in rows:
+            lines.append(f"🆔 {r['user_id']} | {r['first_name'] or '-'} | @{r['username'] or '-'} | {'🚫' if r['blocked'] else '🟢'}")
+        buttons=[]
+        if page>0: buttons.append(InlineKeyboardButton("⬅️ قبلی",callback_data=f"adm:users:{page-1}"))
+        if offset+per<total: buttons.append(InlineKeyboardButton("بعدی ➡️",callback_data=f"adm:users:{page+1}"))
+        await query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([buttons] if buttons else [])); return
+    if data == "adm:payments":
+        conn=db(); rows=conn.execute("SELECT id,user_id,days,amount,created_at FROM payment_requests WHERE status='pending' ORDER BY id DESC LIMIT 20").fetchall(); conn.close()
+        if not rows: await query.message.reply_text("💳 پرداخت در انتظار وجود ندارد."); return
+        await query.message.reply_text("💳 پرداخت‌های در انتظار:\n\n"+"\n".join(f"#{r['id']} | {r['user_id']} | {r['days']} روز | {r['amount']:,} تومان" for r in rows)); return
+    if data == "adm:support":
+        conn=db(); rows=conn.execute("SELECT id,user_id,message,created_at FROM support_messages WHERE direction='user_to_admin' AND status='open' ORDER BY id DESC LIMIT 15").fetchall(); conn.close()
+        if not rows: await query.message.reply_text("📨 پیام باز ندارید."); return
+        await query.message.reply_text("📨 پیام‌های باز:\n\n"+"\n\n".join(f"#{r['id']} | user={r['user_id']}\n{r['message'][:500]}" for r in rows)); return
+    if data == "adm:broadcast":
+        context.user_data["admin_mode"]="broadcast"
+        await query.message.reply_text("📢 متن پیام همگانی را ارسال کنید. برای لغو: لغو")
+        return
+    if data == "adm:message":
+        context.user_data["admin_mode"]="message"
+        await query.message.reply_text("👤 ابتدا شناسه عددی کاربر را بفرستید.")
+        return
+    if data == "adm:block":
+        context.user_data["admin_mode"]="block"
+        await query.message.reply_text("🚫 شناسه کاربر را بفرستید؛ سپس وضعیت مسدودی تغییر می‌کند.")
+        return
+
+
+async def admin_text_action(update, context):
+    if not is_admin(update.effective_user.id): return False
+    mode=context.user_data.get("admin_mode")
+    if not mode: return False
+    text=clean_text(update.message.text)
+    if text=="لغو": context.user_data.pop("admin_mode",None); await update.message.reply_text("لغو شد."); return True
+    if mode in ("message","block"):
+        if not text.isdigit(): await update.message.reply_text("❌ شناسه عددی معتبر بفرستید."); return True
+        uid=int(text)
+        if mode=="block":
+            conn=db(); conn.execute("UPDATE users SET blocked=CASE WHEN blocked=0 THEN 1 ELSE 0 END WHERE user_id=?",(uid,)); row=conn.execute("SELECT blocked FROM users WHERE user_id=?",(uid,)).fetchone(); conn.commit(); conn.close()
+            await update.message.reply_text("🚫 وضعیت کاربر: " + ("مسدود" if row and row["blocked"] else "فعال")); context.user_data.pop("admin_mode",None); return True
+        context.user_data["admin_message_user"]=uid; context.user_data["admin_mode"]="message_text"; await update.message.reply_text("✍️ متن پیام را بفرستید."); return True
+    if mode=="message_text":
+        uid=context.user_data.get("admin_message_user"); sent=await safe_send(context.bot,uid,"📩 پیام مدیر:\n\n"+text); await update.message.reply_text("✅ ارسال شد." if sent else "❌ ارسال نشد."); context.user_data.pop("admin_mode",None); context.user_data.pop("admin_message_user",None); return True
+    if mode=="broadcast":
+        conn=db(); rows=conn.execute("SELECT user_id FROM users WHERE blocked=0").fetchall(); conn.close(); ok=0; fail=0
+        for r in rows:
+            if await safe_send(context.bot,r["user_id"],"📢 پیام مدیریت:\n\n"+text): ok+=1
+            else: fail+=1
+            await asyncio.sleep(0.04)
+        context.user_data.pop("admin_mode",None); await update.message.reply_text(f"📢 ارسال تمام شد.\n✅ {ok}\n❌ {fail}"); return True
+    return False
+
+
+# ============================================================
 # HELP / ADMIN
 # ============================================================
+
+async def crypto_list(update, context):
+    await update.message.reply_text(POPULAR_CRYPTO_TEXT)
+
 
 async def help_cmd(update, context):
     support = (
@@ -1653,32 +1961,7 @@ async def help_cmd(update, context):
 
 
 async def admin(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
-        return
-
-    conn = db()
-    users = conn.execute(
-        "SELECT COUNT(*) n FROM users"
-    ).fetchone()["n"]
-    subs = conn.execute(
-        """
-        SELECT COUNT(*) n FROM subscriptions
-        WHERE status='active' AND end_at>?
-        """,
-        (now_iso(),),
-    ).fetchone()["n"]
-    pending = conn.execute(
-        "SELECT COUNT(*) n FROM payment_requests WHERE status='pending'"
-    ).fetchone()["n"]
-    conn.close()
-
-    await update.message.reply_text(
-        "📊 پنل مدیریت\n\n"
-        f"👥 کاربران: {users}\n"
-        f"🟢 اشتراک فعال: {subs}\n"
-        f"💳 پرداخت در انتظار: {pending}"
-    )
+    await admin_panel(update, context)
 
 
 # ============================================================
@@ -1688,6 +1971,15 @@ async def admin(update, context):
 async def text_router(update, context):
     ensure_user(update.effective_user)
     text = clean_text(update.message.text)
+
+    if await admin_text_action(update, context):
+        return
+    if context.user_data.get("support_mode"):
+        await forward_support_message(update, context)
+        return
+    if context.user_data.get("admin_reply_to"):
+        await send_admin_reply(update, context)
+        return
 
     mode = context.user_data.get("awaiting_asset")
 
@@ -1753,6 +2045,9 @@ async def text_router(update, context):
         "💳 خرید اشتراک": buy_menu,
         "👤 وضعیت اشتراک": subscription_status,
         "🔔 هشدارها": alerts,
+        "🪙 ارزهای بیشتر": crypto_list,
+        "📨 ارتباط با پشتیبان": support_prompt,
+        "👨‍💼 پنل مدیریت": admin_panel,
         "ℹ️ راهنما": help_cmd,
     }
 
@@ -1794,7 +2089,9 @@ async def shutdown_http():
 # ============================================================
 
 async def main():
+    verify_storage()
     init_db()
+    backup_database()
 
     log.info("Starting Market Analyzer...")
     log.info("DB_PATH=%s", DB_PATH)
@@ -1832,6 +2129,18 @@ async def main():
         CallbackQueryHandler(
             alert_callback,
             pattern=r"^alert:(on|off)$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_callback,
+            pattern=r"^adm:",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            support_reply_callback,
+            pattern=r"^support:reply:",
         )
     )
 
@@ -1903,6 +2212,7 @@ async def main():
         except Exception:
             log.exception("Application shutdown failed")
 
+        backup_database()
         await shutdown_http()
         log.info("Market Analyzer stopped.")
 
