@@ -989,7 +989,25 @@ async def text_router(update,context):
         for k in ("support_mode","chat_room","awaiting_asset","payment_plan","admin_mode","admin_reply_to","message_target"):
             context.user_data.pop(k,None)
         await update.message.reply_text("لغو شد.",reply_markup=main_kb(uid)); return
-    if await admin_text_action(update,context,text): return
+    # Main-menu buttons always have priority over temporary modes such as
+    # support, asset-entry and crypto-chat.  Without this rule, a user who
+    # was inside a crypto room could accidentally send buttons such as
+    # "🪙 ارزهای بیشتر" as chat messages.
+    handlers={
+        "➕ افزودن دارایی":add_asset_prompt,"📋 واچ‌لیست":watchlist_menu,
+        "📊 تحلیل":analysis_prompt,"🚨 سیگنال‌ها":signals_menu,
+        "💳 خرید اشتراک":buy_menu,"👤 وضعیت اشتراک":status_menu,
+        "🔔 هشدارها":alerts_menu,"🪙 ارزهای بیشتر":more_coins,
+        "💬 چت رمز ارز":crypto_chat_menu,"📨 ارتباط با پشتیبان":support_prompt,
+        "ℹ️ راهنما":help_text,"👨‍💼 پنل مدیریت":admin_panel,
+    }
+    if text in handlers:
+        for k in ("support_mode","chat_room","awaiting_asset","payment_plan","admin_reply_to","message_target"):
+            context.user_data.pop(k,None)
+        await handlers[text](update,context)
+        return
+
+    if await admin_text_action(update,context): return
     if is_admin(uid) and context.user_data.get("admin_reply_to"):
         await send_support_reply(update,context,text); return
     if context.user_data.get("support_mode"):
@@ -1010,16 +1028,6 @@ async def text_router(update,context):
             await update.message.reply_text("⏳ در حال تحلیل...")
             a=await analyze(text)
             await update.message.reply_text(analysis_text(a),parse_mode=ParseMode.HTML); return
-    handlers={
-        "➕ افزودن دارایی":add_asset_prompt,"📋 واچ‌لیست":watchlist_menu,
-        "📊 تحلیل":analysis_prompt,"🚨 سیگنال‌ها":signals_menu,
-        "💳 خرید اشتراک":buy_menu,"👤 وضعیت اشتراک":status_menu,
-        "🔔 هشدارها":alerts_menu,"🪙 ارزهای بیشتر":more_coins,
-        "💬 چت رمز ارز":crypto_chat_menu,"📨 ارتباط با پشتیبان":support_prompt,
-        "ℹ️ راهنما":help_text,"👨‍💼 پنل مدیریت":admin_panel,
-    }
-    fn=handlers.get(text)
-    if fn: await fn(update,context)
 
 # ---------------- MEDIA ROUTER ----------------
 async def media_router(update,context):
