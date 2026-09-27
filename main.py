@@ -80,6 +80,12 @@ ANALYSIS_CACHE_SECONDS = max(15, int(os.getenv("ANALYSIS_CACHE_SECONDS", "45")))
 ALERT_INTERVAL_SECONDS = max(60, int(os.getenv("ALERT_INTERVAL_SECONDS", "300")))
 MAX_WATCHLIST = max(1, int(os.getenv("MAX_WATCHLIST", "100")))
 
+# Smart technical-analysis engine
+GOLD_HISTORY_INTERVAL_SECONDS = max(60, int(os.getenv("GOLD_HISTORY_INTERVAL_SECONDS", "300")))
+GOLD_MIN_HISTORY_POINTS = max(50, int(os.getenv("GOLD_MIN_HISTORY_POINTS", "50")))
+SIGNAL_MIN_SCORE = max(70, min(100, int(os.getenv("SIGNAL_MIN_SCORE", "78"))))
+SIGNAL_CONFIRMATIONS_REQUIRED = max(2, int(os.getenv("SIGNAL_CONFIRMATIONS_REQUIRED", "2")))
+
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "ثبت نشده").strip()
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "پشتیبان").strip()
 
@@ -211,17 +217,14 @@ def _prepare_persistent_db():
     target.parent.mkdir(parents=True, exist_ok=True)
     Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
 
-    # Never replace a healthy persistent database.
     if target.exists() and _db_has_tables(target):
         users = _db_user_count(target)
         if users > 0:
             return
 
-        # Empty DB: try backup first, then legacy DB.
         if AUTO_RESTORE_BACKUP and _restore_latest_backup(target):
             return
 
-    # If target exists but is corrupt/empty, preserve it before attempting recovery.
     recovery_candidates = [
         Path("/app/crypto_bot.db"),
         Path("/app/data/crypto_bot.db"),
@@ -236,7 +239,6 @@ def _prepare_persistent_db():
         Path("zec_bot.db"),
     ]
 
-    # Optional comma-separated legacy paths can be supplied during migration.
     for raw in os.getenv("LEGACY_DB_PATHS", "").split(","):
         raw = raw.strip()
         if raw:
@@ -257,7 +259,6 @@ def _prepare_persistent_db():
             if users <= 0:
                 continue
 
-            # If target is a bad/empty file, preserve it for diagnosis.
             if target.exists() and target.stat().st_size > 0 and _db_user_count(target) == 0:
                 try:
                     quarantine = target.with_name(
@@ -279,7 +280,6 @@ def _prepare_persistent_db():
         except Exception as e:
             log.warning("Legacy database recovery failed %s: %s", src, e)
 
-    # Final backup attempt after legacy search.
     if AUTO_RESTORE_BACKUP:
         _restore_latest_backup(target)
 
@@ -431,6 +431,29 @@ def init_db():
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS market_history(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            asset_type TEXT NOT NULL,
+            price REAL NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_market_history_asset
+        ON market_history(symbol,asset_type,created_at);
+
+        CREATE TABLE IF NOT EXISTS signal_state(
+            symbol TEXT PRIMARY KEY,
+            candidate TEXT NOT NULL,
+            confirmations INTEGER NOT NULL DEFAULT 0,
+            last_candidate_at TEXT,
+            last_price REAL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_signal_state_candidate
+        ON signal_state(candidate,confirmations);
+
         CREATE TABLE IF NOT EXISTS support_messages(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -480,7 +503,7 @@ def init_db():
         ensure_column(c, "support_messages", "replied_at", "TEXT")
         ensure_column(c, "chat_messages", "deleted_by", "INTEGER")
         ensure_column(c, "chat_messages", "deleted_at", "TEXT")
-        c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('schema_version','8')")
+        c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('schema_version','9')")
         c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('db_path',?)", (DB_PATH,))
 
 def now_iso():
@@ -756,13 +779,6 @@ def _unit_factor(text, forced_unit="auto"):
     return None
 
 def _infer_gold18_factor(raw_value):
-    """TGJU sometimes omits the unit beside the numeric value.
-
-    For GOLD18, a value in the hundreds of millions is the usual Rial
-    representation of a roughly tens-of-millions Toman price. A value in
-    the tens of millions can already be Toman. This is only used after the
-    parser has tied the number to the geram18 price context.
-    """
     try:
         v = float(raw_value)
     except Exception:
@@ -784,39 +800,6 @@ def _context(tag, levels=4, limit=5000):
             parts.append(text)
         node = node.parent
     return " ".join(dict.fromkeys(parts))[:limit]
-
-def _candidate_from_node(tag, forced_unit="auto", min_value=100_000, max_value=500_000_000):
-    text = tag.get_text(" ", strip=True)
-    factor = _unit_factor(text, forced_unit)
-    if factor is None:
-        factor = _unit_factor(_context(tag), forced_unit)
-
-    nums = [
-        x for x in _numbers_with_positions(text)
-        if min_value <= x[1] <= max_value
-    ]
-    if not nums or factor is None:
-        return None
-
-    low = digits_to_latin(text).lower()
-    labels = []
-    for kw in ("قیمت", "نرخ", "آخرین", "price", "value", "current"):
-        pos = low.find(kw)
-        if pos >= 0:
-            labels.append(pos)
-
-    if labels:
-        raw = min(
-            nums,
-            key=lambda x: min(abs(x[0] - p) for p in labels)
-        )[1]
-    else:
-        raw = nums[0][1]
-
-    value = raw * factor
-    if not min_value <= value <= max_value:
-        return None
-    return value
 
 def _score_gold18_node(tag):
     attrs = " ".join(f"{k}={v}" for k, v in tag.attrs.items()).lower()
@@ -848,7 +831,6 @@ def _score_gold18_node(tag):
 # ============================================================
 
 def find_gold18_value(html):
-    """Find TGJU geram18 price robustly, including JSON/script markup."""
     if not html:
         return None
 
@@ -882,7 +864,6 @@ def find_gold18_value(html):
         except Exception as e:
             log.warning("Invalid GOLD18 selector: %s", e)
 
-    # Strongly prefer elements/ancestors explicitly tied to geram18.
     selectors = [
         '[data-symbol="geram18"]', '[data-profile="geram18"]',
         '[data-code="geram18"]', '[data-item="geram18"]',
@@ -905,7 +886,6 @@ def find_gold18_value(html):
             for _, raw in _numbers_with_positions(tag.get_text(" ", strip=True)):
                 add_candidate(raw, context, 900 + _score_gold18_node(tag))
 
-    # Scan compact rows/blocks containing geram18.
     keywords = (
         "geram18", "گرم طلای 18", "گرم طلای ۱۸",
         "طلای 18 عیار", "طلای ۱۸ عیار", "طلای18", "طلای۱۸"
@@ -920,15 +900,11 @@ def find_gold18_value(html):
         for _, raw in _numbers_with_positions(text):
             add_candidate(raw, text, 500 + _score_gold18_node(tag))
 
-    # TGJU may put the price in inline JavaScript/JSON where BeautifulSoup
-    # does not expose a useful element. Search only a bounded neighborhood
-    # around explicit geram18 references.
     raw_html = digits_to_latin(html)
     for m in re.finditer(r"geram18", raw_html, flags=re.I):
         lo = max(0, m.start() - 2500)
         hi = min(len(raw_html), m.end() + 5000)
         chunk = raw_html[lo:hi]
-        # Price-like keys get extra score.
         key_bonus = 0
         if re.search(r"(?:price|value|current|last|close|p|v)\s*[:=]", chunk, re.I):
             key_bonus = 180
@@ -938,8 +914,6 @@ def find_gold18_value(html):
     if not candidates:
         return None
 
-    # Highest context score first; for equally relevant candidates prefer the
-    # value that is in the normal Iranian 18K range.
     candidates.sort(
         key=lambda x: (x[0], 1 if 15_000_000 <= x[1] <= 50_000_000 else 0, -x[2]),
         reverse=True
@@ -948,9 +922,46 @@ def find_gold18_value(html):
     log.info("TGJU GOLD18 parsed: %.0f Toman/gram", value)
     return value
 
+def save_market_snapshot(symbol, atype, price):
+    if price is None or price <= 0:
+        return
+    try:
+        with db() as c:
+            last = c.execute(
+                "SELECT price,created_at FROM market_history WHERE symbol=? AND asset_type=? ORDER BY id DESC LIMIT 1",
+                (symbol, atype)
+            ).fetchone()
+            if last and abs(float(last["price"]) - float(price)) < 1e-12:
+                try:
+                    age = datetime.now(timezone.utc) - datetime.fromisoformat(last["created_at"])
+                    if age.total_seconds() < GOLD_HISTORY_INTERVAL_SECONDS * 0.8:
+                        return
+                except Exception:
+                    pass
+            c.execute(
+                "INSERT INTO market_history(symbol,asset_type,price,created_at) VALUES(?,?,?,?)",
+                (symbol, atype, float(price), now_iso())
+            )
+            c.execute(
+                "DELETE FROM market_history WHERE symbol=? AND asset_type=? AND id NOT IN (SELECT id FROM market_history WHERE symbol=? AND asset_type=? ORDER BY id DESC LIMIT 1000)",
+                (symbol, atype, symbol, atype)
+            )
+    except Exception:
+        log.exception("market snapshot save: %s", symbol)
+
+def get_market_history(symbol, atype, limit=500):
+    try:
+        with db() as c:
+            rows = c.execute(
+                "SELECT price FROM market_history WHERE symbol=? AND asset_type=? ORDER BY id DESC LIMIT ?",
+                (symbol, atype, int(limit))
+            ).fetchall()
+        return pd.Series([float(r["price"]) for r in reversed(rows)], dtype=float)
+    except Exception:
+        return pd.Series(dtype=float)
+
 async def gold18_data():
     global GOLD18_CACHE
-
     now = time.monotonic()
     if GOLD18_CACHE and now - GOLD18_CACHE[0] < PRICE_CACHE_SECONDS:
         return GOLD18_CACHE[1]
@@ -959,20 +970,18 @@ async def gold18_data():
     if not html:
         log.error("TGJU geram18 unavailable")
         return None
-
     price = find_gold18_value(html)
     if price is None or not (5_000_000 <= price <= 100_000_000):
         log.error("TGJU geram18 price could not be identified safely: %s", price)
         return None
 
-    result = (
-        "GOLD18",
-        pd.Series([price] * 30, dtype=float),
-        pd.Series(dtype=float)
-    )
+    save_market_snapshot("GOLD18", "gold18", price)
+    history = get_market_history("GOLD18", "gold18")
+    if len(history) < GOLD_MIN_HISTORY_POINTS:
+        history = history if len(history) else pd.Series([price], dtype=float)
+    result = ("GOLD18", history, pd.Series(dtype=float))
     GOLD18_CACHE = (now, result)
-
-    log.info("TGJU GOLD18: %.0f Toman/gram", price)
+    log.info("TGJU GOLD18: %.0f Toman/gram | history=%s", price, len(history))
     return result
 
 # ============================================================
@@ -980,10 +989,6 @@ async def gold18_data():
 # ============================================================
 
 def find_xau_value(html):
-    """
-    Strict parser for TGJU /profile/ons.
-    Expected output: USD per troy ounce.
-    """
     if not html:
         return None
 
@@ -1103,11 +1108,11 @@ async def xau_data():
     price = await xau_tgju_price()
     if price is None:
         return None
-
-    # TGJU profile/ons is used as the source of the current price.
-    # We do not fabricate historical candles.
-    prices = pd.Series([price] * 30, dtype=float)
-    return "XAU", prices, pd.Series(dtype=float)
+    save_market_snapshot("XAU", "gold", price)
+    history = get_market_history("XAU", "gold")
+    if len(history) < GOLD_MIN_HISTORY_POINTS:
+        history = history if len(history) else pd.Series([price], dtype=float)
+    return "XAU", history, pd.Series(dtype=float)
 
 # ============================================================
 # ASSET DATA / CURRENT PRICE
@@ -1216,104 +1221,289 @@ def format_live_price(item):
 # ANALYSIS
 # ============================================================
 
-def analysis_from_series(symbol, prices, volumes=None):
-    p = pd.Series(prices, dtype=float).dropna()
-    if len(p) < 5:
+def _safe_float(v, default=0.0):
+    try:
+        x = float(v)
+        return default if pd.isna(x) else x
+    except Exception:
+        return default
+
+def _rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    out = 100 - (100 / (1 + rs))
+    out = out.where(avg_loss != 0, 100)
+    return out
+
+def _atr(p, period=14):
+    tr = p.diff().abs()
+    return tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+
+def _adx(p, period=14):
+    move = p.diff()
+    up = move.clip(lower=0)
+    down = (-move).clip(lower=0)
+    tr = move.abs()
+    atr = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    dip = 100 * up.ewm(alpha=1/period, adjust=False, min_periods=period).mean() / atr.replace(0, pd.NA)
+    dim = 100 * down.ewm(alpha=1/period, adjust=False, min_periods=period).mean() / atr.replace(0, pd.NA)
+    dx = (100 * (dip - dim).abs() / (dip + dim).replace(0, pd.NA))
+    adx = dx.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    return adx, dip, dim
+
+def _format_price(symbol, value):
+    if symbol == "GOLD18":
+        return f"{value:,.0f}"
+    if symbol == "XAU":
+        return f"{value:,.2f}"
+    if abs(value) >= 1000:
+        return f"{value:,.2f}"
+    if abs(value) >= 1:
+        return f"{value:,.4f}"
+    return f"{value:,.8f}".rstrip("0").rstrip(".")
+
+def technical_analysis(symbol, prices, volumes=None):
+    p = pd.Series(prices, dtype=float).dropna().reset_index(drop=True)
+    if len(p) < 50:
         return None
 
-    ema9 = p.ewm(span=9, adjust=False).mean().iloc[-1]
-    ema21 = p.ewm(span=21, adjust=False).mean().iloc[-1]
+    ema9 = p.ewm(span=9, adjust=False).mean()
+    ema21 = p.ewm(span=21, adjust=False).mean()
+    ema50 = p.ewm(span=50, adjust=False).mean()
+    ema200 = p.ewm(span=200, adjust=False, min_periods=50).mean()
 
     delta = p.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, pd.NA)
+    rsi_s = _rsi(p, 14)
+    rsi = _safe_float(rsi_s.iloc[-1], 50)
 
-    try:
-        rsi = float((100 - (100 / (1 + rs))).iloc[-1])
-    except Exception:
-        rsi = 50.0
+    macd_line = p.ewm(span=12, adjust=False).mean() - p.ewm(span=26, adjust=False).mean()
+    macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+    macd_hist = macd_line - macd_signal
 
-    if pd.isna(rsi):
-        rsi = 50.0
+    bb_mid = p.rolling(20).mean()
+    bb_std = p.rolling(20).std(ddof=0)
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
 
-    r1 = ((p.iloc[-1] / p.iloc[-2]) - 1) * 100 if len(p) >= 2 and p.iloc[-2] else 0
-    r6 = ((p.iloc[-1] / p.iloc[-7]) - 1) * 100 if len(p) >= 7 and p.iloc[-7] else r1
-    r24 = ((p.iloc[-1] / p.iloc[-25]) - 1) * 100 if len(p) >= 25 and p.iloc[-25] else r6
+    atr_s = _atr(p, 14)
+    atr = _safe_float(atr_s.iloc[-1], 0)
+    adx_s, dip_s, dim_s = _adx(p, 14)
+    adx = _safe_float(adx_s.iloc[-1], 0)
+    dip = _safe_float(dip_s.iloc[-1], 0)
+    dim = _safe_float(dim_s.iloc[-1], 0)
 
-    score = 0
-    score += 2 if ema9 > ema21 else -2
-    score += 2 if rsi > 52 else -2 if rsi < 48 else 0
-    score += 1 if r1 > 0 else -1 if r1 < 0 else 0
-    score += 1 if r6 > 0 else -1 if r6 < 0 else 0
-    score = max(-6, min(6, score))
+    current = float(p.iloc[-1])
+    e9, e21, e50 = float(ema9.iloc[-1]), float(ema21.iloc[-1]), float(ema50.iloc[-1])
+    e200 = _safe_float(ema200.iloc[-1], e50)
+    mline, msignal, mhist = float(macd_line.iloc[-1]), float(macd_signal.iloc[-1]), float(macd_hist.iloc[-1])
+    prev_hist = _safe_float(macd_hist.iloc[-2], mhist)
+    mid, upper, lower = _safe_float(bb_mid.iloc[-1], current), _safe_float(bb_upper.iloc[-1], current), _safe_float(bb_lower.iloc[-1], current)
 
-    signal = "BUY" if score >= 3 else "SELL" if score <= -3 else "WAIT"
-    strength = min(99, 50 + abs(score) * 8)
-    probability = min(95, max(5, 50 + score * 7))
+    r1 = ((current / p.iloc[-2]) - 1) * 100 if p.iloc[-2] else 0
+    r6 = ((current / p.iloc[-7]) - 1) * 100 if len(p) >= 7 and p.iloc[-7] else r1
+    r24 = ((current / p.iloc[-25]) - 1) * 100 if len(p) >= 25 and p.iloc[-25] else r6
+    r72 = ((current / p.iloc[-73]) - 1) * 100 if len(p) >= 73 and p.iloc[-73] else r24
+
+    recent = p.tail(min(50, len(p)))
+    resistance = float(recent.max())
+    support = float(recent.min())
+    atr_pct = (atr / current * 100) if current else 0
+    bb_position = ((current - lower) / (upper - lower) * 100) if upper > lower else 50
+
+    if current > e9 > e21 > e50 and current > e200:
+        trend = "BULLISH"
+    elif current < e9 < e21 < e50 and current < e200:
+        trend = "BEARISH"
+    elif current > e50:
+        trend = "BULLISH_WEAK"
+    elif current < e50:
+        trend = "BEARISH_WEAK"
+    else:
+        trend = "NEUTRAL"
+
+    components = [
+        1 if current > e21 else -1,
+        1 if e9 > e21 else -1,
+        1 if e21 > e50 else -1,
+        1 if current > e200 else -1,
+        1 if 50 <= rsi <= 68 else -1 if rsi < 40 or rsi > 75 else 0,
+        1 if mhist > 0 else -1,
+        1 if adx >= 20 else 0,
+        1 if r6 > 0 else -1 if r6 < 0 else 0,
+    ]
+    raw_strength = 50 + sum(components) * 5
+    strength = float(max(10, min(95, raw_strength)))
+
+    buy_points = 0.0
+    sell_points = 0.0
+    reasons_buy, reasons_sell = [], []
+
+    if current > e21 > e50:
+        buy_points += 18; reasons_buy.append("روند و EMA تأیید")
+    elif current < e21 < e50:
+        sell_points += 18; reasons_sell.append("روند و EMA تأیید")
+
+    if mline > msignal and mhist > prev_hist:
+        buy_points += 16; reasons_buy.append("MACD صعودی")
+    elif mline < msignal and mhist < prev_hist:
+        sell_points += 16; reasons_sell.append("MACD نزولی")
+
+    if 52 <= rsi <= 68:
+        buy_points += 12; reasons_buy.append("RSI مناسب خرید")
+    elif 32 <= rsi <= 48:
+        sell_points += 12; reasons_sell.append("RSI مناسب فروش")
+
+    if adx >= 25 and dip > dim:
+        buy_points += 14; reasons_buy.append("قدرت روند +DI")
+    elif adx >= 25 and dim > dip:
+        sell_points += 14; reasons_sell.append("قدرت روند -DI")
+
+    if current > mid and current < upper * 0.995:
+        buy_points += 10; reasons_buy.append("موقعیت Bollinger مناسب")
+    elif current < mid and current > lower * 1.005:
+        sell_points += 10; reasons_sell.append("موقعیت Bollinger مناسب")
+
+    if r6 > 0 and r24 > 0:
+        buy_points += 10; reasons_buy.append("مومنتوم مثبت")
+    elif r6 < 0 and r24 < 0:
+        sell_points += 10; reasons_sell.append("مومنتوم منفی")
+
+    vol_confirm = None
+    if volumes is not None:
+        v = pd.Series(volumes, dtype=float).dropna()
+        if len(v) >= 20:
+            v = v.tail(min(len(v), len(p)))
+            vma = v.rolling(20).mean().iloc[-1]
+            vol_confirm = bool(v.iloc[-1] >= vma * 1.10)
+            if vol_confirm and r1 > 0:
+                buy_points += 10; reasons_buy.append("حجم تأییدکننده")
+            elif vol_confirm and r1 < 0:
+                sell_points += 10; reasons_sell.append("حجم تأییدکننده")
+
+    best = max(buy_points, sell_points)
+    second = min(buy_points, sell_points)
+    direction = "BUY" if buy_points > sell_points else "SELL" if sell_points > buy_points else "WAIT"
+    score = float(best)
+    candidate = direction if score >= SIGNAL_MIN_SCORE and (score - second) >= 20 else "WAIT"
+
+    if candidate == "BUY":
+        stop = current - max(atr * 1.5, current * 0.005)
+        risk = max(current - stop, current * 0.003)
+        targets = [current + risk * 1.5, current + risk * 2.5, current + risk * 3.5]
+    elif candidate == "SELL":
+        stop = current + max(atr * 1.5, current * 0.005)
+        risk = max(stop - current, current * 0.003)
+        targets = [current - risk * 1.5, current - risk * 2.5, current - risk * 3.5]
+    else:
+        stop = 0.0; targets = [0.0, 0.0, 0.0]; risk = 0.0
+
+    rr = 0.0 if not risk else abs((targets[1] - current) / risk)
+    if candidate != "WAIT" and rr < 1.5:
+        candidate = "WAIT"
+
+    probability = float(max(5, min(95, 50 + (score - second) * 0.9)))
 
     return {
-        "symbol": symbol,
-        "price": float(p.iloc[-1]),
-        "ema9": float(ema9),
-        "ema21": float(ema21),
-        "rsi": float(rsi),
-        "r1": float(r1),
-        "r6": float(r6),
-        "r24": float(r24),
-        "score": int(score),
-        "signal": signal,
-        "strength": float(strength),
-        "probability": float(probability),
+        "symbol": symbol, "price": current,
+        "ema9": e9, "ema21": e21, "ema50": e50, "ema200": e200,
+        "rsi": rsi, "macd": mline, "macd_signal": msignal, "macd_hist": mhist,
+        "bb_upper": upper, "bb_mid": mid, "bb_lower": lower, "bb_position": bb_position,
+        "atr": atr, "atr_pct": atr_pct, "adx": adx, "di_plus": dip, "di_minus": dim,
+        "r1": float(r1), "r6": float(r6), "r24": float(r24), "r72": float(r72),
+        "support": support, "resistance": resistance, "trend": trend,
+        "strength": strength, "signal_candidate": candidate, "signal_score": score,
+        "buy_score": buy_points, "sell_score": sell_points,
+        "probability": probability, "reasons_buy": reasons_buy, "reasons_sell": reasons_sell,
+        "stop": stop, "targets": targets, "rr": rr, "volume_confirm": vol_confirm,
+        "history_points": len(p),
+        "signal": "WAIT", "confirmed": False, "confirmations": 0,
     }
+
+def confirm_signal(symbol, candidate, price):
+    if candidate == "WAIT":
+        with db() as c:
+            c.execute("DELETE FROM signal_state WHERE symbol=?", (symbol,))
+        return "WAIT", False, 0
+    now = now_iso()
+    with db() as c:
+        row = c.execute("SELECT * FROM signal_state WHERE symbol=?", (symbol,)).fetchone()
+        if row and row["candidate"] == candidate:
+            confirmations = min(SIGNAL_CONFIRMATIONS_REQUIRED, int(row["confirmations"]) + 1)
+        else:
+            confirmations = 1
+        c.execute("""
+            INSERT INTO signal_state(symbol,candidate,confirmations,last_candidate_at,last_price,updated_at)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                candidate=excluded.candidate, confirmations=excluded.confirmations,
+                last_candidate_at=excluded.last_candidate_at, last_price=excluded.last_price,
+                updated_at=excluded.updated_at
+        """, (symbol, candidate, confirmations, now, float(price), now))
+    confirmed = confirmations >= SIGNAL_CONFIRMATIONS_REQUIRED
+    return (candidate if confirmed else "WAIT"), confirmed, confirmations
 
 async def analyze(symbol):
     s = norm_symbol(symbol)
-
     cached = ANALYSIS_CACHE.get(s)
     if cached and time.monotonic() - cached[0] < ANALYSIS_CACHE_SECONDS:
         return cached[1]
-
     data = await asset_data(s)
-    result = analysis_from_series(data[0], data[1], data[2]) if data else None
-
-    if result:
-        ANALYSIS_CACHE[s] = (time.monotonic(), result)
-
+    if not data:
+        return None
+    if s in ("GOLD18", "XAU") and len(data[1]) < GOLD_MIN_HISTORY_POINTS:
+        return {"symbol": s, "price": float(data[1].iloc[-1]), "insufficient_history": True, "history_points": len(data[1]), "signal": "WAIT"}
+    result = technical_analysis(data[0], data[1], data[2])
+    if not result:
+        return None
+    confirmed_signal, confirmed, confirmations = confirm_signal(s, result["signal_candidate"], result["price"])
+    result["signal"] = confirmed_signal
+    result["confirmed"] = confirmed
+    result["confirmations"] = confirmations
+    ANALYSIS_CACHE[s] = (time.monotonic(), result)
     return result
 
 def signal_fa(s):
-    return {
-        "BUY": "🟢 خرید",
-        "SELL": "🔴 فروش",
-        "WAIT": "🟡 انتظار"
-    }.get(s, s)
+    return {"BUY":"🟢 خرید","SELL":"🔴 فروش","WAIT":"🟡 انتظار"}.get(s, s)
 
 def analysis_text(a):
     if not a:
         return "❌ اطلاعات بازار در دسترس نیست."
-
-    if a["symbol"] == "GOLD18":
-        unit = " تومان"
-    elif a["symbol"] == "XAU":
-        unit = " دلار"
-    else:
-        unit = " دلار"
-
+    if a.get("insufficient_history"):
+        return (f"📊 <b>تحلیل {escape(a['symbol'])}</b>\n\n"
+                f"💰 قیمت فعلی: <b>{_format_price(a['symbol'], a['price'])}</b>\n"
+                f"📚 تاریخچه قابل استفاده: {a['history_points']} نقطه از {GOLD_MIN_HISTORY_POINTS} نقطه لازم\n\n"
+                "⏳ تحلیل تکنیکال و سیگنال پس از جمع‌آوری تاریخچه واقعی فعال می‌شود.\n"
+                "❌ هیچ داده مصنوعی یا قیمت تکراری برای ساخت اندیکاتورها استفاده نمی‌شود.")
+    unit = "تومان" if a["symbol"] == "GOLD18" else "دلار"
+    trend_fa = {"BULLISH":"صعودی قوی","BULLISH_WEAK":"صعودی ضعیف","BEARISH":"نزولی قوی","BEARISH_WEAK":"نزولی ضعیف","NEUTRAL":"خنثی"}.get(a["trend"], a["trend"])
+    reasons = a["reasons_buy"] if a["signal_candidate"] == "BUY" else a["reasons_sell"] if a["signal_candidate"] == "SELL" else []
+    reasons_text = "\n".join("✅ " + escape(x) for x in reasons[:6]) or "⚪ تأیید کافی وجود ندارد"
     return (
-        f"📊 <b>تحلیل {escape(a['symbol'])}</b>\n\n"
-        f"💰 قیمت: <b>{a['price']:,.4f}{unit}</b>\n"
-        f"📈 EMA9: {a['ema9']:,.4f}\n"
-        f"📉 EMA21: {a['ema21']:,.4f}\n"
-        f"RSI14: <b>{a['rsi']:.1f}</b>\n"
-        f"بازده کوتاه‌مدت: {a['r1']:+.2f}%\n"
-        f"بازده ۶ دوره: {a['r6']:+.2f}%\n"
-        f"بازده ۲۴ دوره: {a['r24']:+.2f}%\n\n"
-        f"🎯 سیگنال: <b>{signal_fa(a['signal'])}</b>\n"
-        f"💪 درصد قدرت: <b>{a['strength']:.0f}%</b>\n"
-        f"🎲 احتمال سود: <b>{a['probability']:.0f}%</b>\n\n"
-        "⚠️ این تحلیل آموزشی است و تضمین سود نیست."
-    )
+        f"📊 <b>تحلیل تکنیکال {escape(a['symbol'])}</b>\n\n"
+        f"💰 قیمت: <b>{_format_price(a['symbol'], a['price'])} {unit}</b>\n"
+        f"📈 روند: <b>{trend_fa}</b>\n\n"
+        f"EMA9: {_format_price(a['symbol'], a['ema9'])} | EMA21: {_format_price(a['symbol'], a['ema21'])}\n"
+        f"EMA50: {_format_price(a['symbol'], a['ema50'])} | EMA200: {_format_price(a['symbol'], a['ema200'])}\n"
+        f"RSI14: <b>{a['rsi']:.1f}</b> | ADX: <b>{a['adx']:.1f}</b>\n"
+        f"MACD: {a['macd']:.5f} | Histogram: {a['macd_hist']:+.5f}\n"
+        f"Bollinger Position: {a['bb_position']:.1f}%\n"
+        f"ATR: {_format_price(a['symbol'], a['atr'])} ({a['atr_pct']:.2f}%)\n"
+        f"حمایت: {_format_price(a['symbol'], a['support'])} | مقاومت: {_format_price(a['symbol'], a['resistance'])}\n\n"
+        f"بازده 1 دوره: {a['r1']:+.2f}% | 6 دوره: {a['r6']:+.2f}%\n"
+        f"بازده 24 دوره: {a['r24']:+.2f}% | 72 دوره: {a['r72']:+.2f}%\n\n"
+        f"💪 قدرت تکنیکال: <b>{a['strength']:.0f}%</b>\n\n"
+        f"🎯 <b>موتور سیگنال مستقل</b>\n"
+        f"وضعیت: <b>{signal_fa(a['signal'])}</b>\n"
+        f"قدرت سیگنال: <b>{a['signal_score']:.0f}%</b>\n"
+        f"احتمال سود مدل: <b>{a['probability']:.0f}%</b>\n"
+        f"تأیید متوالی: <b>{a['confirmations']}/{SIGNAL_CONFIRMATIONS_REQUIRED}</b>\n\n"
+        f"{reasons_text}\n\n"
+        + (f"💰 ورود: {_format_price(a['symbol'], a['price'])}\n🛑 حد ضرر: {_format_price(a['symbol'], a['stop'])}\n🎯 هدف 1: {_format_price(a['symbol'], a['targets'][0])}\n🎯 هدف 2: {_format_price(a['symbol'], a['targets'][1])}\n🎯 هدف 3: {_format_price(a['symbol'], a['targets'][2])}\n⚖️ R/R: 1:{a['rr']:.2f}\n\n" if a['signal'] != 'WAIT' else "\n⏳ برای ارسال BUY/SELL، تأیید کامل و متوالی لازم است.\n\n")
+        + "⚠️ این خروجی مدل تحلیلی است و هیچ سیگنال بازار تضمین‌شده نیست.")
 
 # ============================================================
 # WATCHLIST
@@ -2189,100 +2379,64 @@ async def alert_callback(update, context):
         "🔔 هشدار سیگنال: " + ("فعال" if new else "خاموش")
     )
 
+async def market_snapshot_worker():
+    while True:
+        try:
+            await asyncio.gather(
+                current_price("GOLD18"),
+                current_price("XAU"),
+                return_exceptions=True
+            )
+        except Exception:
+            log.exception("market snapshot worker")
+        await asyncio.sleep(GOLD_HISTORY_INTERVAL_SECONDS)
+
 async def alert_worker(app):
     while True:
         try:
             with db() as c:
                 rows = c.execute("""
-                SELECT DISTINCT w.symbol
-                FROM watchlist w
+                SELECT DISTINCT w.symbol FROM watchlist w
                 JOIN alert_preferences a ON a.user_id=w.user_id
                 JOIN subscriptions s ON s.user_id=w.user_id
-                WHERE a.enabled=1
-                AND s.status='active'
-                AND s.end_at>?
+                WHERE a.enabled=1 AND s.status='active' AND s.end_at>?
                 """, (now_iso(),)).fetchall()
-
             symbols = [r["symbol"] for r in rows]
             analyses = {}
-
             if symbols:
-                results = await asyncio.gather(
-                    *(analyze(s) for s in symbols),
-                    return_exceptions=True
-                )
+                results = await asyncio.gather(*(analyze(s) for s in symbols), return_exceptions=True)
                 for s, a in zip(symbols, results):
-                    if isinstance(a, Exception):
-                        continue
-                    if a:
+                    if not isinstance(a, Exception) and a:
                         analyses[s] = a
 
             with db() as c:
                 users = c.execute("""
-                SELECT DISTINCT a.user_id
-                FROM alert_preferences a
+                SELECT DISTINCT a.user_id FROM alert_preferences a
                 JOIN subscriptions s ON s.user_id=a.user_id
                 JOIN watchlist w ON w.user_id=a.user_id
-                WHERE a.enabled=1
-                AND s.status='active'
-                AND s.end_at>?
+                WHERE a.enabled=1 AND s.status='active' AND s.end_at>?
                 """, (now_iso(),)).fetchall()
 
             for ur in users:
                 uid = ur["user_id"]
-                assets = user_assets(uid)
-
-                for asset in assets:
+                for asset in user_assets(uid):
                     a = analyses.get(asset["symbol"])
-
-                    if not a or a["signal"] == "WAIT":
+                    if not a or a.get("signal") == "WAIT" or not a.get("confirmed"):
                         continue
-
-                    key = f"{a['symbol']}:{a['signal']}"
-
+                    key = f"{a['symbol']}:{a['signal']}:{a.get('confirmations',0)}:{round(a['price'],8)}"
                     with db() as c:
-                        prev = c.execute("""
-                        SELECT signal_key
-                        FROM alert_events
-                        WHERE user_id=? AND symbol=?
-                        ORDER BY id DESC LIMIT 1
-                        """, (uid, a["symbol"])).fetchone()
-
-                        if prev and prev["signal_key"] == key:
+                        prev = c.execute("SELECT signal_key FROM alert_events WHERE user_id=? AND symbol=? ORDER BY id DESC LIMIT 1", (uid,a["symbol"])).fetchone()
+                        if prev and prev["signal_key"].startswith(f"{a['symbol']}:{a['signal']}"):
                             continue
-
-                        c.execute("""
-                        INSERT INTO alert_events(
-                            user_id,symbol,signal_key,message,created_at
-                        ) VALUES(?,?,?,?,?)
-                        """, (
-                            uid,
-                            a["symbol"],
-                            key,
-                            analysis_text(a),
-                            now_iso()
-                        ))
-
+                        c.execute("INSERT INTO alert_events(user_id,symbol,signal_key,message,created_at) VALUES(?,?,?,?,?)", (uid,a["symbol"],key,analysis_text(a),now_iso()))
                     try:
-                        await app.bot.send_message(
-                            uid,
-                            "🔔 <b>سیگنال جدید</b>\n\n" +
-                            analysis_text(a),
-                            parse_mode=ParseMode.HTML
-                        )
+                        await app.bot.send_message(uid, "🔔 <b>سیگنال تأییدشده</b>\n\n" + analysis_text(a), parse_mode=ParseMode.HTML)
                     except Exception:
                         pass
-
                 with db() as c:
-                    c.execute("""
-                    UPDATE alert_preferences
-                    SET last_check_at=?
-                    WHERE user_id=?
-                    """, (now_iso(), uid))
-
+                    c.execute("UPDATE alert_preferences SET last_check_at=? WHERE user_id=?", (now_iso(),uid))
         except Exception:
             log.exception("alert worker")
-
         await asyncio.sleep(ALERT_INTERVAL_SECONDS)
 
 # ============================================================
@@ -3038,6 +3192,10 @@ async def post_init(app):
 
     app.create_task(
         backup_worker()
+    )
+
+    app.create_task(
+        market_snapshot_worker()
     )
 
     try:
