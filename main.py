@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Crypto / Global Gold / Iran 18K Gold Telegram Analyzer
-Railway production build
+Railway production build — REVISED v12
 Analysis + signals + notifications. No automatic trading.
 
 Sources:
-- Crypto: CoinGecko
+- Crypto OHLCV : OKX spot (professional multi-timeframe engine)
+- Crypto market: CoinGecko (universe scan, fallback close-only)
 - Iran 18K Gold: TGJU / profile/geram18
-- Global Gold XAU: TGJU / profile/ons
+- Global Gold  : TGJU / profile/ons
 
 Required:
     TELEGRAM_BOT_TOKEN
@@ -26,6 +27,18 @@ IMPORTANT:
 - Keep only ONE running instance for this bot token.
 - Never delete /data/crypto_bot.db.
 - Database migrations are additive.
+
+CHANGELOG v12:
+- Fixed GOLD18 Rial/Toman ambiguity with strict value ranges.
+- Fixed XAU parser to reject silver/platinum noise.
+- Signal confirmation now bucket-based (per closed candle), not wall-minute.
+- LRU+TTL cache with size cap (no memory leak).
+- BTC market gate stricter (BUY or strength>=65).
+- Alert cycle key wall-clock based (survives restarts).
+- RSI gates for BUY/SELL symmetric and safer.
+- Volume series properly aligned in fallback analysis.
+- growth_scan unified on professional engine.
+- Analysis labels clarified (candle vs day).
 """
 
 import os
@@ -33,6 +46,7 @@ import re
 import sqlite3
 import shutil
 from pathlib import Path
+from collections import OrderedDict
 import asyncio
 import logging
 import time
@@ -60,8 +74,6 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 ADMIN_IDS = set()
-# Accept both names so an older Railway configuration using ADMIN_ID
-# cannot silently disable the admin payment buttons.
 _admin_raw = os.getenv("ADMIN_IDS", "").strip()
 if not _admin_raw:
     _admin_raw = os.getenv("ADMIN_ID", "").strip()
@@ -70,8 +82,7 @@ for x in _admin_raw.split(","):
         if x.strip():
             ADMIN_IDS.add(int(x.strip()))
     except ValueError:
-        log_msg = f"Invalid admin id ignored: {x!r}"
-        print(log_msg)
+        print(f"Invalid admin id ignored: {x!r}")
 
 DB_PATH = os.getenv("DB_PATH", "/data/crypto_bot.db").strip()
 BACKUP_DIR = os.getenv("BACKUP_DIR", "/data/backups").strip()
@@ -86,17 +97,17 @@ ANALYSIS_CACHE_SECONDS = max(15, int(os.getenv("ANALYSIS_CACHE_SECONDS", "45")))
 ALERT_INTERVAL_SECONDS = max(60, int(os.getenv("ALERT_INTERVAL_SECONDS", "300")))
 MAX_WATCHLIST = max(1, int(os.getenv("MAX_WATCHLIST", "100")))
 
-# Smart technical-analysis engine
 GOLD_HISTORY_INTERVAL_SECONDS = max(60, int(os.getenv("GOLD_HISTORY_INTERVAL_SECONDS", "300")))
 GOLD_MIN_HISTORY_POINTS = max(50, int(os.getenv("GOLD_MIN_HISTORY_POINTS", "50")))
 SIGNAL_MIN_SCORE = max(70, min(100, int(os.getenv("SIGNAL_MIN_SCORE", "85"))))
 ALERT_OPPORTUNITY_MIN = max(85, min(100, int(os.getenv("ALERT_OPPORTUNITY_MIN", "85"))))
 ALERT_STRENGTH_MIN = max(72, min(100, int(os.getenv("ALERT_STRENGTH_MIN", "72"))))
 ALERT_PROBABILITY_MIN = max(70, min(100, int(os.getenv("ALERT_PROBABILITY_MIN", "70"))))
-ALERT_RSI_MIN = max(45, min(60, int(os.getenv("ALERT_RSI_MIN", "50"))))
-ALERT_RSI_MAX = max(65, min(75, int(os.getenv("ALERT_RSI_MAX", "68"))))
+ALERT_RSI_MIN = max(40, min(60, int(os.getenv("ALERT_RSI_MIN", "48"))))
+ALERT_RSI_MAX = max(65, min(78, int(os.getenv("ALERT_RSI_MAX", "70"))))
 ALERT_MIN_TURNOVER = max(0.01, float(os.getenv("ALERT_MIN_TURNOVER", "0.03")))
 SIGNAL_CONFIRMATIONS_REQUIRED = max(2, int(os.getenv("SIGNAL_CONFIRMATIONS_REQUIRED", "2")))
+SIGNAL_CONFIRM_TIMEFRAME = os.getenv("SIGNAL_CONFIRM_TIMEFRAME", "4H").strip()
 MARKET_SCAN_PAGES = max(1, min(40, int(os.getenv("MARKET_SCAN_PAGES", "40"))))
 MARKET_SCAN_PER_PAGE = max(50, min(250, int(os.getenv("MARKET_SCAN_PER_PAGE", "250"))))
 MARKET_SCAN_TOP = max(5, min(30, int(os.getenv("MARKET_SCAN_TOP", "12"))))
@@ -112,17 +123,17 @@ OKX_CANDLE_CACHE = {}
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "ثبت نشده").strip()
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "پشتیبان").strip()
 
-# TGJU sources
 GOLD18_URL = "https://www.tgju.org/profile/geram18"
 XAU_TGJU_URL = "https://www.tgju.org/profile/ons"
-
-# Optional explicit selectors if TGJU changes HTML.
 GOLD18_PRICE_SELECTOR = os.getenv("GOLD18_PRICE_SELECTOR", "").strip()
 XAU_PRICE_SELECTOR = os.getenv("XAU_PRICE_SELECTOR", "").strip()
-
-# auto = detect, toman/rial = force source unit
 GOLD18_SOURCE_UNIT = os.getenv("GOLD18_SOURCE_UNIT", "auto").strip().lower()
-XAU_SOURCE_UNIT = os.getenv("XAU_SOURCE_UNIT", "auto").strip().lower()
+
+# Real Iranian 18K price band (Toman per gram). Update if market shifts.
+GOLD18_TOMAN_MIN = int(os.getenv("GOLD18_TOMAN_MIN", "15000000"))
+GOLD18_TOMAN_MAX = int(os.getenv("GOLD18_TOMAN_MAX", "90000000"))
+XAU_USD_MIN = float(os.getenv("XAU_USD_MIN", "500"))
+XAU_USD_MAX = float(os.getenv("XAU_USD_MAX", "10000"))
 
 PLANS = {
     "30": (30, 200000),
@@ -137,7 +148,40 @@ logging.basicConfig(
 log = logging.getLogger("market_bot")
 
 HTTP_SESSION = None
-CACHE = {}
+
+
+# ============================================================
+# LRU + TTL CACHE (bounded)
+# ============================================================
+
+class LRUTTLCache:
+    """Bounded ordered cache. Prevents unbounded memory growth."""
+    def __init__(self, maxsize=2000):
+        self._data = OrderedDict()
+        self._max = max(64, int(maxsize))
+
+    def get(self, key, ttl):
+        item = self._data.get(key)
+        if not item:
+            return None
+        ts, val = item
+        if time.monotonic() - ts >= ttl:
+            self._data.pop(key, None)
+            return None
+        self._data.move_to_end(key)
+        return val
+
+    def set(self, key, val):
+        self._data[key] = (time.monotonic(), val)
+        self._data.move_to_end(key)
+        while len(self._data) > self._max:
+            self._data.popitem(last=False)
+
+    def __len__(self):
+        return len(self._data)
+
+
+CACHE = LRUTTLCache(maxsize=int(os.getenv("CACHE_MAX_ENTRIES", "2000")))
 PRICE_CACHE = {}
 ANALYSIS_CACHE = {}
 GOLD18_CACHE = None
@@ -226,31 +270,17 @@ def _restore_latest_backup(target):
     return False
 
 def _prepare_persistent_db():
-    """Prepare the persistent DB without ever replacing a healthy user database.
-
-    Priority:
-      1) Existing /data database with users/subscriptions.
-      2) Latest valid backup on /data/backups.
-      3) Legacy database left in the container/repo.
-      4) Only then allow SQLite to create a fresh database.
-
-    This is intentionally conservative so a code update cannot wipe subscriptions.
-    """
     target = Path(DB_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
     Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
 
-    # Never replace a healthy persistent database.
     if target.exists() and _db_has_tables(target):
         users = _db_user_count(target)
         if users > 0:
             return
-
-        # Empty DB: try backup first, then legacy DB.
         if AUTO_RESTORE_BACKUP and _restore_latest_backup(target):
             return
 
-    # If target exists but is corrupt/empty, preserve it before attempting recovery.
     recovery_candidates = [
         Path("/app/crypto_bot.db"),
         Path("/app/data/crypto_bot.db"),
@@ -264,8 +294,6 @@ def _prepare_persistent_db():
         Path("subscriptions.db"),
         Path("zec_bot.db"),
     ]
-
-    # Optional comma-separated legacy paths can be supplied during migration.
     for raw in os.getenv("LEGACY_DB_PATHS", "").split(","):
         raw = raw.strip()
         if raw:
@@ -279,36 +307,26 @@ def _prepare_persistent_db():
             if src in seen or src == target_resolved:
                 continue
             seen.add(src)
-
             if not src.exists() or not _db_has_tables(src):
                 continue
             users = _db_user_count(src)
             if users <= 0:
                 continue
-
-            # If target is a bad/empty file, preserve it for diagnosis.
             if target.exists() and target.stat().st_size > 0 and _db_user_count(target) == 0:
                 try:
-                    quarantine = target.with_name(
-                        target.name + ".empty-before-recovery"
-                    )
+                    quarantine = target.with_name(target.name + ".empty-before-recovery")
                     if not quarantine.exists():
                         shutil.copy2(target, quarantine)
                 except Exception:
                     pass
-
             tmp = target.with_suffix(target.suffix + ".migrate.tmp")
             shutil.copy2(src, tmp)
             os.replace(tmp, target)
-            log.warning(
-                "RECOVERED USER DATABASE: %s -> %s | users=%s",
-                src, target, users
-            )
+            log.warning("RECOVERED USER DATABASE: %s -> %s | users=%s", src, target, users)
             return
         except Exception as e:
             log.warning("Legacy database recovery failed %s: %s", src, e)
 
-    # Final backup attempt after legacy search.
     if AUTO_RESTORE_BACKUP:
         _restore_latest_backup(target)
 
@@ -387,7 +405,6 @@ def database_diagnostics():
         }
 
 def _preflight_legacy_schema():
-    """Repair columns that older production databases may be missing before indexes/queries run."""
     path = Path(DB_PATH)
     if not path.exists():
         return
@@ -404,15 +421,14 @@ def _preflight_legacy_schema():
             cols = {r[1] for r in con.execute("PRAGMA table_info(subscriptions)")}
             if "end_at" not in cols:
                 con.execute("ALTER TABLE subscriptions ADD COLUMN end_at TEXT")
-                # Older versions used different names for the subscription expiry.
                 if "end_date" in cols:
-                    con.execute("UPDATE subscriptions SET end_at=end_date WHERE end_at IS NULL OR end_at=''" )
+                    con.execute("UPDATE subscriptions SET end_at=end_date WHERE end_at IS NULL OR end_at=''")
                 elif "expires_at" in cols:
-                    con.execute("UPDATE subscriptions SET end_at=expires_at WHERE end_at IS NULL OR end_at=''" )
+                    con.execute("UPDATE subscriptions SET end_at=expires_at WHERE end_at IS NULL OR end_at=''")
                 elif "expiry" in cols:
-                    con.execute("UPDATE subscriptions SET end_at=expiry WHERE end_at IS NULL OR end_at=''" )
+                    con.execute("UPDATE subscriptions SET end_at=expiry WHERE end_at IS NULL OR end_at=''")
                 elif "start_at" in cols and "days" in cols:
-                    rows = con.execute("SELECT id,start_at,days FROM subscriptions WHERE end_at IS NULL OR end_at=''" ).fetchall()
+                    rows = con.execute("SELECT id,start_at,days FROM subscriptions WHERE end_at IS NULL OR end_at=''").fetchall()
                     for row in rows:
                         try:
                             start = datetime.fromisoformat(str(row[1]))
@@ -420,16 +436,13 @@ def _preflight_legacy_schema():
                             con.execute("UPDATE subscriptions SET end_at=? WHERE id=?", (end.isoformat(), row[0]))
                         except Exception:
                             pass
-
-            # Ensure legacy rows with no expiry cannot break active-subscription queries.
-            if "status" in cols or "status" in {r[1] for r in con.execute("PRAGMA table_info(subscriptions)")}:
+            if "status" in cols:
                 con.execute("UPDATE subscriptions SET status='expired' WHERE (end_at IS NULL OR end_at='') AND status='active'")
 
         if "watchlist" in tables:
             cols = {r[1] for r in con.execute("PRAGMA table_info(watchlist)")}
             if "asset_key" in cols:
-                # Old schema requires asset_key on INSERT. Existing rows are left intact.
-                con.execute("UPDATE watchlist SET asset_key=upper(symbol) WHERE asset_key IS NULL OR asset_key=''" )
+                con.execute("UPDATE watchlist SET asset_key=upper(symbol) WHERE asset_key IS NULL OR asset_key=''")
 
         con.commit()
         con.close()
@@ -447,150 +460,72 @@ def init_db():
 
     with db() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS app_meta(
-            key TEXT PRIMARY KEY,value TEXT
-        );
-
+        CREATE TABLE IF NOT EXISTS app_meta(key TEXT PRIMARY KEY,value TEXT);
         CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            created_at TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            blocked INTEGER NOT NULL DEFAULT 0
-        );
-
+            user_id INTEGER PRIMARY KEY,username TEXT,first_name TEXT,
+            created_at TEXT NOT NULL,last_seen TEXT NOT NULL,
+            blocked INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS subscriptions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            plan TEXT NOT NULL,
-            days INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            start_at TEXT NOT NULL,
-            end_at TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,days INTEGER NOT NULL,amount INTEGER NOT NULL,
+            start_at TEXT NOT NULL,end_at TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active',
             source TEXT DEFAULT 'manual',
-            payment_request_id INTEGER,
-            created_at TEXT NOT NULL
-        );
-
+            payment_request_id INTEGER,created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS payment_requests(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            plan TEXT NOT NULL,
-            days INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            receipt_file_id TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            reviewed_at TEXT,
-            reviewed_by INTEGER
-        );
-
+            id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,days INTEGER NOT NULL,amount INTEGER NOT NULL,
+            receipt_file_id TEXT,status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,reviewed_at TEXT,reviewed_by INTEGER);
         CREATE TABLE IF NOT EXISTS watchlist(
-            user_id INTEGER NOT NULL,
-            symbol TEXT NOT NULL,
-            asset_type TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY(user_id,symbol,asset_type)
-        );
-
+            user_id INTEGER NOT NULL,symbol TEXT NOT NULL,
+            asset_type TEXT NOT NULL,created_at TEXT NOT NULL,
+            PRIMARY KEY(user_id,symbol,asset_type));
         CREATE TABLE IF NOT EXISTS alert_preferences(
-            user_id INTEGER PRIMARY KEY,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            interval_seconds INTEGER NOT NULL DEFAULT 300,
-            last_check_at TEXT
-        );
-
+            user_id INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,
+            interval_seconds INTEGER NOT NULL DEFAULT 300,last_check_at TEXT);
         CREATE TABLE IF NOT EXISTS alert_events(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            symbol TEXT NOT NULL,
-            signal_key TEXT NOT NULL,
-            message TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-
+            id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,signal_key TEXT NOT NULL,
+            message TEXT NOT NULL,created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS market_history(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            asset_type TEXT NOT NULL,
-            price REAL NOT NULL,
-            created_at TEXT NOT NULL
-        );
-
+            id INTEGER PRIMARY KEY AUTOINCREMENT,symbol TEXT NOT NULL,
+            asset_type TEXT NOT NULL,price REAL NOT NULL,created_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_market_history_asset
         ON market_history(symbol,asset_type,created_at);
-
         CREATE TABLE IF NOT EXISTS signal_state(
-            symbol TEXT PRIMARY KEY,
-            candidate TEXT NOT NULL,
+            symbol TEXT PRIMARY KEY,candidate TEXT NOT NULL,
             confirmations INTEGER NOT NULL DEFAULT 0,
-            last_candidate_at TEXT,
-            last_price REAL,
-            updated_at TEXT NOT NULL
-        );
-
+            last_candidate_at TEXT,last_price REAL,updated_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_signal_state_candidate
         ON signal_state(candidate,confirmations);
-
         CREATE TABLE IF NOT EXISTS market_alert_state(
-            symbol TEXT PRIMARY KEY,
-            candidate TEXT NOT NULL,
+            symbol TEXT PRIMARY KEY,candidate TEXT NOT NULL,
             confirmations INTEGER NOT NULL DEFAULT 0,
-            last_observation_key TEXT,
-            last_price REAL,
-            updated_at TEXT NOT NULL
-        );
-
+            last_observation_key TEXT,last_price REAL,updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS support_messages(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            admin_id INTEGER,
-            direction TEXT NOT NULL,
-            message TEXT,
-            telegram_message_id INTEGER,
-            status TEXT NOT NULL DEFAULT 'open',
-            created_at TEXT NOT NULL,
-            replied_at TEXT
-        );
-
+            id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,
+            admin_id INTEGER,direction TEXT NOT NULL,message TEXT,
+            telegram_message_id INTEGER,status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL,replied_at TEXT);
         CREATE TABLE IF NOT EXISTS chat_messages(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            asset_type TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            message TEXT NOT NULL,
-            telegram_message_id INTEGER,
-            created_at TEXT NOT NULL,
-            deleted INTEGER NOT NULL DEFAULT 0,
-            deleted_by INTEGER,
-            deleted_at TEXT
-        );
-
+            id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,
+            asset_type TEXT NOT NULL,symbol TEXT NOT NULL,message TEXT NOT NULL,
+            telegram_message_id INTEGER,created_at TEXT NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0,deleted_by INTEGER,deleted_at TEXT);
         CREATE TABLE IF NOT EXISTS chat_reports(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id INTEGER NOT NULL,
-            reporter_id INTEGER NOT NULL,
-            reason TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            reviewed_by INTEGER,
-            reviewed_at TEXT
-        );
-
+            id INTEGER PRIMARY KEY AUTOINCREMENT,message_id INTEGER NOT NULL,
+            reporter_id INTEGER NOT NULL,reason TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,
+            reviewed_by INTEGER,reviewed_at TEXT);
         """)
-        # Additive migrations for older databases.  The bot must keep
-        # existing users/subscriptions/watchlists after code upgrades.
+
         ensure_column(c, "users", "username", "TEXT")
         ensure_column(c, "users", "first_name", "TEXT")
         ensure_column(c, "users", "created_at", "TEXT")
         ensure_column(c, "users", "blocked", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(c, "users", "last_seen", "TEXT")
 
-        # Payment migrations for databases created by older bot versions.
-        # Receipt approval must keep working even when the persistent DB was
-        # created by an older release.
         ensure_column(c, "payment_requests", "user_id", "INTEGER")
         ensure_column(c, "payment_requests", "plan", "TEXT")
         ensure_column(c, "payment_requests", "days", "INTEGER")
@@ -601,7 +536,6 @@ def init_db():
         ensure_column(c, "payment_requests", "reviewed_at", "TEXT")
         ensure_column(c, "payment_requests", "reviewed_by", "INTEGER")
 
-        # Subscription migrations for databases created by older bot versions.
         ensure_column(c, "subscriptions", "plan", "TEXT")
         ensure_column(c, "subscriptions", "days", "INTEGER")
         ensure_column(c, "subscriptions", "amount", "INTEGER")
@@ -612,25 +546,19 @@ def init_db():
         ensure_column(c, "subscriptions", "payment_request_id", "INTEGER")
         ensure_column(c, "subscriptions", "created_at", "TEXT")
 
-        # Watchlist migrations. Some old production DBs have a mandatory
-        # asset_key column, so add/populate it and make inserts aware of it.
         ensure_column(c, "watchlist", "user_id", "INTEGER")
         ensure_column(c, "watchlist", "symbol", "TEXT")
         ensure_column(c, "watchlist", "asset_type", "TEXT")
         ensure_column(c, "watchlist", "created_at", "TEXT")
-        # Some production databases created by an older version have a
-        # mandatory asset_key column. Add it safely when missing, and fill
-        # empty legacy rows before any watchlist INSERT is attempted.
         ensure_column(c, "watchlist", "asset_key", "TEXT DEFAULT ''")
-        c.execute("UPDATE watchlist SET asset_key=upper(symbol) WHERE asset_key IS NULL OR asset_key='' ")
+        c.execute("UPDATE watchlist SET asset_key=upper(symbol) WHERE asset_key IS NULL OR asset_key=''")
+
         ensure_column(c, "alert_events", "signal_key", "TEXT DEFAULT ''")
         ensure_column(c, "market_alert_state", "cycle_id", "TEXT")
         ensure_column(c, "support_messages", "replied_at", "TEXT")
         ensure_column(c, "chat_messages", "deleted_by", "INTEGER")
         ensure_column(c, "chat_messages", "deleted_at", "TEXT")
 
-        # Create indexes only AFTER additive migrations. Older production
-        # databases may not have columns such as subscriptions.end_at yet.
         c.execute("CREATE INDEX IF NOT EXISTS idx_sub_user_end ON subscriptions(user_id,end_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_pay_status ON payment_requests(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_watch_asset ON watchlist(asset_type,symbol)")
@@ -638,7 +566,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_chat_reports ON chat_reports(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_alert_events ON alert_events(user_id,symbol,created_at)")
 
-        c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('schema_version','11')")
+        c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('schema_version','12')")
         c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('db_path',?)", (DB_PATH,))
 
 def now_iso():
@@ -751,9 +679,9 @@ def cache_key(url, params):
 async def http_json(url, params=None, ttl=None, retries=2):
     key = cache_key(url, params)
     ttl = CACHE_SECONDS if ttl is None else ttl
-    item = CACHE.get(key)
-    if item and time.monotonic() - item[0] < ttl:
-        return item[1]
+    cached = CACHE.get(key, ttl)
+    if cached is not None:
+        return cached
 
     session = await get_session()
     for attempt in range(retries):
@@ -761,7 +689,7 @@ async def http_json(url, params=None, ttl=None, retries=2):
             async with session.get(url, params=params) as r:
                 if r.status == 200:
                     data = await r.json(content_type=None)
-                    CACHE[key] = (time.monotonic(), data)
+                    CACHE.set(key, data)
                     return data
                 log.warning("HTTP %s %s", r.status, url)
         except Exception as e:
@@ -773,15 +701,15 @@ async def http_json(url, params=None, ttl=None, retries=2):
 async def http_text(url, ttl=None):
     key = ("TEXT", url)
     ttl = CACHE_SECONDS if ttl is None else ttl
-    item = CACHE.get(key)
-    if item and time.monotonic() - item[0] < ttl:
-        return item[1]
+    cached = CACHE.get(key, ttl)
+    if cached is not None:
+        return cached
     try:
         session = await get_session()
         async with session.get(url) as r:
             if r.status == 200:
                 text = await r.text()
-                CACHE[key] = (time.monotonic(), text)
+                CACHE.set(key, text)
                 return text
             log.warning("HTTP text %s: %s", r.status, url)
     except Exception as e:
@@ -861,10 +789,6 @@ async def crypto_data(symbol, coin_id=None):
     return s, prices, vols
 
 async def market_universe():
-    """Fetch a broad CoinGecko market universe, paginated and cached.
-    This is the universe the bot can actually inspect; it is broader than the
-    hand-maintained COINS dictionary and can be tuned with MARKET_SCAN_PAGES.
-    """
     global MARKET_SCAN_CACHE
     now = time.monotonic()
     if MARKET_SCAN_CACHE and now - MARKET_SCAN_CACHE[0] < MARKET_SCAN_SECONDS:
@@ -900,8 +824,14 @@ async def market_universe():
 def _clamp(v, lo=0, hi=100):
     return max(lo, min(hi, float(v)))
 
+def _safe_float(v, default=0.0):
+    try:
+        x = float(v)
+        return default if pd.isna(x) else x
+    except Exception:
+        return default
+
 def _market_growth_score(x, ta=None):
-    """Score growth setup, not guaranteed profit. Strength stays separate."""
     p = float(x.get("current_price") or 0)
     if p <= 0:
         return None
@@ -916,7 +846,6 @@ def _market_growth_score(x, ta=None):
         return None
 
     score = 50.0
-    # Momentum, with a penalty for extreme one-day spikes.
     score += _clamp(ch1 * 2.0, -8, 8)
     score += _clamp(ch24 * 0.65, -10, 10)
     score += _clamp(ch7 * 0.40, -8, 8)
@@ -926,41 +855,31 @@ def _market_growth_score(x, ta=None):
     turnover = vol / mcap
     score += _clamp((turnover - 0.05) * 80, -5, 8)
 
-    # Prefer constructive momentum rather than already-parabolic moves.
-    if ch24 > 25:
-        score -= 7
-    if ch7 > 60:
-        score -= 5
-    if ch24 < -20 and ch7 < -20:
-        score -= 8
+    if ch24 > 25: score -= 7
+    if ch7 > 60: score -= 5
+    if ch24 < -20 and ch7 < -20: score -= 8
 
     if ta:
         score += _clamp((ta.get("strength",50)-50)*0.18, -8, 8)
-        if ta.get("trend") in ("BULLISH", "BULLISH_WEAK"):
-            score += 5
-        if ta.get("rsi",50) > 75:
-            score -= 5
-        elif 52 <= ta.get("rsi",50) <= 68:
-            score += 4
-        if ta.get("macd_hist",0) > 0:
-            score += 4
-        if ta.get("adx",0) >= 20:
-            score += 3
+        if ta.get("trend") in ("BULLISH", "BULLISH_WEAK"): score += 5
+        if ta.get("rsi",50) > 75: score -= 5
+        elif 52 <= ta.get("rsi",50) <= 68: score += 4
+        if ta.get("macd_hist",0) > 0: score += 4
+        if ta.get("adx",0) >= 20: score += 3
 
     return _clamp(score)
 
 def _growth_probability(score, x):
-    """Model confidence-like metric, explicitly not a guaranteed probability."""
     rank = float(x.get("market_cap_rank") or 10000)
     rank_bonus = _clamp(10 - (rank / 1000), -5, 10)
     return _clamp(50 + (score - 50) * 0.75 + rank_bonus, 5, 95)
 
 async def growth_scan():
+    """Unified with professional engine."""
     rows = await market_universe()
     if not rows:
         return []
 
-    # First pass over the entire market universe using market-wide fields.
     rough = []
     for x in rows:
         score = _market_growth_score(x)
@@ -969,20 +888,24 @@ async def growth_scan():
         rough.append((score, x))
     rough.sort(key=lambda z: z[0], reverse=True)
 
-    # Deep technical pass only on the strongest candidates, avoiding hundreds
-    # of expensive market_chart calls while still screening the whole universe.
-    result = []
-    for rough_score, x in rough[:MARKET_SCAN_DEEP]:
-        prices = (x.get("sparkline_in_7d") or {}).get("price") or []
-        ta = None
-        if len(prices) >= 50:
-            ta = technical_analysis(
-                norm_symbol(x.get("symbol") or ""),
-                pd.Series(prices, dtype=float),
-                None
-            )
-        score = _market_growth_score(x, ta) or rough_score
-        result.append({
+    top = rough[:MARKET_SCAN_DEEP]
+    async def deep(x):
+        sym = norm_symbol(x.get("symbol") or "")
+        try:
+            return x, await professional_crypto_analysis(sym)
+        except Exception:
+            return x, None
+    results = await asyncio.gather(*(deep(x) for _, x in top), return_exceptions=True)
+
+    out = []
+    for item in results:
+        if isinstance(item, Exception):
+            continue
+        x, ta = item
+        if not ta:
+            continue
+        score = _market_growth_score(x, ta) or 50.0
+        out.append({
             "id": x.get("id"), "symbol": norm_symbol(x.get("symbol") or ""),
             "name": x.get("name") or norm_symbol(x.get("symbol") or ""),
             "price": float(x.get("current_price") or 0),
@@ -994,15 +917,15 @@ async def growth_scan():
             "ch30": float(x.get("price_change_percentage_30d_in_currency") or 0),
             "growth_score": score,
             "probability": _growth_probability(score, x),
-            "strength": float(ta.get("strength", score)) if ta else score,
-            "trend": ta.get("trend") if ta else "MARKET",
-            "rsi": ta.get("rsi") if ta else None,
+            "strength": _safe_float(ta.get("strength", score)),
+            "trend": ta.get("trend") or "MARKET",
+            "rsi": _safe_float(ta.get("rsi"), 0),
         })
-    result.sort(key=lambda z: z["growth_score"], reverse=True)
-    return result[:MARKET_SCAN_TOP]
+    out.sort(key=lambda z: z["growth_score"], reverse=True)
+    return out[:MARKET_SCAN_TOP]
 
 # ============================================================
-# NUMBER / TGJU PARSING
+# NUMBER / TGJU PARSING (REVISED)
 # ============================================================
 
 def digits_to_latin(s):
@@ -1019,52 +942,22 @@ def _numbers_with_positions(text):
         raw
     ):
         try:
-            out.append((
-                m.start(),
-                float(m.group(1).replace(",", "").replace(" ", ""))
-            ))
+            out.append((m.start(), float(m.group(1).replace(",", "").replace(" ", ""))))
         except Exception:
             pass
     return out
 
-def number_candidates(text):
-    return [
-        v for _, v in _numbers_with_positions(text)
-        if 100_000 <= v <= 500_000_000
-    ]
-
-def _unit_factor(text, forced_unit="auto"):
+def _unit_factor_strict(text, forced_unit="auto"):
     t = digits_to_latin(text or "").replace(" ", "").lower()
-
-    if forced_unit in {"toman", "تومان"}:
-        return 1.0
-    if forced_unit in {"rial", "ریال"}:
-        return 0.1
-
+    if forced_unit in ("toman", "تومان"):
+        return 1.0, "toman"
+    if forced_unit in ("rial", "ریال"):
+        return 0.1, "rial"
     if "تومان" in t:
-        return 1.0
+        return 1.0, "toman"
     if "ریال" in t:
-        return 0.1
-
-    return None
-
-def _infer_gold18_factor(raw_value):
-    """TGJU sometimes omits the unit beside the numeric value.
-
-    For GOLD18, a value in the hundreds of millions is the usual Rial
-    representation of a roughly tens-of-millions Toman price. A value in
-    the tens of millions can already be Toman. This is only used after the
-    parser has tied the number to the geram18 price context.
-    """
-    try:
-        v = float(raw_value)
-    except Exception:
-        return None
-    if 50_000_000 <= v <= 500_000_000:
-        return 0.1
-    if 5_000_000 <= v < 50_000_000:
-        return 1.0
-    return None
+        return 0.1, "rial"
+    return None, None
 
 def _context(tag, levels=4, limit=5000):
     parts = []
@@ -1078,104 +971,64 @@ def _context(tag, levels=4, limit=5000):
         node = node.parent
     return " ".join(dict.fromkeys(parts))[:limit]
 
-def _candidate_from_node(tag, forced_unit="auto", min_value=100_000, max_value=500_000_000):
-    text = tag.get_text(" ", strip=True)
-    factor = _unit_factor(text, forced_unit)
-    if factor is None:
-        factor = _unit_factor(_context(tag), forced_unit)
-
-    nums = [
-        x for x in _numbers_with_positions(text)
-        if min_value <= x[1] <= max_value
-    ]
-    if not nums or factor is None:
-        return None
-
-    low = digits_to_latin(text).lower()
-    labels = []
-    for kw in ("قیمت", "نرخ", "آخرین", "price", "value", "current"):
-        pos = low.find(kw)
-        if pos >= 0:
-            labels.append(pos)
-
-    if labels:
-        raw = min(
-            nums,
-            key=lambda x: min(abs(x[0] - p) for p in labels)
-        )[1]
-    else:
-        raw = nums[0][1]
-
-    value = raw * factor
-    if not min_value <= value <= max_value:
-        return None
-    return value
-
 def _score_gold18_node(tag):
     attrs = " ".join(f"{k}={v}" for k, v in tag.attrs.items()).lower()
     text = tag.get_text(" ", strip=True)
     low = text.lower()
     score = 0
-    if "geram18" in attrs:
-        score += 300
-    if "geram18" in low.replace(" ", ""):
-        score += 250
-    if "geram" in attrs and "18" in attrs:
-        score += 180
+    if "geram18" in attrs: score += 300
+    if "geram18" in low.replace(" ", ""): score += 250
+    if "geram" in attrs and "18" in attrs: score += 180
     for word in ("طلای 18 عیار", "طلای ۱۸ عیار", "گرم طلای 18", "گرم طلای ۱۸"):
-        if word in text:
-            score += 160
+        if word in text: score += 160
     for word in ("قیمت", "نرخ", "آخرین", "ارزش", "price", "value", "current"):
-        if word in low:
-            score += 12
-    if "ریال" in text or "تومان" in text:
-        score += 30
-    if len(text) > 1500:
-        score -= 150
-    if len(text) > 5000:
-        score -= 300
+        if word in low: score += 12
+    if "ریال" in text or "تومان" in text: score += 30
+    if len(text) > 1500: score -= 150
+    if len(text) > 5000: score -= 300
     return score
 
 # ============================================================
-# TGJU GOLD18
+# TGJU GOLD18 (STRICT)
 # ============================================================
 
 def find_gold18_value(html):
-    """Find TGJU geram18 price robustly, including JSON/script markup."""
+    """Robust TGJU geram18 parser. Returns Toman per gram or None."""
     if not html:
         return None
 
     soup = BeautifulSoup(html, "html.parser")
     candidates = []
 
-    def add_candidate(raw_value, context_text, score=0):
+    def consider(raw, ctx, score=0):
         try:
-            raw = float(raw_value)
+            raw = float(raw)
         except Exception:
             return
-        if not (5_000_000 <= raw <= 500_000_000):
-            return
-
-        factor = _unit_factor(context_text, GOLD18_SOURCE_UNIT)
+        factor, unit = _unit_factor_strict(ctx, GOLD18_SOURCE_UNIT)
         if factor is None and GOLD18_SOURCE_UNIT == "auto":
-            factor = _infer_gold18_factor(raw)
+            if 150_000_000 <= raw <= 900_000_000:
+                factor = 0.1; unit = "rial"
+            elif GOLD18_TOMAN_MIN <= raw <= GOLD18_TOMAN_MAX:
+                factor = 1.0; unit = "toman"
+            else:
+                return
         if factor is None:
             return
-
-        value = raw * factor
-        if 5_000_000 <= value <= 100_000_000:
-            candidates.append((score, value, len(context_text)))
+        toman = raw * factor
+        if not (GOLD18_TOMAN_MIN <= toman <= GOLD18_TOMAN_MAX):
+            return
+        candidates.append((score, toman, unit, raw))
 
     if GOLD18_PRICE_SELECTOR:
         try:
             for tag in soup.select(GOLD18_PRICE_SELECTOR):
                 text = _context(tag, levels=5, limit=6000)
                 for _, raw in _numbers_with_positions(tag.get_text(" ", strip=True)):
-                    add_candidate(raw, text, 1000)
+                    consider(raw, text, 1000)
         except Exception as e:
             log.warning("Invalid GOLD18 selector: %s", e)
 
-    # Strongly prefer elements/ancestors explicitly tied to geram18.
     selectors = [
         '[data-symbol="geram18"]', '[data-profile="geram18"]',
         '[data-code="geram18"]', '[data-item="geram18"]',
@@ -1183,7 +1036,6 @@ def find_gold18_value(html):
         '[class*="geram18"]', '[data-field*="geram18"]',
         '[data-symbol*="geram18"]',
     ]
-
     seen = set()
     for selector in selectors:
         try:
@@ -1194,11 +1046,10 @@ def find_gold18_value(html):
             if id(tag) in seen:
                 continue
             seen.add(id(tag))
-            context = _context(tag, levels=6, limit=8000)
+            ctx = _context(tag, levels=6, limit=8000)
             for _, raw in _numbers_with_positions(tag.get_text(" ", strip=True)):
-                add_candidate(raw, context, 900 + _score_gold18_node(tag))
+                consider(raw, ctx, 900 + _score_gold18_node(tag))
 
-    # Scan compact rows/blocks containing geram18.
     keywords = (
         "geram18", "گرم طلای 18", "گرم طلای ۱۸",
         "طلای 18 عیار", "طلای ۱۸ عیار", "طلای18", "طلای۱۸"
@@ -1211,34 +1062,27 @@ def find_gold18_value(html):
         if not any(k.lower().replace(" ", "") in compact for k in keywords):
             continue
         for _, raw in _numbers_with_positions(text):
-            add_candidate(raw, text, 500 + _score_gold18_node(tag))
+            consider(raw, text, 500 + _score_gold18_node(tag))
 
-    # TGJU may put the price in inline JavaScript/JSON where BeautifulSoup
-    # does not expose a useful element. Search only a bounded neighborhood
-    # around explicit geram18 references.
     raw_html = digits_to_latin(html)
     for m in re.finditer(r"geram18", raw_html, flags=re.I):
         lo = max(0, m.start() - 2500)
         hi = min(len(raw_html), m.end() + 5000)
         chunk = raw_html[lo:hi]
-        # Price-like keys get extra score.
-        key_bonus = 0
-        if re.search(r"(?:price|value|current|last|close|p|v)\s*[:=]", chunk, re.I):
-            key_bonus = 180
+        key_bonus = 180 if re.search(r"(?:price|value|current|last|close|p|v)\s*[:=]", chunk, re.I) else 0
         for _, raw in _numbers_with_positions(chunk):
-            add_candidate(raw, chunk, 700 + key_bonus)
+            consider(raw, chunk, 700 + key_bonus)
 
     if not candidates:
         return None
 
-    # Highest context score first; for equally relevant candidates prefer the
-    # value that is in the normal Iranian 18K range.
     candidates.sort(
-        key=lambda x: (x[0], 1 if 15_000_000 <= x[1] <= 50_000_000 else 0, -x[2]),
+        key=lambda x: (x[0], 1 if 20_000_000 <= x[1] <= 60_000_000 else 0),
         reverse=True
     )
     value = float(candidates[0][1])
-    log.info("TGJU GOLD18 parsed: %.0f Toman/gram", value)
+    log.info("TGJU GOLD18 parsed: %.0f Toman/gram (unit=%s raw=%.0f)",
+             value, candidates[0][2], candidates[0][3])
     return value
 
 def save_market_snapshot(symbol, atype, price):
@@ -1250,7 +1094,6 @@ def save_market_snapshot(symbol, atype, price):
                 "SELECT price,created_at FROM market_history WHERE symbol=? AND asset_type=? ORDER BY id DESC LIMIT 1",
                 (symbol, atype)
             ).fetchone()
-            # Do not store duplicate observations from the same cached price.
             if last and abs(float(last["price"]) - float(price)) < 1e-12:
                 try:
                     age = datetime.now(timezone.utc) - datetime.fromisoformat(last["created_at"])
@@ -1262,7 +1105,6 @@ def save_market_snapshot(symbol, atype, price):
                 "INSERT INTO market_history(symbol,asset_type,price,created_at) VALUES(?,?,?,?)",
                 (symbol, atype, float(price), now_iso())
             )
-            # Keep a bounded local history.
             c.execute(
                 "DELETE FROM market_history WHERE symbol=? AND asset_type=? AND id NOT IN (SELECT id FROM market_history WHERE symbol=? AND asset_type=? ORDER BY id DESC LIMIT 1000)",
                 (symbol, atype, symbol, atype)
@@ -1292,14 +1134,13 @@ async def gold18_data():
         log.error("TGJU geram18 unavailable")
         return None
     price = find_gold18_value(html)
-    if price is None or not (5_000_000 <= price <= 100_000_000):
+    if price is None or not (GOLD18_TOMAN_MIN <= price <= GOLD18_TOMAN_MAX):
         log.error("TGJU geram18 price could not be identified safely: %s", price)
         return None
 
     save_market_snapshot("GOLD18", "gold18", price)
     history = get_market_history("GOLD18", "gold18")
     if len(history) < GOLD_MIN_HISTORY_POINTS:
-        # Return the real observations only; never manufacture candles.
         history = history if len(history) else pd.Series([price], dtype=float)
     result = ("GOLD18", history, pd.Series(dtype=float))
     GOLD18_CACHE = (now, result)
@@ -1307,110 +1148,85 @@ async def gold18_data():
     return result
 
 # ============================================================
-# TGJU GLOBAL GOLD / ONS
+# TGJU GLOBAL GOLD / ONS (STRICT)
 # ============================================================
 
 def find_xau_value(html):
-    """
-    Strict parser for TGJU /profile/ons.
-    Expected output: USD per troy ounce.
-    """
+    """Strict TGJU /profile/ons parser. Returns USD per troy ounce or None."""
     if not html:
         return None
 
     soup = BeautifulSoup(html, "html.parser")
     candidates = []
 
+    def consider(value, ctx, base_score):
+        try:
+            v = float(value)
+        except Exception:
+            return
+        if not (XAU_USD_MIN <= v <= XAU_USD_MAX):
+            return
+        score = base_score
+        low = ctx.lower()
+        if "انس" in ctx or "اونس" in ctx: score += 150
+        if "طلا" in ctx or "gold" in low: score += 100
+        if "دلار" in ctx or "usd" in low: score += 80
+        for noise in ("نقره", "نقره‌ای", "silver", "platinum", "پلاتین", "palladium", "پالادیوم"):
+            if noise.lower() in low:
+                score -= 400
+        candidates.append((score, v))
+
     if XAU_PRICE_SELECTOR:
         try:
             for tag in soup.select(XAU_PRICE_SELECTOR):
                 text = tag.get_text(" ", strip=True)
-                nums = _numbers_with_positions(text)
-                for _, value in nums:
-                    if 500 <= value <= 10000:
-                        score = 1000
-                        if "دلار" in text or "usd" in text.lower():
-                            score += 100
-                        candidates.append((score, value, len(text)))
+                for _, value in _numbers_with_positions(text):
+                    consider(value, text, 1000)
         except Exception as e:
             log.warning("Invalid XAU selector: %s", e)
 
     selectors = [
-        '[data-symbol="ons"]',
-        '[data-profile="ons"]',
-        '[data-code="ons"]',
-        '[data-item="ons"]',
-        '#ons',
-        '.ons',
-        '[id*="ons"]',
-        '[class*="ons"]',
-        '[data-symbol*="ons"]',
+        '[data-symbol="ons"]', '[data-profile="ons"]', '[data-code="ons"]',
+        '[data-item="ons"]', '#ons', '.ons',
+        '[id*="ons"]', '[class*="ons"]', '[data-symbol*="ons"]',
     ]
-
     seen = set()
     for selector in selectors:
         try:
             nodes = soup.select(selector)
         except Exception:
             nodes = []
-
         for tag in nodes:
             if id(tag) in seen:
                 continue
             seen.add(id(tag))
-
             text = tag.get_text(" ", strip=True)
             if len(text) > 3000:
                 continue
-
             for _, value in _numbers_with_positions(text):
-                if 500 <= value <= 10000:
-                    score = 500
-                    low = text.lower()
-                    if "انس" in text or "اونس" in text:
-                        score += 150
-                    if "طلا" in text:
-                        score += 100
-                    if "gold" in low:
-                        score += 100
-                    if "دلار" in text or "usd" in low:
-                        score += 80
-                    candidates.append((score, value, len(text)))
+                consider(value, text, 500)
 
-    keywords = (
-        "انس طلا", "انس جهانی طلا", "انس جهانی",
-        "اونس طلا", "اونس جهانی", "gold", "xau"
-    )
-
-    for tag in soup.find_all(["tr","li","article","section","td","div"]):
+    keywords = ("انس طلا", "انس جهانی طلا", "انس جهانی", "اونس طلا", "اونس جهانی", "gold", "xau")
+    for tag in soup.find_all(["tr", "li", "article", "section", "td", "div"]):
         text = tag.get_text(" ", strip=True)
         if len(text) > 1200:
             continue
-
         compact = text.lower().replace(" ", "")
         if not any(k.lower().replace(" ", "") in compact for k in keywords):
             continue
-
         for _, value in _numbers_with_positions(text):
-            if 500 <= value <= 10000:
-                score = 100
-                if "انس" in text or "اونس" in text:
-                    score += 100
-                if "طلا" in text:
-                    score += 100
-                if "دلار" in text or "usd" in text.lower():
-                    score += 70
-                candidates.append((score, value, len(text)))
+            consider(value, text, 100)
 
     if not candidates:
         return None
-
-    candidates.sort(key=lambda x: (x[0], -x[2]), reverse=True)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    if candidates[0][0] < 100:
+        log.warning("XAU parse confidence too low (%s); returning None", candidates[0][0])
+        return None
     return float(candidates[0][1])
 
 async def xau_tgju_price():
     global XAU_CACHE
-
     now = time.monotonic()
     if XAU_CACHE and now - XAU_CACHE[0] < PRICE_CACHE_SECONDS:
         return XAU_CACHE[1]
@@ -1421,8 +1237,7 @@ async def xau_tgju_price():
         return None
 
     price = find_xau_value(html)
-
-    if price is None or not (500 <= price <= 10000):
+    if price is None or not (XAU_USD_MIN <= price <= XAU_USD_MAX):
         log.error("TGJU ons price could not be identified safely: %s", price)
         return None
 
@@ -1455,7 +1270,6 @@ async def asset_data(symbol):
 async def current_price(symbol):
     s = norm_symbol(symbol)
     item = PRICE_CACHE.get(s)
-
     if item and time.monotonic() - item[0] < PRICE_CACHE_SECONDS:
         return item[1]
 
@@ -1470,7 +1284,6 @@ async def current_price(symbol):
                 "unit": "تومان برای هر گرم طلای ۱۸ عیار ایران",
                 "source": "TGJU",
             }
-
     elif s == "XAU":
         value = await xau_tgju_price()
         if value is not None:
@@ -1480,76 +1293,59 @@ async def current_price(symbol):
                 "unit": "دلار برای هر اونس",
                 "source": "TGJU",
             }
-
     else:
         cid = COINS.get(s)
         if not cid:
             res = await crypto_search(s)
             if res:
                 s, cid, _ = res[0]
-
         if cid:
             data = await http_json(
                 "https://api.coingecko.com/api/v3/simple/price",
-                {
-                    "ids": cid,
-                    "vs_currencies": "usd",
-                    "include_24hr_change": "true",
-                },
+                {"ids": cid, "vs_currencies": "usd", "include_24hr_change": "true"},
                 ttl=PRICE_CACHE_SECONDS
             )
             try:
                 it = data[cid]
                 result = {
-                    "symbol": s,
-                    "price": float(it["usd"]),
+                    "symbol": s, "price": float(it["usd"]),
                     "change24": float(it.get("usd_24h_change") or 0),
-                    "unit": "دلار",
-                    "source": "CoinGecko",
+                    "unit": "دلار", "source": "CoinGecko",
                 }
             except Exception:
                 pass
 
     if result:
         PRICE_CACHE[s] = (time.monotonic(), result)
-
     return result
 
 def format_live_price(item):
     if not item:
         return "❌ قیمت در حال حاضر در دسترس نیست."
-
     s = escape(item["symbol"])
     p = item["price"]
-
     if item["symbol"] == "GOLD18":
         value = f"{p:,.0f}"
     elif item["symbol"] == "XAU":
         value = f"{p:,.2f}"
     else:
         value = f"{p:,.8f}".rstrip("0").rstrip(".")
-
     text = (
         f"💰 <b>{s}</b>\n"
         f"قیمت فعلی: <b>{value}</b>\n"
         f"واحد: {escape(item['unit'])}"
     )
-
     if item.get("source"):
         text += f"\nمنبع: {escape(item['source'])}"
-
     if "change24" in item:
         text += f"\nتغییر ۲۴ ساعت: <b>{item['change24']:+.2f}%</b>"
-
     return text
 
 # ============================================================
-# PROFESSIONAL OHLCV MARKET DATA (OKX SPOT)
+# PROFESSIONAL OHLCV (OKX)
 # ============================================================
 
-
 async def okx_candles(symbol, bar="1H", limit=240):
-    """Fetch confirmed OHLCV candles from OKX."""
     s = norm_symbol(symbol)
     inst = f"{s}-USDT"
     key = (inst, bar, int(limit))
@@ -1560,8 +1356,7 @@ async def okx_candles(symbol, bar="1H", limit=240):
     data = await http_json(
         f"{OKX_BASE_URL}/api/v5/market/candles",
         {"instId": inst, "bar": bar, "limit": str(min(300, int(limit)))},
-        ttl=OKX_CANDLE_CACHE_SECONDS,
-        retries=2,
+        ttl=OKX_CANDLE_CACHE_SECONDS, retries=2,
     )
     rows = (data or {}).get("data") or []
     parsed = []
@@ -1571,10 +1366,8 @@ async def okx_candles(symbol, bar="1H", limit=240):
         try:
             parsed.append({
                 "ts": int(row[0]),
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
+                "open": float(row[1]), "high": float(row[2]),
+                "low": float(row[3]), "close": float(row[4]),
                 "volume": float(row[5]),
                 "confirm": int(row[8]) if len(row) > 8 and str(row[8]).isdigit() else 1,
             })
@@ -1591,7 +1384,6 @@ async def okx_candles(symbol, bar="1H", limit=240):
     OKX_CANDLE_CACHE[key] = (time.monotonic(), df.copy())
     return df
 
-
 def _wilder_rsi(close, period=14):
     close = pd.to_numeric(close, errors="coerce").astype(float)
     delta = close.diff()
@@ -1604,66 +1396,42 @@ def _wilder_rsi(close, period=14):
     out = out.where(al != 0, 100)
     return out.astype(float).fillna(50.0)
 
-
 def _advanced_indicators(df):
-    """Full OHLCV indicator set used by the professional decision engine.
-
-    Normalize exchange OHLCV values to real float columns before rolling/EWM
-    calculations. Nullable ``pd.NA`` values can otherwise promote arithmetic
-    results to object dtype and cause pandas to raise
-    ``DataError: No numeric types to aggregate``.
-    """
     if df is None or df.empty:
         return None
-
     x = df.copy()
     required = ("open", "high", "low", "close", "volume")
     for col in required:
         if col not in x.columns:
             return None
         x[col] = pd.to_numeric(x[col], errors="coerce")
-
     x = x.replace([float("inf"), float("-inf")], float("nan"))
     x = x.dropna(subset=list(required)).reset_index(drop=True)
-
     if not x.empty:
         valid = (
-            (x["open"] > 0) &
-            (x["high"] > 0) &
-            (x["low"] > 0) &
-            (x["close"] > 0) &
-            (x["volume"] >= 0) &
-            (x["high"] >= x["low"])
+            (x["open"] > 0) & (x["high"] > 0) & (x["low"] > 0) &
+            (x["close"] > 0) & (x["volume"] >= 0) & (x["high"] >= x["low"])
         )
         x = x.loc[valid].reset_index(drop=True)
-
     if len(x) < 100:
         return None
 
-    c = x["close"].astype(float)
-    h = x["high"].astype(float)
-    l = x["low"].astype(float)
-    v = x["volume"].astype(float)
+    c = x["close"].astype(float); h = x["high"].astype(float)
+    l = x["low"].astype(float); v = x["volume"].astype(float)
 
     ema9 = c.ewm(span=9, adjust=False).mean()
     ema21 = c.ewm(span=21, adjust=False).mean()
     ema50 = c.ewm(span=50, adjust=False).mean()
     ema200 = c.ewm(span=200, adjust=False, min_periods=100).mean()
-
     rsi = _wilder_rsi(c, 14)
     macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     macd_sig = macd.ewm(span=9, adjust=False).mean()
     macd_hist = macd - macd_sig
 
-    tr = pd.concat([
-        h - l,
-        (h - c.shift()).abs(),
-        (l - c.shift()).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
 
-    up = h.diff()
-    down = -l.diff()
+    up = h.diff(); down = -l.diff()
     plus_dm = up.where((up > down) & (up > 0), 0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
     atr_w = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
@@ -1672,28 +1440,20 @@ def _advanced_indicators(df):
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, float('nan'))
     adx = dx.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
 
-    bb_mid = c.rolling(20).mean()
-    bb_std = c.rolling(20).std(ddof=0)
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
+    bb_mid = c.rolling(20).mean(); bb_std = c.rolling(20).std(ddof=0)
+    bb_upper = bb_mid + 2 * bb_std; bb_lower = bb_mid - 2 * bb_std
     bb_width = (bb_upper - bb_lower) / bb_mid.replace(0, float('nan')) * 100
 
-    vol_ma20 = v.rolling(20).mean()
-    vol_ma50 = v.rolling(50).mean()
-
+    vol_ma20 = v.rolling(20).mean(); vol_ma50 = v.rolling(50).mean()
     obv_step = c.diff().apply(lambda z: 1 if z > 0 else -1 if z < 0 else 0) * v
     obv = obv_step.cumsum()
-
     typical = (h + l + c) / 3
     vwap = (typical * v).rolling(48, min_periods=10).sum() / v.rolling(48, min_periods=10).sum().replace(0, float('nan'))
 
-    lowest14 = l.rolling(14).min()
-    highest14 = h.rolling(14).max()
+    lowest14 = l.rolling(14).min(); highest14 = h.rolling(14).max()
     stoch_k = 100 * (c - lowest14) / (highest14 - lowest14).replace(0, float('nan'))
     stoch_d = stoch_k.rolling(3).mean()
-
-    roc5 = c.pct_change(5) * 100
-    roc20 = c.pct_change(20) * 100
+    roc5 = c.pct_change(5) * 100; roc20 = c.pct_change(20) * 100
     returns = c.pct_change() * 100
     realized_vol = returns.rolling(30).std()
 
@@ -1708,35 +1468,26 @@ def _advanced_indicators(df):
         "realized_vol": realized_vol,
     }
 
-
 def _market_structure(df, lookback=80):
-    """Detect swing structure and break-of-structure without future-bar leakage."""
     x = df.tail(max(40, lookback)).reset_index(drop=True)
     h, l, c = x["high"], x["low"], x["close"]
-
-    swing_highs = []
-    swing_lows = []
+    swing_highs, swing_lows = [], []
     radius = 2
     for i in range(radius, len(x) - radius):
         if h.iloc[i] >= h.iloc[i-radius:i+radius+1].max():
             swing_highs.append((i, float(h.iloc[i])))
         if l.iloc[i] <= l.iloc[i-radius:i+radius+1].min():
             swing_lows.append((i, float(l.iloc[i])))
-
-    last_highs = swing_highs[-4:]
-    last_lows = swing_lows[-4:]
+    last_highs = swing_highs[-4:]; last_lows = swing_lows[-4:]
     hh = len(last_highs) >= 2 and last_highs[-1][1] > last_highs[-2][1]
     hl = len(last_lows) >= 2 and last_lows[-1][1] > last_lows[-2][1]
     lh = len(last_highs) >= 2 and last_highs[-1][1] < last_highs[-2][1]
     ll = len(last_lows) >= 2 and last_lows[-1][1] < last_lows[-2][1]
-
     current = float(c.iloc[-1])
     prev_res = last_highs[-1][1] if last_highs else float(h.tail(20).max())
     prev_sup = last_lows[-1][1] if last_lows else float(l.tail(20).min())
-
     bos_up = current > prev_res and len(last_highs) >= 2
     bos_down = current < prev_sup and len(last_lows) >= 2
-
     structure = (
         "BULLISH" if hh and hl
         else "BEARISH" if lh and ll
@@ -1747,59 +1498,47 @@ def _market_structure(df, lookback=80):
         "structure": structure, "hh": hh, "hl": hl, "lh": lh, "ll": ll,
         "bos_up": bos_up, "bos_down": bos_down,
         "swing_high": prev_res, "swing_low": prev_sup,
-        "swing_highs": last_highs, "swing_lows": last_lows,
     }
 
-
 def _divergence(close, rsi, window=35):
-    """Simple confirmed-window RSI divergence detector."""
     c = close.tail(window).reset_index(drop=True)
     r = rsi.tail(window).reset_index(drop=True)
     if len(c) < 15:
         return "NONE"
-
     half = max(5, len(c) // 2)
     c1, c2 = float(c.iloc[:half].min()), float(c.iloc[half:].min())
     r1, r2 = float(r.iloc[:half].min()), float(r.iloc[half:].min())
     h1, h2 = float(c.iloc[:half].max()), float(c.iloc[half:].max())
     rh1, rh2 = float(r.iloc[:half].max()), float(r.iloc[half:].max())
-
-    if c2 < c1 and r2 > r1 + 2:
-        return "BULLISH"
-    if h2 > h1 and rh2 < rh1 - 2:
-        return "BEARISH"
+    if c2 < c1 and r2 > r1 + 2: return "BULLISH"
+    if h2 > h1 and rh2 < rh1 - 2: return "BEARISH"
     return "NONE"
-
 
 def _tf_decision(symbol, df, timeframe):
     if df is None or len(df) < 100:
         return None
-
     z = _advanced_indicators(df)
+    if not z:
+        return None
     c, h, l, v = z["c"], z["h"], z["l"], z["v"]
     current = float(c.iloc[-1])
     e9, e21, e50 = map(lambda s: float(s.iloc[-1]), (z["ema9"], z["ema21"], z["ema50"]))
     e200 = _safe_float(z["ema200"].iloc[-1], e50)
     rsi = _safe_float(z["rsi"].iloc[-1], 50)
-    macd = _safe_float(z["macd"].iloc[-1])
-    macd_sig = _safe_float(z["macd_sig"].iloc[-1])
-    hist = _safe_float(z["macd_hist"].iloc[-1])
-    prev_hist = _safe_float(z["macd_hist"].iloc[-2], hist)
+    macd = _safe_float(z["macd"].iloc[-1]); macd_sig = _safe_float(z["macd_sig"].iloc[-1])
+    hist = _safe_float(z["macd_hist"].iloc[-1]); prev_hist = _safe_float(z["macd_hist"].iloc[-2], hist)
     atr = max(_safe_float(z["atr"].iloc[-1]), current * 0.005)
     atr_pct = atr / current * 100 if current else 0
     adx = _safe_float(z["adx"].iloc[-1])
-    dip = _safe_float(z["plus_di"].iloc[-1])
-    dim = _safe_float(z["minus_di"].iloc[-1])
+    dip = _safe_float(z["plus_di"].iloc[-1]); dim = _safe_float(z["minus_di"].iloc[-1])
     vwap = _safe_float(z["vwap"].iloc[-1], current)
     bb_u = _safe_float(z["bb_upper"].iloc[-1], current)
     bb_l = _safe_float(z["bb_lower"].iloc[-1], current)
     bb_m = _safe_float(z["bb_mid"].iloc[-1], current)
     bb_width = _safe_float(z["bb_width"].iloc[-1])
     vol_ratio = _safe_float(v.iloc[-1] / z["vol_ma20"].iloc[-1], 1) if _safe_float(z["vol_ma20"].iloc[-1]) > 0 else 1
-    stoch_k = _safe_float(z["stoch_k"].iloc[-1], 50)
-    stoch_d = _safe_float(z["stoch_d"].iloc[-1], 50)
-    roc5 = _safe_float(z["roc5"].iloc[-1])
-    roc20 = _safe_float(z["roc20"].iloc[-1])
+    stoch_k = _safe_float(z["stoch_k"].iloc[-1], 50); stoch_d = _safe_float(z["stoch_d"].iloc[-1], 50)
+    roc5 = _safe_float(z["roc5"].iloc[-1]); roc20 = _safe_float(z["roc20"].iloc[-1])
     structure = _market_structure(df)
     divergence = _divergence(c, z["rsi"])
 
@@ -1814,7 +1553,6 @@ def _tf_decision(symbol, df, timeframe):
     bull, bear = 0.0, 0.0
     rb, rs = [], []
 
-    # Trend / EMA: 20
     if current > e21 > e50 > e200:
         bull += 20; rb.append("روند اصلی صعودی و EMAها هم‌راستا هستند")
     elif current < e21 < e50 < e200:
@@ -1824,7 +1562,6 @@ def _tf_decision(symbol, df, timeframe):
     elif current < e50:
         bear += 9; rs.append("قیمت زیر EMA50 است")
 
-    # Structure / BOS: 20
     if structure["bos_up"]:
         bull += 14; rb.append("شکست ساختار صعودی (BOS) تأیید شده")
     elif structure["bos_down"]:
@@ -1834,11 +1571,11 @@ def _tf_decision(symbol, df, timeframe):
     elif structure["structure"] == "BEARISH":
         bear += 6; rs.append("ساختار LH/LL نزولی")
 
-    # Momentum / MACD / RSI: 15
     if macd > macd_sig and hist > prev_hist:
         bull += 10; rb.append("MACD و مومنتوم در حال تقویت")
     elif macd < macd_sig and hist < prev_hist:
         bear += 10; rs.append("MACD و مومنتوم در حال تضعیف")
+
     if 52 <= rsi <= 68:
         bull += 5; rb.append("RSI در محدوده سازنده")
     elif 32 <= rsi < 45:
@@ -1848,7 +1585,6 @@ def _tf_decision(symbol, df, timeframe):
     elif rsi < 28:
         bull += 3; rb.append("RSI اشباع فروش؛ نیازمند تأیید ساختار")
 
-    # Trend strength / DI: 10
     if adx >= 25 and dip > dim:
         bull += 8; rb.append("ADX و +DI روند صعودی را تأیید می‌کنند")
     elif adx >= 25 and dim > dip:
@@ -1856,7 +1592,6 @@ def _tf_decision(symbol, df, timeframe):
     elif adx < 18:
         rb.append("بازار روند قدرتمندی ندارد")
 
-    # Volume: 10
     if vol_ratio >= 1.30 and current > c.iloc[-2]:
         bull += 8; rb.append("افزایش حجم همراه حرکت صعودی")
     elif vol_ratio >= 1.30 and current < c.iloc[-2]:
@@ -1864,92 +1599,75 @@ def _tf_decision(symbol, df, timeframe):
     elif vol_ratio < 0.70:
         rb.append("حجم پایین؛ شکست نیازمند احتیاط است")
 
-    # VWAP / Bollinger / Stochastic: 10
-    if current > vwap:
-        bull += 3; rb.append("قیمت بالای VWAP")
-    else:
-        bear += 3; rs.append("قیمت زیر VWAP")
-    if current > bb_m and current < bb_u:
-        bull += 3
-    elif current < bb_m and current > bb_l:
-        bear += 3
-    if stoch_k > stoch_d and stoch_k < 85:
-        bull += 4
-    elif stoch_k < stoch_d and stoch_k > 15:
-        bear += 4
+    if current > vwap: bull += 3; rb.append("قیمت بالای VWAP")
+    else: bear += 3; rs.append("قیمت زیر VWAP")
 
-    # Divergence
+    if current > bb_m and current < bb_u: bull += 3
+    elif current < bb_m and current > bb_l: bear += 3
+
+    if stoch_k > stoch_d and stoch_k < 85: bull += 4
+    elif stoch_k < stoch_d and stoch_k > 15: bear += 4
+
     if divergence == "BULLISH":
         bull += 6; rb.append("واگرایی مثبت RSI")
     elif divergence == "BEARISH":
         bear += 6; rs.append("واگرایی منفی RSI")
 
-    # Anti-chasing
     extension = (current - e21) / atr if atr else 0
     if extension > 2.0:
         bull -= 9; rb.append("قیمت از EMA21 بیش از حد کشیده شده")
     if extension < -2.0:
         bear -= 9; rs.append("قیمت از EMA21 بیش از حد نزولی کشیده شده")
 
-    # Breakout quality / fakeout
-    recent_res = float(h.iloc[-21:-1].max())
-    recent_sup = float(l.iloc[-21:-1].min())
+    recent_res = float(h.iloc[-21:-1].max()) if len(h) >= 21 else float(h.max())
+    recent_sup = float(l.iloc[-21:-1].min()) if len(l) >= 21 else float(l.min())
     breakout_up = current > recent_res
     breakout_down = current < recent_sup
     breakout_confirmed = False
     fakeout_risk = False
     if breakout_up:
         if vol_ratio >= 1.15 and current > recent_res + 0.15 * atr:
-            bull += 7; rb.append("شکست مقاومت با حجم و فاصله کافی")
-            breakout_confirmed = True
+            bull += 7; rb.append("شکست مقاومت با حجم و فاصله کافی"); breakout_confirmed = True
         else:
-            bull -= 5; rb.append("شکست مقاومت بدون تأیید کافی؛ ریسک فیک‌اوت")
-            fakeout_risk = True
+            bull -= 5; rb.append("شکست مقاومت بدون تأیید کافی؛ ریسک فیک‌اوت"); fakeout_risk = True
     elif breakout_down:
         if vol_ratio >= 1.15 and current < recent_sup - 0.15 * atr:
-            bear += 7; rs.append("شکست حمایت با حجم و فاصله کافی")
-            breakout_confirmed = True
+            bear += 7; rs.append("شکست حمایت با حجم و فاصله کافی"); breakout_confirmed = True
         else:
-            bear -= 5; rs.append("شکست حمایت بدون تأیید کافی؛ ریسک فیک‌اوت")
-            fakeout_risk = True
+            bear -= 5; rs.append("شکست حمایت بدون تأیید کافی؛ ریسک فیک‌اوت"); fakeout_risk = True
 
     bull, bear = max(0.0, bull), max(0.0, bear)
     edge = bull - bear
     strength = _clamp(45 + max(bull, bear) * 0.70 + (8 if adx >= 25 else 0))
     signal_score = _clamp(50 + abs(edge) * 1.15)
 
-    # Mandatory filters: an indicator alone can never create a trade.
+    # SYMMETRIC RSI GATES (fix #12)
     buy_ok = (
         bull >= 62 and edge >= 18 and
         trend in ("BULLISH", "BULLISH_WEAK") and
         structure["structure"] != "BEARISH" and
-        rsi < 74 and
+        40 < rsi < 72 and
         not fakeout_risk
     )
     sell_ok = (
         bear >= 62 and edge <= -18 and
         trend in ("BEARISH", "BEARISH_WEAK") and
         structure["structure"] != "BULLISH" and
-        rsi > 26 and
+        35 < rsi < 68 and
         not fakeout_risk
     )
     candidate = "BUY" if buy_ok else "SELL" if sell_ok else "WAIT"
 
-    recent_low = float(l.tail(20).min())
-    recent_high = float(h.tail(20).max())
+    recent_low = float(l.tail(20).min()); recent_high = float(h.tail(20).max())
     if candidate == "BUY":
         stop = min(recent_low, current - 1.35 * atr)
         risk = current - stop
-        if risk <= 0:
-            risk = 1.35 * atr
-            stop = current - risk
+        if risk <= 0: risk = 1.35 * atr; stop = current - risk
         targets = [current + 1.5 * risk, current + 2.5 * risk, current + 3.5 * risk]
     elif candidate == "SELL":
         stop = max(recent_high, current + 1.35 * atr)
         risk = stop - current
-        if risk <= 0:
-            risk = 1.35 * atr
-            stop = current + risk
+        if risk <= 0: risk = 1.35 * atr; stop = current + risk
         targets = [current - 1.5 * risk, current - 2.5 * risk, current - 3.5 * risk]
     else:
         stop, risk, targets = 0.0, 0.0, [0.0, 0.0, 0.0]
@@ -1983,9 +1701,7 @@ def _tf_decision(symbol, df, timeframe):
         "history_points": len(df), "data_source": "OKX OHLCV professional",
     }
 
-
 async def professional_crypto_analysis(symbol):
-    """Professional multi-timeframe decision engine."""
     bars = {"15m": 240, "1H": 240, "4H": 240, "1D": 200}
     sem = asyncio.Semaphore(OKX_MAX_CONCURRENCY)
 
@@ -1993,10 +1709,7 @@ async def professional_crypto_analysis(symbol):
         async with sem:
             return tf, await okx_candles(symbol, tf, limit)
 
-    pairs = await asyncio.gather(
-        *(one(tf, n) for tf, n in bars.items()),
-        return_exceptions=True
-    )
+    pairs = await asyncio.gather(*(one(tf, n) for tf, n in bars.items()), return_exceptions=True)
 
     tfs = {}
     for item in pairs:
@@ -2006,8 +1719,7 @@ async def professional_crypto_analysis(symbol):
         tf, df = item
         try:
             a = _tf_decision(symbol, df, tf)
-            if a:
-                tfs[tf] = a
+            if a: tfs[tf] = a
         except Exception:
             log.exception("TF engine error %s %s", symbol, tf)
 
@@ -2048,7 +1760,6 @@ async def professional_crypto_analysis(symbol):
         + (8 if agreement >= 0.70 else 3 if agreement >= 0.55 else 0)
     )
 
-    # Confidence-like score; never a guarantee of profit.
     confidence = _clamp(
         50 + abs(edge) * 0.70
         + max(0, agreement_score - 50) * 0.22
@@ -2088,21 +1799,13 @@ async def professional_crypto_analysis(symbol):
     return out
 
 # ============================================================
-# ANALYSIS
+# FALLBACK ANALYSIS (close-only, for GOLD18/XAU)
 # ============================================================
-
-def _safe_float(v, default=0.0):
-    try:
-        x = float(v)
-        return default if pd.isna(x) else x
-    except Exception:
-        return default
 
 def _rsi(series, period=14):
     series = pd.to_numeric(series, errors="coerce").astype(float)
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.clip(lower=0); loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0, float('nan'))
@@ -2111,16 +1814,15 @@ def _rsi(series, period=14):
     return out
 
 def _atr(p, period=14):
-    # We only have close prices, so true range is represented by close-to-close movement.
     tr = p.diff().abs()
     return tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
 
 def _adx(p, period=14):
-    # Close-only approximation. This is intentionally labeled as trend-strength, not OHLC ADX.
+    """Close-only ADX approximation.
+    For real OHLC ADX use _advanced_indicators(). Used only for GOLD18/XAU
+    fallback where only close prices are available."""
     move = p.diff()
-    up = move.clip(lower=0)
-    down = (-move).clip(lower=0)
-    tr = move.abs()
+    up = move.clip(lower=0); down = (-move).clip(lower=0); tr = move.abs()
     atr = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
     dip = 100 * up.ewm(alpha=1/period, adjust=False, min_periods=period).mean() / atr.replace(0, float('nan'))
     dim = 100 * down.ewm(alpha=1/period, adjust=False, min_periods=period).mean() / atr.replace(0, float('nan'))
@@ -2129,14 +1831,10 @@ def _adx(p, period=14):
     return adx, dip, dim
 
 def _format_price(symbol, value):
-    if symbol == "GOLD18":
-        return f"{value:,.0f}"
-    if symbol == "XAU":
-        return f"{value:,.2f}"
-    if abs(value) >= 1000:
-        return f"{value:,.2f}"
-    if abs(value) >= 1:
-        return f"{value:,.4f}"
+    if symbol == "GOLD18": return f"{value:,.0f}"
+    if symbol == "XAU": return f"{value:,.2f}"
+    if abs(value) >= 1000: return f"{value:,.2f}"
+    if abs(value) >= 1: return f"{value:,.4f}"
     return f"{value:,.8f}".rstrip("0").rstrip(".")
 
 def technical_analysis(symbol, prices, volumes=None):
@@ -2150,7 +1848,6 @@ def technical_analysis(symbol, prices, volumes=None):
     ema50 = p.ewm(span=50, adjust=False).mean()
     ema200 = p.ewm(span=200, adjust=False, min_periods=50).mean()
 
-    delta = p.diff()
     rsi_s = _rsi(p, 14)
     rsi = _safe_float(rsi_s.iloc[-1], 50)
 
@@ -2175,7 +1872,9 @@ def technical_analysis(symbol, prices, volumes=None):
     e200 = _safe_float(ema200.iloc[-1], e50)
     mline, msignal, mhist = float(macd_line.iloc[-1]), float(macd_signal.iloc[-1]), float(macd_hist.iloc[-1])
     prev_hist = _safe_float(macd_hist.iloc[-2], mhist)
-    mid, upper, lower = _safe_float(bb_mid.iloc[-1], current), _safe_float(bb_upper.iloc[-1], current), _safe_float(bb_lower.iloc[-1], current)
+    mid = _safe_float(bb_mid.iloc[-1], current)
+    upper = _safe_float(bb_upper.iloc[-1], current)
+    lower = _safe_float(bb_lower.iloc[-1], current)
 
     r1 = ((current / p.iloc[-2]) - 1) * 100 if p.iloc[-2] else 0
     r6 = ((current / p.iloc[-7]) - 1) * 100 if len(p) >= 7 and p.iloc[-7] else r1
@@ -2183,8 +1882,7 @@ def technical_analysis(symbol, prices, volumes=None):
     r72 = ((current / p.iloc[-73]) - 1) * 100 if len(p) >= 73 and p.iloc[-73] else r24
 
     recent = p.tail(min(50, len(p)))
-    resistance = float(recent.max())
-    support = float(recent.min())
+    resistance = float(recent.max()); support = float(recent.min())
     atr_pct = (atr / current * 100) if current else 0
     bb_position = ((current - lower) / (upper - lower) * 100) if upper > lower else 50
 
@@ -2199,7 +1897,6 @@ def technical_analysis(symbol, prices, volumes=None):
     else:
         trend = "NEUTRAL"
 
-    # Analysis strength is descriptive and independent from signal score.
     components = [
         1 if current > e21 else -1,
         1 if e9 > e21 else -1,
@@ -2213,9 +1910,7 @@ def technical_analysis(symbol, prices, volumes=None):
     raw_strength = 50 + sum(components) * 5
     strength = float(max(10, min(95, raw_strength)))
 
-    # Independent SMART SIGNAL engine.
-    buy_points = 0.0
-    sell_points = 0.0
+    buy_points = 0.0; sell_points = 0.0
     reasons_buy, reasons_sell = [], []
 
     if current > e21 > e50:
@@ -2248,26 +1943,31 @@ def technical_analysis(symbol, prices, volumes=None):
     elif r6 < 0 and r24 < 0:
         sell_points += 10; reasons_sell.append("مومنتوم منفی")
 
+    # FIX #14: proper volume alignment
     vol_confirm = None
     if volumes is not None:
-        v = pd.Series(volumes, dtype=float).dropna()
+        v = pd.Series(volumes, dtype=float)
+        if len(v) > len(p):
+            v = v.iloc[-len(p):].reset_index(drop=True)
+        elif len(v) < len(p):
+            pad = len(p) - len(v)
+            v = pd.concat([pd.Series([float("nan")] * pad), v], ignore_index=True)
+        v = v.dropna()
         if len(v) >= 20:
-            v = v.tail(min(len(v), len(p)))
             vma = v.rolling(20).mean().iloc[-1]
-            vol_confirm = bool(v.iloc[-1] >= vma * 1.10)
-            if vol_confirm and r1 > 0:
-                buy_points += 10; reasons_buy.append("حجم تأییدکننده")
-            elif vol_confirm and r1 < 0:
-                sell_points += 10; reasons_sell.append("حجم تأییدکننده")
+            if vma and vma > 0:
+                vol_confirm = bool(v.iloc[-1] >= vma * 1.10)
+                if vol_confirm and r1 > 0:
+                    buy_points += 10; reasons_buy.append("حجم تأییدکننده")
+                elif vol_confirm and r1 < 0:
+                    sell_points += 10; reasons_sell.append("حجم تأییدکننده")
 
     best = max(buy_points, sell_points)
     second = min(buy_points, sell_points)
     direction = "BUY" if buy_points > sell_points else "SELL" if sell_points > buy_points else "WAIT"
     score = float(best)
-    # Require a clear edge and strong absolute score.
     candidate = direction if score >= SIGNAL_MIN_SCORE and (score - second) >= 20 else "WAIT"
 
-    # Risk levels use ATR rather than arbitrary percentages.
     if candidate == "BUY":
         stop = current - max(atr * 1.5, current * 0.005)
         risk = max(current - stop, current * 0.003)
@@ -2283,7 +1983,6 @@ def technical_analysis(symbol, prices, volumes=None):
     if candidate != "WAIT" and rr < 1.5:
         candidate = "WAIT"
 
-    # Model probability is a model score, not a guaranteed statistical probability.
     probability = float(max(5, min(95, 50 + (score - second) * 0.9)))
 
     return {
@@ -2300,15 +1999,28 @@ def technical_analysis(symbol, prices, volumes=None):
         "stop": stop, "targets": targets, "rr": rr, "volume_confirm": vol_confirm,
         "history_points": len(p),
         "signal": "WAIT", "confirmed": False, "confirmations": 0,
+        "data_source": "TGJU (close-only)" if symbol in ("GOLD18", "XAU") else "CoinGecko (close-only)",
     }
 
-def confirm_signal(symbol, candidate, price):
+# ============================================================
+# SIGNAL CONFIRMATION (BUCKET-BASED, FIX #5)
+# ============================================================
+
+def _timeframe_bucket(timeframe):
+    tf_seconds = {"15m": 900, "1H": 3600, "4H": 14400, "1D": 86400}.get(timeframe, 3600)
+    bucket = int(time.time() // tf_seconds)
+    return f"{timeframe}:{bucket}"
+
+def confirm_signal(symbol, candidate, price, timeframe=None):
+    """Confirm a signal on successive CLOSED candles of the given timeframe."""
+    timeframe = timeframe or SIGNAL_CONFIRM_TIMEFRAME
     if candidate == "WAIT":
         with db() as c:
             c.execute("DELETE FROM signal_state WHERE symbol=?", (symbol,))
         return "WAIT", False, 0
-    observation_key = datetime.now(timezone.utc).replace(second=0, microsecond=0).isoformat()
-    now = now_iso()
+
+    observation_key = _timeframe_bucket(timeframe)
+    iso_now = now_iso()
     with db() as c:
         row = c.execute("SELECT * FROM signal_state WHERE symbol=?", (symbol,)).fetchone()
         if row and row["candidate"] == candidate:
@@ -2321,10 +2033,12 @@ def confirm_signal(symbol, candidate, price):
             INSERT INTO signal_state(symbol,candidate,confirmations,last_candidate_at,last_price,updated_at)
             VALUES(?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
-                candidate=excluded.candidate, confirmations=excluded.confirmations,
-                last_candidate_at=excluded.last_candidate_at, last_price=excluded.last_price,
+                candidate=excluded.candidate,
+                confirmations=excluded.confirmations,
+                last_candidate_at=excluded.last_candidate_at,
+                last_price=excluded.last_price,
                 updated_at=excluded.updated_at
-        """, (symbol, candidate, confirmations, observation_key, float(price), now))
+        """, (symbol, candidate, confirmations, observation_key, float(price), iso_now))
     confirmed = confirmations >= SIGNAL_CONFIRMATIONS_REQUIRED
     return (candidate if confirmed else "WAIT"), confirmed, confirmations
 
@@ -2333,26 +2047,37 @@ async def analyze(symbol):
     cached = ANALYSIS_CACHE.get(s)
     if cached and time.monotonic() - cached[0] < ANALYSIS_CACHE_SECONDS:
         return cached[1]
+
     if s not in ("GOLD18", "XAU"):
         result = await professional_crypto_analysis(s)
         if result:
-            observation_key = datetime.now(timezone.utc).replace(second=0, microsecond=0).isoformat()
-            confirmed_signal, confirmed, confirmations = confirm_signal(s, result["signal_candidate"], result["price"])
+            confirmed_signal, confirmed, confirmations = confirm_signal(
+                s, result["signal_candidate"], result["price"], SIGNAL_CONFIRM_TIMEFRAME
+            )
             result["signal"] = confirmed_signal
             result["confirmed"] = confirmed
             result["confirmations"] = confirmations
             ANALYSIS_CACHE[s] = (time.monotonic(), result)
             return result
+
     data = await asset_data(s)
     if not data:
         return None
     if s in ("GOLD18", "XAU") and len(data[1]) < GOLD_MIN_HISTORY_POINTS:
-        return {"symbol": s, "price": float(data[1].iloc[-1]), "insufficient_history": True, "history_points": len(data[1]), "signal": "WAIT"}
+        return {
+            "symbol": s, "price": float(data[1].iloc[-1]),
+            "insufficient_history": True, "history_points": len(data[1]),
+            "signal": "WAIT"
+        }
     result = technical_analysis(data[0], data[1], data[2])
     if not result:
         return None
-    confirmed_signal, confirmed, confirmations = confirm_signal(s, result["signal_candidate"], result["price"])
-    result["signal"] = confirmed_signal; result["confirmed"] = confirmed; result["confirmations"] = confirmations
+    confirmed_signal, confirmed, confirmations = confirm_signal(
+        s, result["signal_candidate"], result["price"], SIGNAL_CONFIRM_TIMEFRAME
+    )
+    result["signal"] = confirmed_signal
+    result["confirmed"] = confirmed
+    result["confirmations"] = confirmations
     ANALYSIS_CACHE[s] = (time.monotonic(), result)
     return result
 
@@ -2360,7 +2085,7 @@ def signal_fa(s):
     return {"BUY":"🟢 خرید","SELL":"🔴 فروش","WAIT":"🟡 انتظار"}.get(s, s)
 
 def analysis_text(a):
-    """Pure technical dashboard. Deliberately does NOT issue a trade signal."""
+    """Pure technical dashboard. No trade signal."""
     if not a:
         return "❌ اطلاعات بازار در دسترس نیست."
     if a.get("insufficient_history"):
@@ -2369,28 +2094,39 @@ def analysis_text(a):
                 f"📚 تاریخچه قابل استفاده: {a['history_points']} نقطه از {GOLD_MIN_HISTORY_POINTS} نقطه لازم\n\n"
                 "⏳ برای محاسبه اندیکاتورها هنوز تاریخچه واقعی کافی جمع نشده است.")
     unit = "تومان" if a["symbol"] == "GOLD18" else "دلار"
-    trend_fa = {"BULLISH":"صعودی قوی","BULLISH_WEAK":"صعودی ضعیف","BEARISH":"نزولی قوی","BEARISH_WEAK":"نزولی ضعیف","NEUTRAL":"خنثی"}.get(a["trend"], a["trend"])
+    trend_fa = {"BULLISH":"صعودی قوی","BULLISH_WEAK":"صعودی ضعیف",
+                "BEARISH":"نزولی قوی","BEARISH_WEAK":"نزولی ضعیف",
+                "NEUTRAL":"خنثی"}.get(a["trend"], a["trend"])
+    source = a.get("data_source") or ("TGJU (close-only)" if a["symbol"] in ("GOLD18","XAU") else "CoinGecko (close-only)")
+    is_close_only = a["symbol"] in ("GOLD18", "XAU") or "close-only" in source
+    adx_label = "ADX≈" if is_close_only else "ADX"
+    candle_note = (
+        "⏱ کندل‌ها بر پایه داده ساعتی CoinGecko ≈ ساعت\n"
+        if is_close_only else
+        f"⏱ کندل‌ها بر پایه تایم‌فریم 4H OKX\n"
+    )
     return (
         f"📊 <b>داشبورد تحلیل تکنیکال {escape(a['symbol'])}</b>\n\n"
         f"💰 قیمت: <b>{_format_price(a['symbol'], a['price'])} {unit}</b>\n"
         f"📈 ساختار روند: <b>{trend_fa}</b>\n\n"
         f"EMA9: {_format_price(a['symbol'], a['ema9'])} | EMA21: {_format_price(a['symbol'], a['ema21'])}\n"
         f"EMA50: {_format_price(a['symbol'], a['ema50'])} | EMA200: {_format_price(a['symbol'], a['ema200'])}\n"
-        f"RSI14: <b>{a['rsi']:.1f}</b> | ADX: <b>{a['adx']:.1f}</b>\n"
+        f"RSI14: <b>{a['rsi']:.1f}</b> | {adx_label}: <b>{a['adx']:.1f}</b>\n"
         f"MACD: {a['macd']:.5f} | Histogram: {a['macd_hist']:+.5f}\n"
         f"Bollinger: <b>{a['bb_position']:.1f}%</b> | ATR: {_format_price(a['symbol'], a['atr'])} ({a['atr_pct']:.2f}%)\n"
         f"حمایت: {_format_price(a['symbol'], a['support'])} | مقاومت: {_format_price(a['symbol'], a['resistance'])}\n\n"
-        f"مومنتوم: 1 دوره {a['r1']:+.2f}% | 6 دوره {a['r6']:+.2f}% | 24 دوره {a['r24']:+.2f}% | 72 دوره {a['r72']:+.2f}%\n\n"
+        f"مومنتوم: 1 کندل {a.get('r1', 0):+.2f}% | 6 کندل {a.get('r6', 0):+.2f}% | "
+        f"24 کندل {a.get('r24', 0):+.2f}% | 72 کندل {a.get('r72', 0):+.2f}%\n"
+        f"{candle_note}\n"
         f"💪 <b>قدرت تکنیکال: {a['strength']:.0f}%</b>\n"
         f"🧭 هم‌جهتی تایم‌فریم‌ها: <b>{a.get('mtf_agreement', 0):.0f}%</b>\n"
         f"🔬 وضعیت ساختار: {'قوی' if a['strength'] >= 75 else 'متوسط' if a['strength'] >= 55 else 'ضعیف'}\n"
-        f"📚 تعداد داده: {a['history_points']} | منبع: {a.get('data_source','تحلیل تاریخی')}\n\n"
+        f"📚 تعداد داده: {a['history_points']} | منبع: {escape(source)}\n\n"
         "ℹ️ این بخش فقط وضعیت بازار و ساختار تکنیکال را توضیح می‌دهد.\n"
         "📡 برای تصمیم معاملاتی از منوی «سیگنال‌ها» استفاده کنید."
     )
 
 def signal_text(a):
-    """Independent trade-setup output. This is intentionally different from analysis."""
     if not a:
         return "❌ سیگنال قابل محاسبه نیست."
     if a.get("insufficient_history"):
@@ -2419,7 +2155,7 @@ def signal_text(a):
         f"🔎 کاندیدا: <b>{candidate_fa}</b>\n"
         f"🎯 امتیاز سیگنال: <b>{a['signal_score']:.0f}%</b>\n"
         f"🧠 اعتماد مدل: <b>{a['probability']:.0f}%</b>\n"
-        f"🔁 تأیید متوالی: <b>{a['confirmations']}/{SIGNAL_CONFIRMATIONS_REQUIRED}</b>\n"
+        f"🔁 تأیید متوالی: <b>{a['confirmations']}/{SIGNAL_CONFIRMATIONS_REQUIRED}</b> ({SIGNAL_CONFIRM_TIMEFRAME})\n"
         f"💪 قدرت تکنیکال: <b>{a['strength']:.0f}%</b>\n"
         f"📈 روند: <b>{a['trend']}</b> | RSI: <b>{a['rsi']:.1f}</b> | ADX: <b>{a['adx']:.1f}</b>\n\n"
         f"🧩 منطق {direction_note}:\n{reasons_text}\n"
@@ -2451,14 +2187,9 @@ def _repair_watchlist_table():
 
         names = {r[1] for r in info}
         required = {"user_id", "symbol", "asset_type", "created_at"}
-        has_bad_required = any(
-            bool(r[3]) and r[4] is None and not bool(r[5]) and r[1] not in required | {"asset_key"}
-            for r in info
-        )
-        if required.issubset(names) and not has_bad_required:
-            # Fill legacy asset_key where present and missing.
+        if required.issubset(names):
             if "asset_key" in names:
-                c.execute("UPDATE watchlist SET asset_key=upper(symbol) WHERE asset_key IS NULL OR asset_key='' ")
+                c.execute("UPDATE watchlist SET asset_key=upper(symbol) WHERE asset_key IS NULL OR asset_key=''")
             return
 
         legacy = f"watchlist_legacy_{int(time.time())}"
@@ -2475,8 +2206,6 @@ def _repair_watchlist_table():
             )
         """)
 
-        # Copy only fields used by the current bot. This preserves existing
-        # watchlist entries even if the old table had incompatible columns.
         old_names = {r[1] for r in info}
         if "user_id" in old_names:
             symbol_expr = "symbol" if "symbol" in old_names else ("asset_key" if "asset_key" in old_names else "''")
@@ -2494,13 +2223,11 @@ def _repair_watchlist_table():
                 WHERE user_id IS NOT NULL
                   AND COALESCE({symbol_expr}, '') <> ''
             """, params + ([stamp] if created_expr != "?" else []))
-
         c.execute("CREATE INDEX IF NOT EXISTS idx_watch_asset ON watchlist(asset_type,symbol)")
         log.warning("WATCHLIST SCHEMA NORMALIZED; legacy table preserved as %s", legacy)
 
 
 def add_watch(uid, symbol, atype, asset_key=None):
-    """Persist a watchlist asset and verify it after commit."""
     uid = int(uid)
     s = norm_symbol(symbol)
     atype = str(atype or asset_type(s))
@@ -2528,8 +2255,6 @@ def add_watch(uid, symbol, atype, asset_key=None):
                 log.warning("WATCHLIST LIMIT uid=%s count=%s", uid, n)
                 return False
 
-            # Use only the canonical columns. Legacy schema repair is handled
-            # separately instead of guessing values for arbitrary constraints.
             c.execute("""
                 INSERT OR IGNORE INTO watchlist(
                     user_id,symbol,asset_type,created_at,asset_key
@@ -2544,7 +2269,7 @@ def add_watch(uid, symbol, atype, asset_key=None):
     try:
         saved = _insert_once()
     except Exception as first_error:
-        log.exception("WATCHLIST INSERT ERROR (first attempt) uid=%s symbol=%s type=%s: %s", uid, s, atype, first_error)
+        log.exception("WATCHLIST INSERT ERROR (first) uid=%s symbol=%s type=%s: %s", uid, s, atype, first_error)
         try:
             _repair_watchlist_table()
             saved = _insert_once()
@@ -2575,7 +2300,6 @@ def remove_watch(uid, symbol, atype):
         """, (uid, norm_symbol(symbol), atype))
 
 def user_assets(uid, atype=None):
-    """Read the current user's persisted watchlist from the same DB path."""
     uid = int(uid)
     with db() as c:
         if atype:
@@ -2592,11 +2316,7 @@ def user_assets(uid, atype=None):
                 WHERE user_id=?
                 ORDER BY created_at ASC, symbol ASC
             """, (uid,)).fetchall()
-
-        log.info(
-            "WATCHLIST READ uid=%s count=%s db=%s",
-            uid, len(rows), DB_PATH
-        )
+        log.info("WATCHLIST READ uid=%s count=%s db=%s", uid, len(rows), DB_PATH)
         return rows
 
 def user_has_asset(uid, symbol, atype):
@@ -2614,26 +2334,19 @@ def main_kb(uid):
     rows = [r[:] for r in MAIN_MENU]
     if not is_admin(uid):
         rows = [r for r in rows if r != ["👨‍💼 پنل مدیریت"]]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False, input_field_placeholder="یک بخش را انتخاب کنید…")
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False,
+                               input_field_placeholder="یک بخش را انتخاب کنید…")
 
 def admin_kb():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📊 داشبورد آماری", callback_data="adm:stats"),
-            InlineKeyboardButton("👥 کاربران", callback_data="adm:users:0"),
-        ],
-        [
-            InlineKeyboardButton("💳 پرداخت‌ها", callback_data="adm:payments"),
-            InlineKeyboardButton("📢 ارسال همگانی", callback_data="adm:broadcast"),
-        ],
-        [
-            InlineKeyboardButton("📨 پشتیبانی", callback_data="adm:support"),
-            InlineKeyboardButton("✉️ پیام مستقیم", callback_data="adm:message"),
-        ],
-        [
-            InlineKeyboardButton("🚫 مدیریت دسترسی", callback_data="adm:block"),
-            InlineKeyboardButton("🗄 وضعیت دیتابیس", callback_data="adm:db"),
-        ],
+        [InlineKeyboardButton("📊 داشبورد آماری", callback_data="adm:stats"),
+         InlineKeyboardButton("👥 کاربران", callback_data="adm:users:0")],
+        [InlineKeyboardButton("💳 پرداخت‌ها", callback_data="adm:payments"),
+         InlineKeyboardButton("📢 ارسال همگانی", callback_data="adm:broadcast")],
+        [InlineKeyboardButton("📨 پشتیبانی", callback_data="adm:support"),
+         InlineKeyboardButton("✉️ پیام مستقیم", callback_data="adm:message")],
+        [InlineKeyboardButton("🚫 مدیریت دسترسی", callback_data="adm:block"),
+         InlineKeyboardButton("🗄 وضعیت دیتابیس", callback_data="adm:db")],
     ])
 
 def watchlist_selector_keyboard(rows, prefix):
@@ -2644,45 +2357,34 @@ def watchlist_selector_keyboard(rows, prefix):
             label += " — طلای جهانی"
         elif r["asset_type"] == "gold18":
             label += " — طلای ۱۸ عیار"
-
         buttons.append([
-            InlineKeyboardButton(
-                label,
-                callback_data=f"{prefix}:{r['asset_type']}:{r['symbol']}"
-            )
+            InlineKeyboardButton(label, callback_data=f"{prefix}:{r['asset_type']}:{r['symbol']}")
         ])
-
     return InlineKeyboardMarkup(buttons)
 
 # ============================================================
-# BASIC
+# BASIC COMMANDS
 # ============================================================
 
 async def start(update, context):
     ensure_user(update.effective_user)
     uid = update.effective_user.id
-
     if is_blocked(uid):
         await update.message.reply_text("🚫 دسترسی شما توسط مدیر محدود شده است.")
         return
-
     await update.message.reply_text(
         "🤖 به ربات تحلیلگر بازار خوش آمدید.\n\n"
         "📊 تحلیل هوشمند رمز ارزها، طلای جهانی (XAU) و طلای ۱۸ عیار ایران (GOLD18)\n\n"
         "✨ امکانات ربات:\n"
         "• 📐 تحلیل تکنیکال: روند، اندیکاتورها، حمایت و مقاومت\n"
-        "• 🧬 تحلیل بنیادی دارایی‌ها\n"
         "• 📊 داشبورد تحلیل تکنیکال مستقل\n"
         "• 📡 موتور سیگنال مستقل با ورود، حدضرر و اهداف\n"
         "• 🎯 اسکن کل بازار برای فرصت‌های خرید تأییدشده\n"
-        "• 💪 قدرت سیگنال و 🎯 احتمال سود به صورت جداگانه\n"
-        "• 🚀 شکار رشد کوتاه‌مدت\n"
         "• 🔔 هشدارهای بازار\n\n"
         "⚙️ روش استفاده:\n"
         "1️⃣ دارایی را به واچ‌لیست اضافه کنید.\n"
         "2️⃣ از بخش تحلیل، بررسی کامل دریافت کنید.\n"
         "3️⃣ از بخش سیگنال‌ها وضعیت بازار را مشاهده کنید.\n\n"
-        "⚠️ گاهی به دلیل نوسان، اختلال موقت یا محدودیت سایت‌های منبع، ممکن است داده یک دارایی در لحظه دریافت نشود. در این حالت چند لحظه بعد دوباره تلاش کنید.\n\n"
         "⚠️ این ربات ابزار تحلیل و تصمیم‌یار بازار است و معامله خودکار انجام نمی‌دهد.",
         reply_markup=main_kb(uid)
     )
@@ -2695,24 +2397,21 @@ async def help_text(update, context):
         "💰 قیمت لحظه‌ای: رایگان\n"
         "📊 تحلیل تکنیکال: داشبورد مستقل وضعیت بازار\n"
         "📡 سیگنال معاملاتی: تصمیم‌یار مستقل با ورود/حدضرر/اهداف\n"
-        "🎯 فرصت‌های خرید: فهرست همه فرصت‌های تأییدشده کل بازار\n"
+        "🎯 فرصت‌های خرید: فهرست فرصت‌های تأییدشده کل بازار\n"
         "🔔 هشدارهای هوشمند: اعلان فرصت‌های جدید\n"
         "📨 پشتیبان: ارتباط مستقیم\n"
         "💳 خرید اشتراک: پرداخت دستی و ارسال رسید\n\n"
+        f"تأیید سیگنال روی تایم‌فریم: {SIGNAL_CONFIRM_TIMEFRAME}\n"
         "منبع GOLD18: TGJU / geram18\n"
         "منبع XAU: TGJU / ons\n\n"
         "⚠️ ربات معامله خودکار انجام نمی‌دهد."
     )
 
 async def add_asset_prompt(update, context):
-    for k in (
-        "support_mode","chat_room","payment_plan",
-        "admin_reply_to","admin_mode","message_target"
-    ):
+    for k in ("support_mode","chat_room","payment_plan",
+              "admin_reply_to","admin_mode","message_target"):
         context.user_data.pop(k, None)
-
     context.user_data["awaiting_asset"] = "add"
-
     await update.message.reply_text(
         "➕ <b>افزودن دارایی</b>\n\n"
         "نمونه: BTC، ZEC، ETH، XAU، GOLD18 یا طلای ۱۸ عیار\n\n"
@@ -2720,118 +2419,69 @@ async def add_asset_prompt(update, context):
         parse_mode=ParseMode.HTML
     )
 
-async def more_coins(update, context):
-    context.user_data["awaiting_asset"] = "add"
-    await update.message.reply_text(
-        "🪙 نام یا نماد رمز ارز را ارسال کنید؛ مثال ZEC، BTC، SOL."
-    )
-
 async def process_add_asset(update, context, text):
     uid = update.effective_user.id
     text = (text or "").strip()
-
     if not text:
         await update.message.reply_text("❌ نماد خالی است.")
         return
-
     try:
         s = norm_symbol(text)
-
         if s in ("XAU", "GOLD18"):
             at = asset_type(s)
             if not add_watch(uid, s, at):
-                await update.message.reply_text(
-                    "⚠️ سقف واچ‌لیست پر شده است یا ذخیره انجام نشد."
-                )
+                await update.message.reply_text("⚠️ سقف واچ‌لیست پر شده است یا ذخیره انجام نشد.")
                 return
-
-            # Final read-back check: never tell the user that the asset was
-            # added unless the same database connection can see it.
             if not user_has_asset(uid, s, at):
-                await update.message.reply_text(
-                    "❌ دارایی در پایگاه‌داده ذخیره نشد. لطفاً دوباره تلاش کنید."
-                )
+                await update.message.reply_text("❌ دارایی در پایگاه‌داده ذخیره نشد. لطفاً دوباره تلاش کنید.")
                 return
-
             label = "طلای جهانی XAU" if s == "XAU" else "طلای ۱۸ عیار ایران"
-            await update.message.reply_text(
-                f"✅ <b>{label}</b> به واچ‌لیست اضافه شد.",
-                parse_mode=ParseMode.HTML
-            )
+            await update.message.reply_text(f"✅ <b>{label}</b> به واچ‌لیست اضافه شد.", parse_mode=ParseMode.HTML)
             return
 
         res = await crypto_search(text)
-
         if not res:
-            await update.message.reply_text(
-                f"❌ دارایی <b>{escape(text)}</b> پیدا نشد.",
-                parse_mode=ParseMode.HTML
-            )
+            await update.message.reply_text(f"❌ دارایی <b>{escape(text)}</b> پیدا نشد.", parse_mode=ParseMode.HTML)
             return
-
         if len(res) == 1:
             sym, _, name = res[0]
-
             if not add_watch(uid, sym, "crypto"):
                 await update.message.reply_text("⚠️ سقف واچ‌لیست پر شده است یا ذخیره انجام نشد.")
                 return
-
             if not user_has_asset(uid, sym, "crypto"):
-                await update.message.reply_text(
-                    "❌ دارایی در پایگاه‌داده ذخیره نشد. لطفاً دوباره تلاش کنید."
-                )
+                await update.message.reply_text("❌ دارایی در پایگاه‌داده ذخیره نشد. لطفاً دوباره تلاش کنید.")
                 return
-
             await update.message.reply_text(
-                f"✅ <b>{escape(sym)}</b> به واچ‌لیست اضافه شد.\n"
-                f"نام: {escape(name)}",
+                f"✅ <b>{escape(sym)}</b> به واچ‌لیست اضافه شد.\nنام: {escape(name)}",
                 parse_mode=ParseMode.HTML
             )
             return
 
-        buttons = []
-        for sym, cid, name in res[:10]:
-            buttons.append([
-                InlineKeyboardButton(
-                    f"{sym} — {name}",
-                    callback_data=f"pick:{cid}:{norm_symbol(sym)}"
-                )
-            ])
-
-        await update.message.reply_text(
-            "🔎 چند دارایی پیدا شد:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
+        buttons = [[
+            InlineKeyboardButton(f"{sym} — {name}", callback_data=f"pick:{cid}:{norm_symbol(sym)}")
+        ] for sym, cid, name in res[:10]]
+        await update.message.reply_text("🔎 چند دارایی پیدا شد:", reply_markup=InlineKeyboardMarkup(buttons))
     except Exception:
         log.exception("add asset")
         await update.message.reply_text("⚠️ افزودن دارایی انجام نشد.")
 
 async def watchlist_menu(update, context):
     rows = user_assets(update.effective_user.id)
-
     if not rows:
         await update.message.reply_text("📋 واچ‌لیست خالی است.")
         return
-
-    lines = []
-    buttons = []
-
+    lines, buttons = [], []
     for r in rows:
         label = r["symbol"] + " — " + (
             "طلای جهانی" if r["asset_type"] == "gold"
             else "طلای ۱۸ عیار" if r["asset_type"] == "gold18"
             else "رمز ارز"
         )
-
         lines.append("• " + label)
         buttons.append([
-            InlineKeyboardButton(
-                f"❌ حذف {r['symbol']}",
-                callback_data=f"wl:del:{r['asset_type']}:{r['symbol']}"
-            )
+            InlineKeyboardButton(f"❌ حذف {r['symbol']}",
+                                 callback_data=f"wl:del:{r['asset_type']}:{r['symbol']}")
         ])
-
     await update.message.reply_text(
         "📋 <b>واچ‌لیست شما</b>\n\n" + "\n".join(lines),
         parse_mode=ParseMode.HTML,
@@ -2840,20 +2490,13 @@ async def watchlist_menu(update, context):
 
 async def live_price_menu(update, context):
     rows = user_assets(update.effective_user.id)
-
     if not rows:
-        await update.message.reply_text(
-            "📋 واچ‌لیست خالی است؛ ابتدا دارایی اضافه کنید."
-        )
+        await update.message.reply_text("📋 واچ‌لیست خالی است؛ ابتدا دارایی اضافه کنید.")
         return
-
     buttons = [[
-        InlineKeyboardButton(
-            f"💰 {r['symbol']}",
-            callback_data=f"price:{r['asset_type']}:{r['symbol']}"
-        )
+        InlineKeyboardButton(f"💰 {r['symbol']}",
+                             callback_data=f"price:{r['asset_type']}:{r['symbol']}")
     ] for r in rows]
-
     await update.message.reply_text(
         "💰 <b>قیمت لحظه‌ای</b>\nرایگان و بدون نیاز به اشتراک:",
         parse_mode=ParseMode.HTML,
@@ -2863,43 +2506,27 @@ async def live_price_menu(update, context):
 async def selected_price_callback(update, context):
     q = update.callback_query
     await q.answer("دریافت قیمت...")
-
     try:
         _, at, s = q.data.split(":", 2)
         s = norm_symbol(s)
-
         if not user_has_asset(q.from_user.id, s, at):
-            await q.message.reply_text(
-                "❌ این دارایی در واچ‌لیست شما نیست."
-            )
+            await q.message.reply_text("❌ این دارایی در واچ‌لیست شما نیست.")
             return
-
         item = await current_price(s)
-
-        await q.message.reply_text(
-            format_live_price(item),
-            parse_mode=ParseMode.HTML
-        )
-
+        await q.message.reply_text(format_live_price(item), parse_mode=ParseMode.HTML)
     except Exception:
         log.exception("price callback")
         await q.message.reply_text("⚠️ دریافت قیمت انجام نشد.")
 
 async def analysis_prompt(update, context):
     uid = update.effective_user.id
-
     if not has_analysis_access(uid):
-        await update.message.reply_text(
-            "🔒 تحلیل فقط برای مشترکین فعال است."
-        )
+        await update.message.reply_text("🔒 تحلیل فقط برای مشترکین فعال است.")
         return
-
     rows = user_assets(uid)
-
     if not rows:
         await update.message.reply_text("📋 واچ‌لیست خالی است.")
         return
-
     await update.message.reply_text(
         "📊 <b>انتخاب دارایی برای تحلیل</b>",
         parse_mode=ParseMode.HTML,
@@ -2908,19 +2535,13 @@ async def analysis_prompt(update, context):
 
 async def signals_menu(update, context):
     uid = update.effective_user.id
-
     if not has_analysis_access(uid):
-        await update.message.reply_text(
-            "🔒 سیگنال‌ها فقط برای مشترکین فعال است."
-        )
+        await update.message.reply_text("🔒 سیگنال‌ها فقط برای مشترکین فعال است.")
         return
-
     rows = user_assets(uid)
-
     if not rows:
         await update.message.reply_text("📋 واچ‌لیست خالی است.")
         return
-
     await update.message.reply_text(
         "🚨 <b>انتخاب دارایی برای سیگنال</b>",
         parse_mode=ParseMode.HTML,
@@ -2932,15 +2553,9 @@ async def signals_menu(update, context):
 # ============================================================
 
 def _short_term_scan_metrics(x, ta):
-    """Build a multi-factor short-term crypto growth setup score.
-
-    This is a screening model, not a guarantee. It deliberately keeps
-    technical strength and model profit probability as separate metrics.
-    """
     price = _safe_float(x.get("current_price"))
     if price <= 0:
         return None
-
     ch1 = _safe_float(x.get("price_change_percentage_1h_in_currency"))
     ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
     ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
@@ -2959,11 +2574,9 @@ def _short_term_scan_metrics(x, ta):
         if len(rets) >= 12:
             volatility = float(rets.tail(72).std())
 
-    # 100-point opportunity score.
     score = 50.0
     reasons = []
 
-    # Short-term momentum: reward positive acceleration, but penalize pumps.
     score += _clamp(ch1 * 2.0, -8, 8)
     score += _clamp(ch24 * 0.55, -10, 10)
     score += _clamp(ch7 * 0.35, -8, 8)
@@ -2975,7 +2588,6 @@ def _short_term_scan_metrics(x, ta):
     if ch7 > 60:
         score -= 6; reasons.append("رشد ۷روزه شدید؛ احتمال اشباع کوتاه‌مدت")
 
-    # Liquidity / tradability.
     if turnover >= 0.25:
         score += 8; reasons.append("نقدشوندگی و گردش معاملات بالا")
     elif turnover >= 0.10:
@@ -2983,15 +2595,10 @@ def _short_term_scan_metrics(x, ta):
     elif turnover < 0.02:
         score -= 8; reasons.append("نقدشوندگی پایین")
 
-    # Market-cap/rank quality without excluding smaller coins.
-    if rank <= 50:
-        score += 5
-    elif rank <= 200:
-        score += 3
-    elif rank > 1000:
-        score -= 4
+    if rank <= 50: score += 5
+    elif rank <= 200: score += 3
+    elif rank > 1000: score -= 4
 
-    # Distance from ATH: not too extended, not a deeply broken chart.
     if -25 <= ath_change <= -5:
         score += 5; reasons.append("فاصله مناسب از سقف تاریخی")
     elif ath_change < -90:
@@ -3023,22 +2630,16 @@ def _short_term_scan_metrics(x, ta):
         elif rsi < 35:
             score -= 3
 
-        if mhist > 0:
-            score += 5; reasons.append("MACD مثبت")
-        if adx >= 25:
-            score += 4; reasons.append("قدرت روند مناسب")
-        if e9 > e21 > e50:
-            score += 5; reasons.append("چیدمان EMA صعودی")
+        if mhist > 0: score += 5; reasons.append("MACD مثبت")
+        if adx >= 25: score += 4; reasons.append("قدرت روند مناسب")
+        if e9 > e21 > e50: score += 5; reasons.append("چیدمان EMA صعودی")
 
-    # Volatility is useful for short-term opportunities but excessive volatility is risk.
     if 0.5 <= volatility <= 3.0:
         score += 4; reasons.append("نوسان مناسب برای معاملات کوتاه‌مدت")
     elif volatility > 6:
         score -= 6; reasons.append("نوسان بسیار بالا")
 
     score = _clamp(score)
-
-    # Separate model probability: not a guarantee and not the strength percentage.
     probability = _clamp(50 + (score - 50) * 0.78 + min(8, max(0, turnover * 20)))
 
     if score >= 75 and probability >= 68:
@@ -3060,26 +2661,15 @@ def _short_term_scan_metrics(x, ta):
         risk = "کنترل‌شده"
 
     return {
-        "score": score,
-        "probability": probability,
-        "strength": strength,
-        "setup": setup,
-        "risk": risk,
-        "reasons": reasons[:5],
-        "volatility": volatility,
-        "turnover": turnover,
-        "ath_change": ath_change,
-        "rank": rank,
-        "price": price,
-        "ch1": ch1,
-        "ch24": ch24,
-        "ch7": ch7,
-        "ch14": ch14,
+        "score": score, "probability": probability, "strength": strength,
+        "setup": setup, "risk": risk, "reasons": reasons[:5],
+        "volatility": volatility, "turnover": turnover, "ath_change": ath_change,
+        "rank": rank, "price": price,
+        "ch1": ch1, "ch24": ch24, "ch7": ch7, "ch14": ch14,
         "ta": ta,
     }
 
 async def short_term_growth_scan():
-    """Scan the broad CoinGecko market and deeply inspect top candidates."""
     global SHORT_TERM_SCAN_CACHE
     now = time.monotonic()
     if SHORT_TERM_SCAN_CACHE and now - SHORT_TERM_SCAN_CACHE[0] < MARKET_SCAN_SECONDS:
@@ -3099,7 +2689,6 @@ async def short_term_growth_scan():
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
         turnover = volume / mcap
-        # Fast whole-market pre-screen. It is intentionally broad.
         rough_score = 50 + _clamp(ch24 * .55, -12, 12) + _clamp(ch7 * .30, -8, 8)
         rough_score += _clamp((turnover - .05) * 70, -7, 9)
         if ch24 > 25: rough_score -= 8
@@ -3112,8 +2701,11 @@ async def short_term_growth_scan():
 
     async def deep_one(x):
         sym = norm_symbol(x.get("symbol") or "")
-        ta = await professional_crypto_analysis(sym)
-        return x, ta
+        try:
+            ta = await professional_crypto_analysis(sym)
+            return x, ta
+        except Exception:
+            return x, None
     deep_results = await asyncio.gather(*(deep_one(x) for _, x in candidates), return_exceptions=True)
     for item in deep_results:
         if isinstance(item, Exception):
@@ -3142,11 +2734,9 @@ async def short_term_growth_menu(update, context):
     if not has_analysis_access(uid):
         await update.message.reply_text("🔒 شکار رشد کوتاه‌مدت فقط برای مشترکین فعال است.")
         return
-
     await update.message.reply_text(
         "🚀 <b>شکار رشد کوتاه‌مدت</b>\n\n"
         f"🌐 بازار گسترده CoinGecko بررسی می‌شود؛ حداکثر {MARKET_SCAN_PAGES * MARKET_SCAN_PER_PAGE:,} دارایی در هر چرخه.\n"
-        "🔬 فیلتر اولیه روی کل بازار و تحلیل عمیق روی نامزدهای برتر انجام می‌شود.\n"
         "⏳ چند لحظه صبر کنید...",
         parse_mode=ParseMode.HTML,
     )
@@ -3155,31 +2745,28 @@ async def short_term_growth_menu(update, context):
         if not items:
             await update.message.reply_text("❌ داده کافی برای اسکن بازار دریافت نشد. چند دقیقه بعد دوباره تلاش کنید.")
             return
-
         lines = [
-            "🚀 <b>نامزدهای رشد کوتاه‌مدت</b>",
-            "",
+            "🚀 <b>نامزدهای رشد کوتاه‌مدت</b>", "",
             "📌 این فهرست «پیش‌بینی قطعی» نیست؛ خروجی یک مدل غربالگری چندعاملی است.",
-            "📊 قدرت تکنیکال و احتمال سود مدل عمداً جداگانه نمایش داده شده‌اند.",
-            "",
+            "📊 قدرت تکنیکال و احتمال سود مدل عمداً جداگانه نمایش داده شده‌اند.", "",
         ]
         for i, item in enumerate(items, 1):
-            m = item["m"]
-            ta = m.get("ta") or {}
+            m = item["m"]; ta = m.get("ta") or {}
             rsi = _safe_float(ta.get("rsi"), 0)
-            trend = {"BULLISH":"صعودی قوی", "BULLISH_WEAK":"صعودی", "BEARISH":"نزولی قوی", "BEARISH_WEAK":"نزولی", "NEUTRAL":"خنثی"}.get(ta.get("trend"), "بازار")
+            trend = {"BULLISH":"صعودی قوی","BULLISH_WEAK":"صعودی",
+                     "BEARISH":"نزولی قوی","BEARISH_WEAK":"نزولی",
+                     "NEUTRAL":"خنثی"}.get(ta.get("trend"), "بازار")
             lines.append(
                 f"<b>{i}. {escape(item['symbol'])}</b> — {escape(item['name'])}\n"
-                f"🎯 فرصت رشد کوتاه‌مدت: <b>{m['score']:.0f}%</b> | وضعیت: <b>{m['setup']}</b>\n"
-                f"💪 قدرت تکنیکال: <b>{m['strength']:.0f}%</b> | 🧠 احتمال سود مدل: <b>{m['probability']:.0f}%</b>\n"
+                f"🎯 فرصت رشد: <b>{m['score']:.0f}%</b> | وضعیت: <b>{m['setup']}</b>\n"
+                f"💪 قدرت تکنیکال: <b>{m['strength']:.0f}%</b> | 🧠 احتمال مدل: <b>{m['probability']:.0f}%</b>\n"
                 f"📈 روند: {trend} | RSI: {rsi:.0f}\n"
                 f"⚡ 1h: {m['ch1']:+.2f}% | 24h: {m['ch24']:+.2f}% | 7d: {m['ch7']:+.2f}%\n"
-                f"💧 حجم/ارزش بازار: {m['turnover']*100:.1f}% | رتبه بازار: #{m['rank']} | ریسک: <b>{m['risk']}</b>\n"
+                f"💧 حجم/ارزش بازار: {m['turnover']*100:.1f}% | رتبه: #{m['rank']} | ریسک: <b>{m['risk']}</b>\n"
                 f"💵 قیمت: ${m['price']:,.8f}".rstrip("0").rstrip(".") + "\n"
                 f"🧩 " + "، ".join(escape(r) for r in m["reasons"][:4]) + "\n"
             )
-        lines.append("⚠️ برای ورود واقعی، تحلیل دارایی و مدیریت حد ضرر را جداگانه بررسی کنید. این خروجی تضمین رشد نیست.")
-        # Telegram message limit safety: send in chunks.
+        lines.append("⚠️ برای ورود واقعی، تحلیل دارایی و مدیریت حد ضرر را جداگانه بررسی کنید.")
         text = "\n".join(lines)
         for start in range(0, len(text), 3800):
             await update.message.reply_text(text[start:start+3800], parse_mode=ParseMode.HTML)
@@ -3194,29 +2781,28 @@ async def growth_scan_menu(update, context):
         return
     await update.message.reply_text(
         "🔎 در حال اسکن بازار...\n\n"
-        f"🌐 کل بازار بررسی می‌شود؛ حداکثر {MARKET_SCAN_PAGES * MARKET_SCAN_PER_PAGE:,} دارایی در هر چرخه.\n"
-        "سپس روی نامزدهای برتر تحلیل تکنیکال عمیق انجام می‌شود. ⏳"
+        f"🌐 حداکثر {MARKET_SCAN_PAGES * MARKET_SCAN_PER_PAGE:,} دارایی بررسی می‌شود.\n"
+        "⏳"
     )
     try:
         items = await growth_scan()
         if not items:
-            await update.message.reply_text("❌ داده کافی از بازار دریافت نشد؛ چند دقیقه بعد دوباره تلاش کنید.")
+            await update.message.reply_text("❌ داده کافی از بازار دریافت نشد.")
             return
-        lines=["🔎 <b>فرصت‌های رشد بازار</b>", "", f"📡 نامزدهای برتر از اسکن بازار: {len(items)}", ""]
+        lines = ["🔎 <b>فرصت‌های رشد بازار</b>", "", f"📡 نامزدهای برتر: {len(items)}", ""]
         for i, x in enumerate(items, 1):
-            rsi = f" | RSI {x['rsi']:.0f}" if x.get('rsi') is not None else ""
+            rsi = f" | RSI {x['rsi']:.0f}" if x.get('rsi') else ""
             lines.append(
                 f"<b>{i}. {escape(x['symbol'])}</b> — {escape(x['name'])}\n"
-                f"📈 امتیاز فرصت رشد: <b>{x['growth_score']:.0f}%</b> | قدرت تکنیکال: <b>{x['strength']:.0f}%</b>\n"
-                f"🧠 احتمال سود مدل: <b>{x['probability']:.0f}%</b> | 24h: {x['ch24']:+.2f}% | 7d: {x['ch7']:+.2f}%{rsi}\n"
-                f"💰 قیمت: ${x['price']:,.8f} | رتبه ارزش بازار: #{x['rank']}\n"
+                f"📈 امتیاز رشد: <b>{x['growth_score']:.0f}%</b> | 💪 تکنیکال: <b>{x['strength']:.0f}%</b>\n"
+                f"🧠 احتمال مدل: <b>{x['probability']:.0f}%</b> | 24h: {x['ch24']:+.2f}% | 7d: {x['ch7']:+.2f}%{rsi}\n"
+                f"💰 قیمت: ${x['price']:,.8f} | رتبه: #{x['rank']}\n"
             )
-        lines.append("⚠️ این رتبه‌بندی مدل تحلیلی است؛ «احتمال سود» تضمین سود یا پیش‌بینی قطعی نیست.")
+        lines.append("⚠️ این رتبه‌بندی مدل تحلیلی است؛ تضمین سود نیست.")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception:
         log.exception("growth scan")
-        await update.message.reply_text("⚠️ اسکن بازار کامل نشد. لاگ Railway را بررسی کنید.")
-
+        await update.message.reply_text("⚠️ اسکن بازار کامل نشد.")
 
 # ============================================================
 # PROFESSIONAL BUY-OPPORTUNITY MENU
@@ -3227,14 +2813,16 @@ def _buy_opportunity_text(item):
     ta = m.get("ta") or {}
     symbol = item.get("symbol") or "?"
     name = item.get("name") or symbol
-    trend_fa = {"BULLISH":"صعودی قوی","BULLISH_WEAK":"صعودی","BEARISH":"نزولی","BEARISH_WEAK":"نزولی ضعیف","NEUTRAL":"خنثی"}.get(ta.get("trend"), "نامشخص")
+    trend_fa = {"BULLISH":"صعودی قوی","BULLISH_WEAK":"صعودی",
+                "BEARISH":"نزولی","BEARISH_WEAK":"نزولی ضعیف",
+                "NEUTRAL":"خنثی"}.get(ta.get("trend"), "نامشخص")
     confirmations = int(m.get("confirmations", 0))
     return (
         f"🎯 <b>{escape(symbol)} — {escape(name)}</b>\n"
         f"🟢 <b>فرصت خرید تأییدشده</b> | 🔁 {confirmations}/{SIGNAL_CONFIRMATIONS_REQUIRED}\n"
         f"💎 فرصت: <b>{_safe_float(m.get('score')):.0f}%</b> | 💪 تکنیکال: <b>{_safe_float(m.get('strength')):.0f}%</b> | 🧠 مدل: <b>{_safe_float(m.get('probability')):.0f}%</b>\n"
         f"📈 روند: <b>{trend_fa}</b> | RSI: <b>{_safe_float(ta.get('rsi')):.1f}</b> | ADX: <b>{_safe_float(ta.get('adx')):.1f}</b>\n"
-        f"📊 مومنتوم: 1H { _safe_float(m.get('ch1')):+.2f}% | 24H { _safe_float(m.get('ch24')):+.2f}% | 7D { _safe_float(m.get('ch7')):+.2f}%\n"
+        f"📊 مومنتوم: 1H {_safe_float(m.get('ch1')):+.2f}% | 24H {_safe_float(m.get('ch24')):+.2f}% | 7D {_safe_float(m.get('ch7')):+.2f}%\n"
         f"💰 قیمت: <b>{_format_price(symbol, _safe_float(m.get('price')))}</b>\n"
         f"🛑 SL: <b>{_format_price(symbol, _safe_float(ta.get('stop')))}</b> | 🎯 TP1: <b>{_format_price(symbol, _safe_float((ta.get('targets') or [0])[0]))}</b>\n"
         f"🎯 TP2: <b>{_format_price(symbol, _safe_float((ta.get('targets') or [0,0])[1]))}</b> | TP3: <b>{_format_price(symbol, _safe_float((ta.get('targets') or [0,0,0])[2]))}</b>\n"
@@ -3242,12 +2830,10 @@ def _buy_opportunity_text(item):
     )
 
 async def buy_opportunities_menu(update, context):
-    """Show every currently qualified buy opportunity in one Telegram menu."""
     uid = update.effective_user.id
     if not has_analysis_access(uid):
         await update.message.reply_text("🔒 فرصت‌های خرید حرفه‌ای فقط برای مشترکین فعال است.")
         return
-
     msg = await update.message.reply_text(
         "🔎 <b>موتور حرفه‌ای فرصت خرید</b>\n\n"
         "🌐 کل بازار غربال می‌شود.\n"
@@ -3273,8 +2859,7 @@ async def buy_opportunities_menu(update, context):
             )
             return
 
-        qualified_items = []
-        pending_items = []
+        qualified_items, pending_items = [], []
         for item in opportunities:
             if not _alert_candidate_ok(item, btc_status):
                 continue
@@ -3311,12 +2896,6 @@ async def buy_opportunities_menu(update, context):
             )
             return
 
-        header = (
-            "🎯 <b>فرصت‌های خرید تأییدشده بازار</b>\n\n"
-            "₿ وضعیت BTC: 🟢 مناسب\n"
-            f"📊 تعداد فرصت‌های معتبر: <b>{len(qualified_items)}</b>\n"
-            f"🔐 فیلتر: Opportunity ≥ {ALERT_OPPORTUNITY_MIN}% | Strength ≥ {ALERT_STRENGTH_MIN}% | Probability ≥ {ALERT_PROBABILITY_MIN}%\n\n"
-        )
         await msg.delete()
         for i, item in enumerate(qualified_items, 1):
             symbol = item["symbol"]
@@ -3329,7 +2908,10 @@ async def buy_opportunities_menu(update, context):
             await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
     except Exception:
         log.exception("professional buy opportunity menu")
-        await msg.edit_text("⚠️ تحلیل حرفه‌ای بازار کامل نشد. لاگ Railway را بررسی کنید.")
+        try:
+            await msg.edit_text("⚠️ تحلیل حرفه‌ای بازار کامل نشد. لاگ Railway را بررسی کنید.")
+        except Exception:
+            pass
 
 # ============================================================
 # SUBSCRIPTIONS
@@ -3337,24 +2919,16 @@ async def buy_opportunities_menu(update, context):
 
 async def buy_menu(update, context):
     buttons = [[
-        InlineKeyboardButton(
-            f"{d} روز — {a:,} تومان",
-            callback_data=f"plan:{p}"
-        )
+        InlineKeyboardButton(f"{d} روز — {a:,} تومان", callback_data=f"plan:{p}")
     ] for p, (d, a) in PLANS.items()]
-
-    await update.message.reply_text(
-        "💳 یکی از پلن‌ها را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    await update.message.reply_text("💳 یکی از پلن‌ها را انتخاب کنید:",
+                                    reply_markup=InlineKeyboardMarkup(buttons))
 
 async def status_menu(update, context):
     s = active_subscription(update.effective_user.id)
-
     if not s:
         await update.message.reply_text("👤 اشتراک فعال ندارید.")
         return
-
     await update.message.reply_text(
         "👤 <b>وضعیت اشتراک</b>\n\n"
         f"پلن: {s['days']} روز\n"
@@ -3367,16 +2941,12 @@ async def status_menu(update, context):
 async def plan_callback(update, context):
     q = update.callback_query
     await q.answer()
-
     plan = q.data.split(":", 1)[1]
-
     if plan not in PLANS:
         await q.message.reply_text("❌ پلن نامعتبر است.")
         return
-
     days, amount = PLANS[plan]
     context.user_data["payment_plan"] = plan
-
     await q.message.reply_text(
         f"💳 <b>پلن {days} روزه</b>\n\n"
         f"مبلغ: <b>{amount:,} تومان</b>\n\n"
@@ -3389,56 +2959,30 @@ async def receipt_photo(update, context):
     if context.user_data.get("support_mode"):
         await support_media(update, context)
         return
-
     plan = context.user_data.get("payment_plan")
-
     if plan not in PLANS:
-        await update.message.reply_text(
-            "ابتدا از «💳 خرید اشتراک» یک پلن انتخاب کنید."
-        )
+        await update.message.reply_text("ابتدا از «💳 خرید اشتراک» یک پلن انتخاب کنید.")
         return
-
     days, amount = PLANS[plan]
     fid = update.message.photo[-1].file_id
-
     with db() as c:
         cur = c.execute("""
         INSERT INTO payment_requests(
             user_id,plan,days,amount,receipt_file_id,status,created_at
         ) VALUES(?,?,?,?,?,?,?)
-        """, (
-            update.effective_user.id, plan, days, amount,
-            fid, "pending", now_iso()
-        ))
+        """, (update.effective_user.id, plan, days, amount, fid, "pending", now_iso()))
         pid = cur.lastrowid
-
     context.user_data.pop("payment_plan", None)
-
-    await update.message.reply_text(
-        "✅ رسید دریافت شد؛ پس از بررسی مدیر اشتراک فعال می‌شود."
-    )
-
+    await update.message.reply_text("✅ رسید دریافت شد؛ پس از بررسی مدیر اشتراک فعال می‌شود.")
     for aid in ADMIN_IDS:
         try:
             await context.bot.send_photo(
-                aid,
-                fid,
-                caption=(
-                    f"💳 رسید جدید\n"
-                    f"کاربر: {update.effective_user.id}\n"
-                    f"پلن: {days} روز\n"
-                    f"مبلغ: {amount:,} تومان\n"
-                    f"شناسه: {pid}"
-                ),
+                aid, fid,
+                caption=(f"💳 رسید جدید\nکاربر: {update.effective_user.id}\n"
+                         f"پلن: {days} روز\nمبلغ: {amount:,} تومان\nشناسه: {pid}"),
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "✅ تایید",
-                        callback_data=f"pay:approve:{pid}"
-                    ),
-                    InlineKeyboardButton(
-                        "❌ رد",
-                        callback_data=f"pay:reject:{pid}"
-                    )
+                    InlineKeyboardButton("✅ تایید", callback_data=f"pay:approve:{pid}"),
+                    InlineKeyboardButton("❌ رد", callback_data=f"pay:reject:{pid}")
                 ]])
             )
         except Exception:
@@ -3451,8 +2995,7 @@ async def receipt_photo(update, context):
 async def support_prompt(update, context):
     context.user_data["support_mode"] = True
     await update.message.reply_text(
-        "📨 پیام خود را برای پشتیبان بفرستید. "
-        "متن، عکس، فایل یا صدا.\n/cancel برای خروج"
+        "📨 پیام خود را برای پشتیبان بفرستید. متن، عکس، فایل یا صدا.\n/cancel برای خروج"
     )
 
 async def save_support(uid, message, mid):
@@ -3465,331 +3008,81 @@ async def save_support(uid, message, mid):
 
 async def support_media(update, context):
     uid = update.effective_user.id
-
+    saved = None
     if update.message.photo:
         saved = "[عکس]"
         for aid in ADMIN_IDS:
             try:
                 await context.bot.send_photo(
-                    aid,
-                    update.message.photo[-1].file_id,
+                    aid, update.message.photo[-1].file_id,
                     caption=f"📨 پیام پشتیبانی\nکاربر: {uid}",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton(
-                            "↩️ پاسخ",
-                            callback_data=f"sup:reply:{uid}"
-                        )
+                        InlineKeyboardButton("↩️ پاسخ", callback_data=f"sup:reply:{uid}")
                     ]])
                 )
             except Exception:
                 pass
-
     elif update.message.document:
         saved = "[فایل]"
         for aid in ADMIN_IDS:
             try:
                 await context.bot.send_document(
-                    aid,
-                    update.message.document.file_id,
+                    aid, update.message.document.file_id,
                     caption=f"📨 فایل از کاربر {uid}",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton(
-                            "↩️ پاسخ",
-                            callback_data=f"sup:reply:{uid}"
-                        )
+                        InlineKeyboardButton("↩️ پاسخ", callback_data=f"sup:reply:{uid}")
                     ]])
                 )
             except Exception:
                 pass
-
     elif update.message.voice:
         saved = "[صدا]"
         for aid in ADMIN_IDS:
             try:
                 await context.bot.send_voice(
-                    aid,
-                    update.message.voice.file_id,
+                    aid, update.message.voice.file_id,
                     caption=f"📨 صدا از کاربر {uid}",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton(
-                            "↩️ پاسخ",
-                            callback_data=f"sup:reply:{uid}"
-                        )
+                        InlineKeyboardButton("↩️ پاسخ", callback_data=f"sup:reply:{uid}")
                     ]])
                 )
             except Exception:
                 pass
     else:
         return
-
     await save_support(uid, saved, update.message.message_id)
     await update.message.reply_text("✅ پیام شما برای پشتیبان ارسال شد.")
 
 async def support_reply_callback(update, context):
     q = update.callback_query
     await q.answer()
-
     if not is_admin(q.from_user.id):
         return
-
     uid = int(q.data.split(":")[-1])
     context.user_data["admin_reply_to"] = uid
-
-    await q.message.reply_text(
-        f"✍️ پاسخ به کاربر {uid} را ارسال کنید."
-    )
+    await q.message.reply_text(f"✍️ پاسخ به کاربر {uid} را ارسال کنید.")
 
 async def send_support_reply(update, context, text):
     uid = context.user_data.pop("admin_reply_to", None)
-
     if not uid:
         return
-
     try:
         await context.bot.send_message(
             uid,
             f"📨 <b>پاسخ پشتیبان</b>\n\n{escape(text)}",
             parse_mode=ParseMode.HTML
         )
-
         with db() as c:
             c.execute("""
             INSERT INTO support_messages(
                 user_id,admin_id,direction,message,status,
                 created_at,replied_at
             ) VALUES(?,?,?,?,?,?,?)
-            """, (
-                uid,
-                update.effective_user.id,
-                "admin_to_user",
-                text,
-                "closed",
-                now_iso(),
-                now_iso()
-            ))
-
+            """, (uid, update.effective_user.id, "admin_to_user",
+                  text, "closed", now_iso(), now_iso()))
         await update.message.reply_text("✅ پاسخ ارسال شد.")
-
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ ارسال نشد: {escape(str(e))}",
-            parse_mode=ParseMode.HTML
-        )
-
-# ============================================================
-# CRYPTO CHAT
-# ============================================================
-
-def chat_name(uid):
-    with db() as c:
-        r = c.execute(
-            "SELECT first_name,username FROM users WHERE user_id=?",
-            (uid,)
-        ).fetchone()
-
-    if not r:
-        return "کاربر"
-    if r["first_name"]:
-        return r["first_name"]
-    if r["username"]:
-        return "@" + r["username"]
-    return "کاربر"
-
-def chat_members(symbol):
-    with db() as c:
-        return c.execute("""
-        SELECT DISTINCT u.user_id
-        FROM users u
-        JOIN watchlist w ON w.user_id=u.user_id
-        JOIN subscriptions s ON s.user_id=u.user_id
-        WHERE u.blocked=0
-        AND w.asset_type='crypto'
-        AND w.symbol=?
-        AND s.status='active'
-        AND s.end_at>?
-        """, (norm_symbol(symbol), now_iso())).fetchall()
-
-async def crypto_chat_menu(update, context):
-    uid = update.effective_user.id
-
-    if not has_analysis_access(uid):
-        await update.message.reply_text(
-            "🔒 چت فقط برای مشترکین فعال است."
-        )
-        return
-
-    rows = user_assets(uid, "crypto")
-
-    if not rows:
-        await update.message.reply_text(
-            "ابتدا رمز ارز به واچ‌لیست اضافه کنید."
-        )
-        return
-
-    await update.message.reply_text(
-        "💬 رمز ارز را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    f"💬 {r['symbol']}",
-                    callback_data=f"chat:open:{r['symbol']}"
-                )
-            ] for r in rows
-        ])
-    )
-
-async def chat_open_callback(update, context):
-    q = update.callback_query
-    await q.answer()
-
-    uid = q.from_user.id
-    sym = norm_symbol(q.data.split(":", 2)[2])
-
-    if not has_analysis_access(uid) or not user_has_asset(uid, sym, "crypto"):
-        await q.message.reply_text("🔒 شما مجاز نیستید.")
-        return
-
-    context.user_data["chat_room"] = sym
-
-    await q.message.reply_text(
-        f"💬 <b>اتاق {escape(sym)}</b>\n"
-        f"👥 اعضای فعال: {len(chat_members(sym))}\n"
-        "پیام شما برای مشترکین همین رمز ارز ارسال می‌شود.\n"
-        "/cancel برای خروج",
-        parse_mode=ParseMode.HTML
-    )
-
-async def process_chat_message(update, context):
-    room = context.user_data.get("chat_room")
-
-    if not room or not update.message or not update.message.text:
-        return False
-
-    uid = update.effective_user.id
-
-    if not has_analysis_access(uid) or not user_has_asset(uid, room, "crypto"):
-        context.user_data.pop("chat_room", None)
-        return False
-
-    text = update.message.text.strip()
-
-    if not text:
-        return True
-
-    if len(text) > 1500:
-        await update.message.reply_text("❌ حداکثر ۱۵۰۰ کاراکتر.")
-        return True
-
-    with db() as c:
-        cur = c.execute("""
-        INSERT INTO chat_messages(
-            user_id,asset_type,symbol,message,
-            telegram_message_id,created_at
-        ) VALUES(?,?,?,?,?,?)
-        """, (
-            uid, "crypto", room, text,
-            update.message.message_id, now_iso()
-        ))
-        mid = cur.lastrowid
-
-    sender = escape(chat_name(uid))
-
-    for m in chat_members(room):
-        if m["user_id"] == uid:
-            continue
-        try:
-            await context.bot.send_message(
-                m["user_id"],
-                f"💬 <b>{sender}</b> در اتاق {escape(room)}:\n\n"
-                f"{escape(text)}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "🚨 گزارش",
-                        callback_data=f"chat:report:{mid}"
-                    )
-                ]])
-            )
-        except Exception:
-            pass
-
-    return True
-
-async def chat_report_callback(update, context):
-    q = update.callback_query
-    await q.answer("گزارش ثبت شد.")
-
-    mid = int(q.data.split(":")[-1])
-    rid = q.from_user.id
-
-    with db() as c:
-        exists = c.execute("""
-        SELECT 1 FROM chat_reports
-        WHERE message_id=? AND reporter_id=? AND status='pending'
-        """, (mid, rid)).fetchone()
-
-        if not exists:
-            c.execute("""
-            INSERT INTO chat_reports(
-                message_id,reporter_id,reason,status,created_at
-            ) VALUES(?,?,?,?,?)
-            """, (
-                mid, rid, "گزارش کاربر",
-                "pending", now_iso()
-            ))
-
-    for aid in ADMIN_IDS:
-        try:
-            await context.bot.send_message(
-                aid,
-                f"🚨 گزارش پیام چت #{mid}\n"
-                f"گزارش‌دهنده: {rid}",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "🗑 حذف پیام",
-                        callback_data=f"chat:delete:{mid}"
-                    )
-                ]])
-            )
-        except Exception:
-            pass
-
-async def chat_admin_callback(update, context):
-    q = update.callback_query
-    await q.answer()
-
-    if not is_admin(q.from_user.id):
-        return
-
-    parts = q.data.split(":")
-    action = parts[1]
-    target = int(parts[2])
-
-    if action == "delete":
-        with db() as c:
-            c.execute("""
-            UPDATE chat_messages
-            SET deleted=1,deleted_by=?,deleted_at=?
-            WHERE id=?
-            """, (q.from_user.id, now_iso(), target))
-
-            c.execute("""
-            UPDATE chat_reports
-            SET status='reviewed',reviewed_by=?,reviewed_at=?
-            WHERE message_id=?
-            """, (q.from_user.id, now_iso(), target))
-
-        await q.message.reply_text("✅ پیام حذف شد.")
-
-    elif action == "block":
-        with db() as c:
-            c.execute(
-                "UPDATE users SET blocked=1 WHERE user_id=?",
-                (target,)
-            )
-        await q.message.reply_text(
-            f"🚫 کاربر {target} مسدود شد."
-        )
+        await update.message.reply_text(f"❌ ارسال نشد: {escape(str(e))}", parse_mode=ParseMode.HTML)
 
 # ============================================================
 # BACKUP / ALERT WORKERS
@@ -3798,60 +3091,35 @@ async def chat_admin_callback(update, context):
 async def backup_worker():
     while True:
         try:
-            await asyncio.to_thread(
-                backup_database,
-                "scheduled"
-            )
+            await asyncio.to_thread(backup_database, "scheduled")
         except Exception:
             log.exception("scheduled database backup")
         await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
 
 async def alerts_menu(update, context):
     uid = update.effective_user.id
-
     with db() as c:
-        r = c.execute(
-            "SELECT enabled FROM alert_preferences WHERE user_id=?",
-            (uid,)
-        ).fetchone()
-
+        r = c.execute("SELECT enabled FROM alert_preferences WHERE user_id=?", (uid,)).fetchone()
     enabled = bool(r["enabled"]) if r else True
-
     await update.message.reply_text(
         "🔔 هشدار سیگنال: " + ("فعال" if enabled else "خاموش"),
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "🔕 خاموش" if enabled else "🔔 روشن",
-                callback_data="alert:toggle"
-            )
+            InlineKeyboardButton("🔕 خاموش" if enabled else "🔔 روشن", callback_data="alert:toggle")
         ]])
     )
 
 async def alert_callback(update, context):
     q = update.callback_query
     await q.answer()
-
     uid = q.from_user.id
-
     with db() as c:
-        r = c.execute(
-            "SELECT enabled FROM alert_preferences WHERE user_id=?",
-            (uid,)
-        ).fetchone()
-
+        r = c.execute("SELECT enabled FROM alert_preferences WHERE user_id=?", (uid,)).fetchone()
         new = 0 if r and r["enabled"] else 1
-
         c.execute("""
-        INSERT INTO alert_preferences(
-            user_id,enabled,interval_seconds
-        ) VALUES(?,?,?)
-        ON CONFLICT(user_id)
-        DO UPDATE SET enabled=excluded.enabled
+        INSERT INTO alert_preferences(user_id,enabled,interval_seconds) VALUES(?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled
         """, (uid, new, ALERT_INTERVAL_SECONDS))
-
-    await q.message.edit_text(
-        "🔔 هشدار سیگنال: " + ("فعال" if new else "خاموش")
-    )
+    await q.message.edit_text("🔔 هشدار سیگنال: " + ("فعال" if new else "خاموش"))
 
 async def market_snapshot_worker():
     while True:
@@ -3866,17 +3134,12 @@ async def market_snapshot_worker():
         await asyncio.sleep(GOLD_HISTORY_INTERVAL_SECONDS)
 
 def confirm_market_alert(symbol, candidate, price, observation_key):
-    """Track confirmations for a whole-market opportunity cycle.
-
-    Returns: (confirmed, confirmations, cycle_id). A new cycle starts only
-    after the previous opportunity has disappeared and its state is cleared.
-    """
+    """Track confirmations for a whole-market opportunity cycle."""
     now = now_iso()
     with db() as c:
         if candidate == "WAIT":
             c.execute("DELETE FROM market_alert_state WHERE symbol=?", (symbol,))
             return False, 0, None
-
         row = c.execute("SELECT * FROM market_alert_state WHERE symbol=?", (symbol,)).fetchone()
         if row and row["candidate"] == candidate:
             cycle_id = row["cycle_id"] or row["last_observation_key"] or observation_key
@@ -3887,12 +3150,10 @@ def confirm_market_alert(symbol, candidate, price, observation_key):
         else:
             confirmations = 1
             cycle_id = observation_key
-
         c.execute("""
             INSERT INTO market_alert_state(
                 symbol,candidate,confirmations,last_observation_key,last_price,updated_at,cycle_id
-            )
-            VALUES(?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
                 candidate=excluded.candidate,
                 confirmations=excluded.confirmations,
@@ -3904,7 +3165,6 @@ def confirm_market_alert(symbol, candidate, price, observation_key):
     return confirmations >= SIGNAL_CONFIRMATIONS_REQUIRED, confirmations, cycle_id
 
 def _alert_candidate_ok(item, btc_metrics):
-    """Apply the final, strict alert gate to one market candidate."""
     m = item.get("m") or {}
     ta = m.get("ta") or {}
     score = _safe_float(m.get("score"))
@@ -3938,35 +3198,40 @@ def _alert_candidate_ok(item, btc_metrics):
     )
 
 async def _btc_market_status(rows):
-    # BTC gate uses the same professional multi-timeframe OHLCV engine as altcoins.
+    """STRICTER BTC gate (fix #8)."""
     ta = await professional_crypto_analysis("BTC")
-    btc = next((x for x in rows if str(x.get("id") or "").lower() == "bitcoin" or str(x.get("symbol") or "").upper() == "BTC"), None)
+    btc = next((x for x in rows
+                if str(x.get("id") or "").lower() == "bitcoin"
+                or str(x.get("symbol") or "").upper() == "BTC"), None)
     if not ta or not btc:
         return {"ok": False}
+
     ch1 = _safe_float(btc.get("price_change_percentage_1h_in_currency"))
     ch24 = _safe_float(btc.get("price_change_percentage_24h_in_currency"))
     ch7 = _safe_float(btc.get("price_change_percentage_7d_in_currency"))
     trend = ta.get("trend")
     rsi = _safe_float(ta.get("rsi"), 50)
-    ok = (ch1 >= 0 and ch24 >= 0 and ch7 >= 0 and trend not in ("BEARISH", "BEARISH_WEAK") and rsi < 72 and ta.get("signal_candidate") != "SELL")
-    return {"ok": ok, "ch1": ch1, "ch24": ch24, "ch7": ch7, "rsi": rsi, "trend": trend, "strength": ta.get("strength", 0)}
+    strength = _safe_float(ta.get("strength"), 0)
+    cand = ta.get("signal_candidate")
+
+    btc_bullish = (
+        cand == "BUY"
+        or (strength >= 65 and trend in ("BULLISH", "BULLISH_WEAK"))
+    )
+    macro_ok = ch1 >= -0.5 and ch24 >= -1.0 and ch7 >= -3.0
+    ok = btc_bullish and macro_ok and rsi < 75 and cand != "SELL"
+
+    return {"ok": ok, "ch1": ch1, "ch24": ch24, "ch7": ch7,
+            "rsi": rsi, "trend": trend, "strength": strength, "candidate": cand}
 
 async def _market_alert_scan():
-    """Whole-market pre-screen + deep technical screening for alerts.
-
-    The broad CoinGecko universe is screened first; only the strongest
-    candidates receive the more expensive technical pass. This keeps the
-    alert worker practical while still allowing opportunities outside the
-    hand-maintained coin list.
-    """
     rows = await market_universe()
     if not rows:
         return [], None, None
 
-    # Confirmation must be based on a genuinely new market snapshot, not on
-    # the alert loop clock. market_universe() keeps the snapshot timestamp.
-    snapshot_ts = MARKET_SCAN_CACHE[0] if MARKET_SCAN_CACHE else time.monotonic()
-    scan_observation_key = f"market:{snapshot_ts:.3f}"
+    # FIX #10: wall-clock bucket so restarts don't reset the cycle.
+    bucket = int(time.time() // max(300, ALERT_INTERVAL_SECONDS))
+    scan_observation_key = f"market:{bucket}"
 
     btc_status = await _btc_market_status(rows)
     rough = []
@@ -3989,9 +3254,13 @@ async def _market_alert_scan():
     rough.sort(key=lambda z: z[0], reverse=True)
     candidates = rough[:MARKET_SCAN_DEEP]
     result = []
+
     async def deep_alert_one(x):
         sym = norm_symbol(x.get("symbol") or "")
-        return x, await professional_crypto_analysis(sym)
+        try:
+            return x, await professional_crypto_analysis(sym)
+        except Exception:
+            return x, None
     deep_results = await asyncio.gather(*(deep_alert_one(x) for _, x in candidates), return_exceptions=True)
     for item in deep_results:
         if isinstance(item, Exception):
@@ -4033,11 +3302,8 @@ async def alert_worker(app):
                     m["cycle_id"] = cycle_id
                     m["signal"] = candidate if confirmed else "WAIT"
                 else:
-                    # Any previously active setup that fails even one final
-                    # gate is considered inactive, allowing a later fresh cycle.
-                    confirm_market_alert(symbol, "WAIT", m["price"], observation_key)
+                    confirm_market_alert(symbol, "WAIT", m["price"] if "m" in dir() else 0.0, observation_key)
 
-            # Clear old active states which disappeared from the deep scan.
             with db() as c:
                 active_states = c.execute(
                     "SELECT symbol FROM market_alert_state WHERE candidate='BUY' AND confirmations>=?",
@@ -4047,9 +3313,6 @@ async def alert_worker(app):
                 if row["symbol"] not in qualified:
                     confirm_market_alert(row["symbol"], "WAIT", 0.0, observation_key)
 
-            # Alerts are broadcast only to users with an active subscription
-            # and enabled alerts. The user's watchlist is deliberately NOT a
-            # requirement: this worker is a whole-market opportunity scanner.
             with db() as c:
                 users = c.execute("""
                     SELECT DISTINCT a.user_id
@@ -4064,7 +3327,6 @@ async def alert_worker(app):
                     m = item["m"]
                     if m.get("signal") != "BUY" or not m.get("confirmed"):
                         continue
-
                     ta = m.get("ta") or {}
                     a = dict(ta)
                     a.update({
@@ -4086,9 +3348,6 @@ async def alert_worker(app):
                             "SELECT signal_key FROM alert_events WHERE user_id=? AND symbol=? ORDER BY id DESC LIMIT 1",
                             (uid, symbol)
                         ).fetchone()
-                        # Suppress only an alert from the CURRENT active cycle.
-                        # After the setup disappears market_alert_state is deleted,
-                        # and a later fresh cycle is allowed to alert again.
                         if prev and prev["signal_key"] == key:
                             continue
                         c.execute(
@@ -4098,17 +3357,15 @@ async def alert_worker(app):
                     try:
                         await app.bot.send_message(
                             uid,
-                            "🔔 <b>فرصت خرید تأییدشده در کل بازار</b>\n\n" + analysis_text(a),
+                            "🔔 <b>فرصت خرید تأییدشده در کل بازار</b>\n\n" + signal_text(a),
                             parse_mode=ParseMode.HTML
                         )
                     except Exception:
                         log.exception("alert send failed user=%s symbol=%s", uid, symbol)
 
                 with db() as c:
-                    c.execute(
-                        "UPDATE alert_preferences SET last_check_at=? WHERE user_id=?",
-                        (now_iso(), uid)
-                    )
+                    c.execute("UPDATE alert_preferences SET last_check_at=? WHERE user_id=?",
+                              (now_iso(), uid))
         except Exception:
             log.exception("alert worker")
         await asyncio.sleep(ALERT_INTERVAL_SECONDS)
@@ -4120,24 +3377,12 @@ async def alert_worker(app):
 async def db_status_command(update, context):
     if not is_admin(update.effective_user.id):
         return
-
     d = database_diagnostics()
-
     with db() as c:
-        users = c.execute(
-            "SELECT COUNT(*) n FROM users"
-        ).fetchone()["n"]
-
-        subs = c.execute(
-            "SELECT COUNT(*) n FROM subscriptions"
-        ).fetchone()["n"]
-
-        active = c.execute("""
-        SELECT COUNT(*) n
-        FROM subscriptions
-        WHERE status='active' AND end_at>?
-        """, (now_iso(),)).fetchone()["n"]
-
+        users = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        subs = c.execute("SELECT COUNT(*) n FROM subscriptions").fetchone()["n"]
+        active = c.execute("SELECT COUNT(*) n FROM subscriptions WHERE status='active' AND end_at>?",
+                           (now_iso(),)).fetchone()["n"]
     await update.message.reply_text(
         "🗄 <b>وضعیت دیتابیس</b>\n\n"
         f"مسیر: <code>{escape(d['path'])}</code>\n"
@@ -4156,29 +3401,18 @@ async def db_status_command(update, context):
 async def backup_command(update, context):
     if not is_admin(update.effective_user.id):
         return
-
-    path = await asyncio.to_thread(
-        backup_database,
-        "manual"
-    )
-
+    path = await asyncio.to_thread(backup_database, "manual")
     if path:
-        await update.message.reply_text(
-            f"✅ Backup ساخته شد:\n"
-            f"<code>{escape(path)}</code>",
-            parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"✅ Backup ساخته شد:\n<code>{escape(path)}</code>",
+                                        parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(
-            "❌ ساخت Backup انجام نشد؛ لاگ Railway را بررسی کن."
-        )
+        await update.message.reply_text("❌ ساخت Backup انجام نشد؛ لاگ Railway را بررسی کن.")
 
 async def admin_panel(update, context):
     if is_admin(update.effective_user.id):
         await update.message.reply_text(
             "👨‍💼 <b>پنل مدیریت MARKET AI</b>\n\nمدیریت کاربران، پرداخت‌ها، پیام‌ها، پشتیبانی و وضعیت دیتابیس از اینجا انجام می‌شود.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_kb()
+            parse_mode=ParseMode.HTML, reply_markup=admin_kb()
         )
         return
     await update.message.reply_text(
@@ -4189,119 +3423,54 @@ async def admin_panel(update, context):
 async def admin_callback(update, context):
     q = update.callback_query
     await q.answer()
-
     if not is_admin(q.from_user.id):
         return
-
     p = q.data.split(":")
     action = p[1]
 
     if action == "stats":
         with db() as c:
-            users = c.execute(
-                "SELECT COUNT(*) n FROM users"
-            ).fetchone()["n"]
-
-            active = c.execute("""
-            SELECT COUNT(DISTINCT user_id) n
-            FROM subscriptions
-            WHERE status='active' AND end_at>?
-            """, (now_iso(),)).fetchone()["n"]
-
-            pending = c.execute("""
-            SELECT COUNT(*) n
-            FROM payment_requests
-            WHERE status='pending'
-            """).fetchone()["n"]
-
-            assets = c.execute(
-                "SELECT COUNT(*) n FROM watchlist"
-            ).fetchone()["n"]
-
+            users = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+            active = c.execute("SELECT COUNT(DISTINCT user_id) n FROM subscriptions WHERE status='active' AND end_at>?",
+                               (now_iso(),)).fetchone()["n"]
+            pending = c.execute("SELECT COUNT(*) n FROM payment_requests WHERE status='pending'").fetchone()["n"]
+            assets = c.execute("SELECT COUNT(*) n FROM watchlist").fetchone()["n"]
         await q.message.reply_text(
-            f"📊 <b>آمار</b>\n\n"
-            f"👥 کاربران: {users}\n"
-            f"💳 مشترک فعال: {active}\n"
-            f"⏳ پرداخت: {pending}\n"
-            f"🪙 دارایی: {assets}",
+            f"📊 <b>آمار</b>\n\n👥 کاربران: {users}\n💳 مشترک فعال: {active}\n⏳ پرداخت: {pending}\n🪙 دارایی: {assets}",
             parse_mode=ParseMode.HTML
         )
-
     elif action == "broadcast":
         context.user_data["admin_mode"] = "broadcast"
-        await q.message.reply_text(
-            "📢 متن پیام برای مشترکین فعال را ارسال کنید."
-        )
-
+        await q.message.reply_text("📢 متن پیام برای مشترکین فعال را ارسال کنید.")
     elif action == "message":
         context.user_data["admin_mode"] = "message_uid"
-        await q.message.reply_text(
-            "شناسه عددی کاربر را ارسال کنید."
-        )
-
+        await q.message.reply_text("شناسه عددی کاربر را ارسال کنید.")
     elif action == "block":
         context.user_data["admin_mode"] = "block"
-        await q.message.reply_text(
-            "شناسه کاربر را ارسال کنید."
-        )
-
+        await q.message.reply_text("شناسه کاربر را ارسال کنید.")
     elif action == "payments":
         with db() as c:
-            rows = c.execute("""
-            SELECT * FROM payment_requests
-            WHERE status='pending'
-            ORDER BY id DESC LIMIT 20
-            """).fetchall()
-
+            rows = c.execute("SELECT * FROM payment_requests WHERE status='pending' ORDER BY id DESC LIMIT 20").fetchall()
         if not rows:
-            await q.message.reply_text(
-                "پرداخت در انتظاری نیست."
-            )
+            await q.message.reply_text("پرداخت در انتظاری نیست.")
             return
-
         for r in rows:
             await q.message.reply_text(
-                f"💳 #{r['id']}\n"
-                f"کاربر: {r['user_id']}\n"
-                f"پلن: {r['days']} روز\n"
-                f"مبلغ: {r['amount']:,}",
+                f"💳 #{r['id']}\nکاربر: {r['user_id']}\nپلن: {r['days']} روز\nمبلغ: {r['amount']:,}",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "✅ تایید",
-                        callback_data=f"pay:approve:{r['id']}"
-                    ),
-                    InlineKeyboardButton(
-                        "❌ رد",
-                        callback_data=f"pay:reject:{r['id']}"
-                    )
+                    InlineKeyboardButton("✅ تایید", callback_data=f"pay:approve:{r['id']}"),
+                    InlineKeyboardButton("❌ رد", callback_data=f"pay:reject:{r['id']}")
                 ]])
             )
-
     elif action == "users":
         page = int(p[2]) if len(p) > 2 else 0
-
         with db() as c:
-            rows = c.execute("""
-            SELECT * FROM users
-            ORDER BY created_at DESC
-            LIMIT 20 OFFSET ?
-            """, (page * 20,)).fetchall()
-
-        txt = (
-            "👥 <b>کاربران</b>\n\n" +
-            "\n".join(
-                f"{r['user_id']} | "
-                f"{escape(r['first_name'] or '-')} | "
-                f"{'🚫' if r['blocked'] else '✅'}"
-                for r in rows
-            )
-        )
-
-        await q.message.reply_text(
-            txt if rows else "کاربری نیست.",
-            parse_mode=ParseMode.HTML
-        )
-
+            rows = c.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 20 OFFSET ?",
+                             (page * 20,)).fetchall()
+        txt = ("👥 <b>کاربران</b>\n\n" +
+               "\n".join(f"{r['user_id']} | {escape(r['first_name'] or '-')} | "
+                         f"{'🚫' if r['blocked'] else '✅'}" for r in rows))
+        await q.message.reply_text(txt if rows else "کاربری نیست.", parse_mode=ParseMode.HTML)
     elif action == "db":
         d = database_diagnostics()
         await q.message.reply_text(
@@ -4313,39 +3482,23 @@ async def admin_callback(update, context):
             f"آخرین Backup: {escape(d['latest_backup'])}",
             parse_mode=ParseMode.HTML
         )
-
     elif action == "support":
         with db() as c:
-            rows = c.execute("""
-            SELECT * FROM support_messages
-            WHERE direction='user_to_admin'
-            ORDER BY id DESC LIMIT 20
-            """).fetchall()
-
+            rows = c.execute("SELECT * FROM support_messages WHERE direction='user_to_admin' ORDER BY id DESC LIMIT 20").fetchall()
         if not rows:
-            await q.message.reply_text(
-                "پیام پشتیبانی نیست."
-            )
+            await q.message.reply_text("پیام پشتیبانی نیست.")
             return
-
         for r in rows:
             await q.message.reply_text(
-                f"📨 #{r['id']} از {r['user_id']}\n"
-                f"{escape(r['message'] or '[رسانه]')}",
+                f"📨 #{r['id']} از {r['user_id']}\n{escape(r['message'] or '[رسانه]')}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "↩️ پاسخ",
-                        callback_data=f"sup:reply:{r['user_id']}"
-                    )
+                    InlineKeyboardButton("↩️ پاسخ", callback_data=f"sup:reply:{r['user_id']}")
                 ]])
             )
 
-
-
-
 # ============================================================
-# ROUTER / MAIN
+# CALLBACKS
 # ============================================================
 
 async def pick_asset_callback(update, context):
@@ -4357,7 +3510,8 @@ async def pick_asset_callback(update, context):
         if not add_watch(q.from_user.id, sym, "crypto"):
             await q.message.reply_text("⚠️ سقف واچ‌لیست پر شده است یا ذخیره انجام نشد.")
             return
-        await q.message.reply_text(f"✅ <b>{escape(sym)}</b> به واچ‌لیست اضافه شد.", parse_mode=ParseMode.HTML)
+        await q.message.reply_text(f"✅ <b>{escape(sym)}</b> به واچ‌لیست اضافه شد.",
+                                   parse_mode=ParseMode.HTML)
     except Exception:
         log.exception("pick asset")
         await q.message.reply_text("⚠️ افزودن دارایی انجام نشد.")
@@ -4368,7 +3522,8 @@ async def watchlist_delete_callback(update, context):
     try:
         _, _, atype, sym = q.data.split(":", 3)
         remove_watch(q.from_user.id, sym, atype)
-        await q.message.reply_text(f"✅ {escape(sym)} از واچ‌لیست حذف شد.", parse_mode=ParseMode.HTML)
+        await q.message.reply_text(f"✅ {escape(sym)} از واچ‌لیست حذف شد.",
+                                   parse_mode=ParseMode.HTML)
     except Exception:
         log.exception("watchlist delete")
         await q.message.reply_text("⚠️ حذف انجام نشد.")
@@ -4441,25 +3596,31 @@ async def payment_admin_callback(update, context):
                 await q.message.reply_text("ℹ️ این درخواست قبلاً بررسی شده است.")
                 return
             if action == "approve":
-                days = int(r["days"])
-                uid = int(r["user_id"])
+                days = int(r["days"]); uid = int(r["user_id"])
                 start = datetime.now(timezone.utc)
-                existing = c.execute("""SELECT * FROM subscriptions WHERE user_id=? AND status='active' AND end_at>? ORDER BY end_at DESC LIMIT 1""", (uid, now_iso())).fetchone()
+                existing = c.execute("""SELECT * FROM subscriptions WHERE user_id=? AND status='active' AND end_at>? ORDER BY end_at DESC LIMIT 1""",
+                                     (uid, now_iso())).fetchone()
                 if existing:
                     old_end = datetime.fromisoformat(existing["end_at"])
                     end = old_end + timedelta(days=days)
-                    c.execute("UPDATE subscriptions SET end_at=?, status='active' WHERE id=?", (end.isoformat(), existing["id"]))
+                    c.execute("UPDATE subscriptions SET end_at=?, status='active' WHERE id=?",
+                              (end.isoformat(), existing["id"]))
                 else:
                     end = start + timedelta(days=days)
-                    c.execute("""INSERT INTO subscriptions(user_id,plan,days,amount,start_at,end_at,status,source,payment_request_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""", (uid,r["plan"],days,r["amount"],start.isoformat(),end.isoformat(),"active","manual",pid,now_iso()))
-                c.execute("UPDATE payment_requests SET status='approved', reviewed_at=?, reviewed_by=? WHERE id=?", (now_iso(), q.from_user.id, pid))
+                    c.execute("""INSERT INTO subscriptions(user_id,plan,days,amount,start_at,end_at,status,source,payment_request_id,created_at)
+                                 VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                              (uid,r["plan"],days,r["amount"],start.isoformat(),end.isoformat(),
+                               "active","manual",pid,now_iso()))
+                c.execute("UPDATE payment_requests SET status='approved', reviewed_at=?, reviewed_by=? WHERE id=?",
+                          (now_iso(), q.from_user.id, pid))
                 await q.message.reply_text("✅ پرداخت تأیید و اشتراک فعال شد.")
                 try:
                     await context.bot.send_message(uid, f"✅ اشتراک شما فعال شد.\n📅 مدت: {days} روز\n⏰ پایان: {format_dt(end.isoformat())}")
                 except Exception:
                     pass
             elif action == "reject":
-                c.execute("UPDATE payment_requests SET status='rejected', reviewed_at=?, reviewed_by=? WHERE id=?", (now_iso(), q.from_user.id, pid))
+                c.execute("UPDATE payment_requests SET status='rejected', reviewed_at=?, reviewed_by=? WHERE id=?",
+                          (now_iso(), q.from_user.id, pid))
                 await q.message.reply_text("❌ پرداخت رد شد.")
                 try:
                     await context.bot.send_message(int(r["user_id"]), "❌ رسید پرداخت شما رد شد. برای پیگیری با پشتیبانی تماس بگیرید.")
@@ -4468,6 +3629,10 @@ async def payment_admin_callback(update, context):
     except Exception:
         log.exception("payment admin callback")
         await q.message.reply_text("⚠️ بررسی پرداخت انجام نشد.")
+
+# ============================================================
+# TEXT ROUTER
+# ============================================================
 
 async def text_router(update, context):
     if not update.message or not update.message.text:
@@ -4514,15 +3679,65 @@ async def text_router(update, context):
         await process_add_asset(update, context, text)
         return
 
-    # Preserve free-form asset search/add behavior.
+    if context.user_data.get("admin_reply_to"):
+        await send_support_reply(update, context, text)
+        return
+
+    if context.user_data.get("admin_mode"):
+        mode = context.user_data.pop("admin_mode")
+        if mode == "broadcast":
+            with db() as c:
+                rows = c.execute("""SELECT DISTINCT s.user_id FROM subscriptions s WHERE s.status='active' AND s.end_at>?""",
+                                 (now_iso(),)).fetchall()
+            sent = 0
+            for r in rows:
+                try:
+                    await context.bot.send_message(r["user_id"], f"📢 <b>اطلاعیه</b>\n\n{escape(text)}",
+                                                   parse_mode=ParseMode.HTML)
+                    sent += 1
+                except Exception:
+                    pass
+            await update.message.reply_text(f"✅ ارسال شد به {sent} کاربر.")
+            return
+        elif mode == "message_uid":
+            try:
+                parts = text.split(maxsplit=1)
+                uid = int(parts[0]); msg = parts[1] if len(parts) > 1 else ""
+                await context.bot.send_message(uid, f"✉️ <b>پیام مدیر</b>\n\n{escape(msg)}",
+                                               parse_mode=ParseMode.HTML)
+                await update.message.reply_text("✅ پیام ارسال شد.")
+            except Exception as e:
+                await update.message.reply_text(f"❌ خطا: {escape(str(e))}", parse_mode=ParseMode.HTML)
+            return
+        elif mode == "block":
+            try:
+                target = int(text.strip())
+                with db() as c:
+                    c.execute("UPDATE users SET blocked=1 WHERE user_id=?", (target,))
+                await update.message.reply_text(f"🚫 کاربر {target} مسدود شد.")
+            except Exception as e:
+                await update.message.reply_text(f"❌ خطا: {escape(str(e))}", parse_mode=ParseMode.HTML)
+            return
+
     if norm_symbol(text) in COINS or norm_symbol(text) in ("XAU", "GOLD18"):
         await process_add_asset(update, context, text)
         return
 
-    await update.message.reply_text("❓ گزینه نامعتبر است. از منوی پایین استفاده کنید.", reply_markup=main_kb(uid))
+    await update.message.reply_text("❓ گزینه نامعتبر است. از منوی پایین استفاده کنید.",
+                                    reply_markup=main_kb(uid))
+
+async def cancel_command(update, context):
+    for k in ("awaiting_asset","support_mode","chat_room","payment_plan",
+              "admin_reply_to","admin_mode","message_target"):
+        context.user_data.pop(k, None)
+    await update.message.reply_text("✅ لغو شد.", reply_markup=main_kb(update.effective_user.id))
 
 async def error_handler(update, context):
     log.exception("Unhandled Telegram error", exc_info=context.error)
+
+# ============================================================
+# STARTUP / MAIN
+# ============================================================
 
 async def post_init(app):
     init_db()
@@ -4533,7 +3748,8 @@ async def post_init(app):
     app.create_task(alert_worker(app))
     app.create_task(backup_worker())
     app.create_task(market_snapshot_worker())
-    log.info("MARKET AI started | professional buy engine enabled")
+    log.info("MARKET AI v12 started | professional buy engine enabled | cache=%s",
+             len(CACHE))
 
 async def post_shutdown(app):
     global HTTP_SESSION
@@ -4547,6 +3763,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_text))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CommandHandler("dbstatus", db_status_command))
     app.add_handler(CommandHandler("admin", admin_panel))
@@ -4561,9 +3778,6 @@ def main():
     app.add_handler(CallbackQueryHandler(selected_signal_callback, pattern=r"^signal:"))
     app.add_handler(CallbackQueryHandler(opportunity_action_callback, pattern=r"^op:"))
     app.add_handler(CallbackQueryHandler(support_reply_callback, pattern=r"^sup:reply:"))
-    app.add_handler(CallbackQueryHandler(chat_open_callback, pattern=r"^chat:open:"))
-    app.add_handler(CallbackQueryHandler(chat_report_callback, pattern=r"^chat:report:"))
-    app.add_handler(CallbackQueryHandler(chat_admin_callback, pattern=r"^chat:(delete|block):"))
     app.add_handler(MessageHandler(filters.PHOTO, receipt_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
