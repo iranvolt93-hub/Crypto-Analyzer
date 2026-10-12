@@ -2923,44 +2923,270 @@ async def growth_scan_menu(update, context):
         await update.message.reply_text("⚠️ اسکن بازار کامل نشد.")
 
 # ============================================================
-# PROFESSIONAL BUY-OPPORTUNITY MENU
+# PROFESSIONAL BUY-OPPORTUNITY MENU (v2 — حرفه‌ای)
 # ============================================================
 
+def _score_zone_pro(entry, sl, tp1, price, ta, atr):
+    """امتیازدهی 0-10 بر اساس ۵ معیار وزنی."""
+    score = 0.0
+
+    # ۱) نزدیکی به EMA (۲۵٪)
+    emas = [_safe_float(ta.get(k)) for k in ("ema9", "ema21", "ema50", "ema200")]
+    emas = [e for e in emas if e > 0]
+    if emas and entry > 0:
+        min_dist = min(abs(entry - e) / entry for e in emas)
+        score += max(0, 1 - min_dist * 20) * 2.5
+
+    # ۲) RSI (۲۰٪)
+    rsi = _safe_float(ta.get("rsi"), 50)
+    if rsi < 30:   score += 2.0
+    elif rsi < 50: score += 1.4
+    elif rsi < 70: score += 0.8
+    else:          score += 0.2
+
+    # ۳) R:R (۲۰٪)
+    risk = abs(entry - sl)
+    if risk > 0:
+        rr = abs(tp1 - entry) / risk
+        score += min(rr / 3.0, 1.0) * 2.0
+
+    # ۴) MACD (۱۵٪)
+    hist = _safe_float(ta.get("macd_hist"), 0)
+    score += (1.0 if hist > 0 else 0.3) * 1.5
+
+    # ۵) فاصله از قیمت فعلی (۲۰٪)
+    if price > 0 and entry > 0:
+        dist = abs(price - entry) / price
+        score += max(0, 1 - dist * 5) * 2.0
+
+    return round(score, 2)
+
+
+def _zone_priority(score):
+    if score >= 8.0: return "🥇 بحرانی"
+    if score >= 6.5: return "🥈 بالا"
+    if score >= 5.0: return "🥉 متوسط"
+    return "⚠️ ضعیف"
+
+
+def _build_buy_zones_pro(ta, price, atr):
+    """ساخت نواحی خرید بر اساس EMAها و ATR."""
+    ema9  = _safe_float(ta.get("ema9"),  price)
+    ema21 = _safe_float(ta.get("ema21"), price)
+    ema50 = _safe_float(ta.get("ema50"), price)
+    if atr <= 0:
+        atr = price * 0.02
+
+    zones = []
+
+    # ─── ناحیه طلایی ───
+    z1 = {
+        "name": "🟢 ناحیه طلایی",
+        "entry_low":  round(ema21 - atr * 0.3, 8),
+        "entry_high": round(ema9 + atr * 0.3, 8),
+        "entry_opt":  round((ema21 + ema9) / 2, 8),
+        "sl":         round(ema21 - atr * 1.0, 8),
+        "tps": [
+            round(price + atr * 1.5, 8),
+            round(price + atr * 3.0, 8),
+            round(price + atr * 5.0, 8),
+        ],
+        "trigger": "کندل ۴H بسته‌شده در ناحیه + RSI < 65",
+        "reasons": [
+            "تلاقی EMA9 و EMA21",
+            "اصلاح طبیعی پس از اشباع خرید",
+        ],
+        "risks": ["ADX ضعیف → احتمال رنج"],
+    }
+    z1["score"] = _score_zone_pro(z1["entry_opt"], z1["sl"], z1["tps"][0], price, ta, atr)
+    z1["rr"]    = abs(z1["tps"][0] - z1["entry_opt"]) / max(abs(z1["entry_opt"] - z1["sl"]), 1e-9)
+    z1["priority"] = _zone_priority(z1["score"])
+    zones.append(z1)
+
+    # ─── ناحیه عمیق ───
+    z2 = {
+        "name": "🟡 ناحیه عمیق",
+        "entry_low":  round(ema50 - atr * 0.4, 8),
+        "entry_high": round(ema50 + atr * 0.4, 8),
+        "entry_opt":  round(ema50, 8),
+        "sl":         round(ema50 - atr * 1.5, 8),
+        "tps": [
+            round(price + atr * 1.0, 8),
+            round(price + atr * 2.5, 8),
+            round(price + atr * 4.0, 8),
+        ],
+        "trigger": "پولبک به EMA50 + واگرایی مثبت",
+        "reasons": [
+            "تلاقی EMA50",
+            "حمایت چندباره",
+        ],
+        "risks": ["شکست EMA50 = فاز نزولی"],
+    }
+    z2["score"] = _score_zone_pro(z2["entry_opt"], z2["sl"], z2["tps"][0], price, ta, atr)
+    z2["rr"]    = abs(z2["tps"][0] - z2["entry_opt"]) / max(abs(z2["entry_opt"] - z2["sl"]), 1e-9)
+    z2["priority"] = _zone_priority(z2["score"])
+    zones.append(z2)
+
+    zones.sort(key=lambda z: z["score"], reverse=True)
+    return zones
+
+
+def _build_if_then_pro(price, zones, rsi, symbol="?"):
+    """سناریوهای شرطی If-Then."""
+    if len(zones) < 2:
+        return []
+    z1, z2 = zones[0], zones[1]
+    return [
+        (f"قیمت > {_format_price(symbol, price)} و RSI(1H) > 75",
+         "عدم ورود | انتظار پولبک"),
+        (f"قیمت در {_format_price(symbol, z1['entry_low'])}-{_format_price(symbol, z1['entry_high'])} و RSI < 65",
+         f"ورود پله ۱ (۴۰٪) | SL {_format_price(symbol, z1['sl'])} | TP {_format_price(symbol, z1['tps'][0])}"),
+        (f"قیمت در {_format_price(symbol, z2['entry_low'])}-{_format_price(symbol, z2['entry_high'])} + واگرایی مثبت",
+         f"ورود سنگین (۶۰٪) | SL {_format_price(symbol, z2['sl'])} | TP {_format_price(symbol, z2['tps'][0])}"),
+        (f"شکست {_format_price(symbol, z1['entry_high'])} با حجم ۱.۵×",
+         "ورود تأییدی (۳۰٪) | SL زیر کندل شکست"),
+        (f"شکست {_format_price(symbol, z2['sl'])}",
+         "🔴 خروج کامل | ساختار بی‌اعتبار"),
+    ]
+
+
+def _pre_trade_checklist_pro(ta, rsi):
+    """چک‌لیست پیش از ورود."""
+    price = _safe_float(ta.get("price"))
+    checks = [
+        ("RSI تایم‌فریم ورود < 70", rsi < 70),
+        ("MACD هم‌جهت (هیستوگرام > 0)", _safe_float(ta.get("macd_hist")) > 0),
+        ("ADX > 20 (قدرت روند)", _safe_float(ta.get("adx")) > 20),
+        ("قیمت بالای EMA50", price > _safe_float(ta.get("ema50"))),
+        ("Bollinger% < 100 (بدون کشیدگی)", _safe_float(ta.get("bb_position")) < 100),
+    ]
+    passed = sum(1 for _, v in checks if v)
+    return checks, passed, len(checks)
+
+
+def _split_telegram(text: str, size: int = 3900):
+    """تقسیم پیام طولانی برای محدودیت 4096 کاراکتری تلگرام."""
+    parts = []
+    while text:
+        if len(text) <= size:
+            parts.append(text); break
+        cut = text.rfind("\n", 0, size)
+        if cut == -1:
+            cut = size
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return parts
+
+
 def _buy_opportunity_text(item):
-    m = item.get("m") or {}
+    """بازنویسی حرفه‌ای — با نواحی، سناریو، چک‌لیست."""
+    m  = item.get("m") or {}
     ta = m.get("ta") or {}
     symbol = item.get("symbol") or "?"
-    name = item.get("name") or symbol
-    trend_fa = {"BULLISH":"صعودی قوی","BULLISH_WEAK":"صعودی",
-                "BEARISH":"نزولی","BEARISH_WEAK":"نزولی ضعیف",
-                "NEUTRAL":"خنثی"}.get(ta.get("trend"), "نامشخص")
+    name   = item.get("name") or symbol
+    price  = _safe_float(m.get("price"), _safe_float(ta.get("price")))
+    atr    = _safe_float(ta.get("atr"))
+    rsi    = _safe_float(ta.get("rsi"), 50)
+    trend_fa = {
+        "BULLISH": "صعودی قوی", "BULLISH_WEAK": "صعودی",
+        "BEARISH": "نزولی", "BEARISH_WEAK": "نزولی ضعیف",
+        "NEUTRAL": "خنثی",
+    }.get(ta.get("trend"), "نامشخص")
     confirmations = int(m.get("confirmations", 0))
-    return (
+
+    # ─── محاسبات حرفه‌ای ───
+    zones      = _build_buy_zones_pro(ta, price, atr)
+    if_then    = _build_if_then_pro(price, zones, rsi, symbol)
+    checks, passed, total = _pre_trade_checklist_pro(ta, rsi)
+    checklist_ok = "🟢 آماده ورود" if passed >= total - 1 else "🚫 ورود توصیه نمی‌شود"
+
+    # ─── سرصفحه ───
+    text = (
         f"🎯 <b>{escape(symbol)} — {escape(name)}</b>\n"
-        f"🟢 <b>فرصت خرید تأییدشده</b> | 🔁 {confirmations}/{SIGNAL_CONFIRMATIONS_REQUIRED}\n"
-        f"💎 فرصت: <b>{_safe_float(m.get('score')):.0f}%</b> | 💪 تکنیکال: <b>{_safe_float(m.get('strength')):.0f}%</b> | 🧠 مدل: <b>{_safe_float(m.get('probability')):.0f}%</b>\n"
-        f"📈 روند: <b>{trend_fa}</b> | RSI: <b>{_safe_float(ta.get('rsi')):.1f}</b> | ADX: <b>{_safe_float(ta.get('adx')):.1f}</b>\n"
-        f"📊 مومنتوم: 1H {_safe_float(m.get('ch1')):+.2f}% | 24H {_safe_float(m.get('ch24')):+.2f}% | 7D {_safe_float(m.get('ch7')):+.2f}%\n"
-        f"💰 قیمت: <b>{_format_price(symbol, _safe_float(m.get('price')))}</b>\n"
-        f"🛑 SL: <b>{_format_price(symbol, _safe_float(ta.get('stop')))}</b> | 🎯 TP1: <b>{_format_price(symbol, _safe_float((ta.get('targets') or [0])[0]))}</b>\n"
-        f"🎯 TP2: <b>{_format_price(symbol, _safe_float((ta.get('targets') or [0,0])[1]))}</b> | TP3: <b>{_format_price(symbol, _safe_float((ta.get('targets') or [0,0,0])[2]))}</b>\n"
-        f"⚖️ R/R: <b>1:{_safe_float(ta.get('rr')):.2f}</b> | ⚠️ ریسک: <b>{escape(str(m.get('risk') or 'نامشخص'))}</b>"
+        f"🟢 <b>فرصت خرید تأییدشده</b> | 🔁 {confirmations}/{SIGNAL_CONFIRMATIONS_REQUIRED}\n\n"
+        f"💎 <b>خلاصه اجرایی</b>\n"
+        f"┣ فرصت: <b>{_safe_float(m.get('score')):.0f}%</b> | "
+        f"تکنیکال: <b>{_safe_float(m.get('strength')):.0f}%</b> | "
+        f"مدل: <b>{_safe_float(m.get('probability')):.0f}%</b>\n"
+        f"┣ روند: <b>{trend_fa}</b> | RSI: <b>{rsi:.1f}</b> | "
+        f"ADX: <b>{_safe_float(ta.get('adx')):.1f}</b>\n"
+        f"┣ قیمت: <b>{_format_price(symbol, price)}</b> | "
+        f"ATR: {_format_price(symbol, atr)} ({_safe_float(ta.get('atr_pct')):.2f}%)\n"
+        f"┗ مومنتوم: 1H {_safe_float(m.get('ch1')):+.2f}% | "
+        f"24H {_safe_float(m.get('ch24')):+.2f}% | "
+        f"7D {_safe_float(m.get('ch7')):+.2f}%\n\n"
     )
+
+    # ─── نواحی خرید ───
+    for i, z in enumerate(zones, 1):
+        stars = "⭐" * max(1, min(5, int(z["score"] / 2)))
+        text += (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{z['name']} (فرصت #{i})\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 محدوده ورود: <b>{_format_price(symbol, z['entry_low'])}</b>"
+            f" – <b>{_format_price(symbol, z['entry_high'])}</b>\n"
+            f"🎯 نقطه بهینه: <b>{_format_price(symbol, z['entry_opt'])}</b>\n"
+            f"🛑 حد ضرر: <b>{_format_price(symbol, z['sl'])}</b>\n"
+            f"🎁 اهداف: {_format_price(symbol, z['tps'][0])} → "
+            f"{_format_price(symbol, z['tps'][1])} → "
+            f"{_format_price(symbol, z['tps'][2])}\n"
+            f"⚖️ R:R: <b>1:{z['rr']:.2f}</b>  {stars}\n"
+            f"📊 امتیاز فرصت: <b>{z['score']}/10</b> | {z['priority']}\n"
+            f"🔔 شرط: {escape(z['trigger'])}\n"
+        )
+        if z.get("reasons"):
+            text += "✅ دلایل:\n"
+            for r in z["reasons"][:3]:
+                text += f"   • {escape(r)}\n"
+        if z.get("risks"):
+            text += "⚠️ ریسک:\n"
+            for r in z["risks"][:2]:
+                text += f"   • {escape(r)}\n"
+        text += "\n"
+
+    # ─── سناریوهای شرطی ───
+    if if_then:
+        text += "🎬 <b>سناریوهای شرطی (If → Then)</b>\n"
+        for i, (cond, action) in enumerate(if_then, 1):
+            text += f"┌─ {i}) IF {escape(cond)}\n└─ ➜ {escape(action)}\n"
+
+    # ─── چک‌لیست ───
+    text += f"\n💎 <b>چک‌لیست پیش از ورود ({passed}/{total})</b>\n"
+    for label, ok in checks:
+        text += f"  {'✅' if ok else '❌'} {escape(label)}\n"
+    text += f"\nوضعیت: <b>{checklist_ok}</b>\n"
+
+    # ─── قوانین طلایی ───
+    text += (
+        "\n⚠️ <b>قوانین طلایی:</b>\n"
+        "  ۱. ریسک هر معامله ≤ ۲٪ سرمایه\n"
+        "  ۲. R:R ≥ 1:2\n"
+        "  ۳. پس از TP1، SL به نقطه ورود منتقل شود\n"
+        "  ۴. در RSI > 80 ورود ممنوع\n"
+        "  ۵. تأیید با کندل بسته‌شده الزامی است\n"
+    )
+    return text
+
 
 async def buy_opportunities_menu(update, context):
     uid = update.effective_user.id
     if not has_analysis_access(uid):
         await update.message.reply_text("🔒 فرصت‌های خرید حرفه‌ای فقط برای مشترکین فعال است.")
         return
+
     msg = await update.message.reply_text(
-        "🔎 <b>موتور حرفه‌ای فرصت خرید</b>\n\n"
+        "🎯 <b>موتور حرفه‌ای فرصت خرید</b>\n\n"
         f"🌐 حداکثر {MARKET_SCAN_PAGES * MARKET_SCAN_PER_PAGE:,} دارایی غربال می‌شود.\n"
-        "📊 EMA / RSI / MACD / ADX / ATR / مومنتوم / نقدشوندگی / ریسک / BTC بررسی می‌شود.\n"
+        "📊 EMA / RSI / MACD / ADX / ATR / مومنتوم / نقدشوندگی / BTC\n"
+        "🎬 نواحی خرید + سناریو + چک‌لیست پیش از ورود\n"
         "⏳ در حال تحلیل بازار...",
         parse_mode=ParseMode.HTML,
     )
     try:
-        opportunities, btc_status, observation_key = await asyncio.wait_for(_market_alert_scan(), timeout=90)
+        opportunities, btc_status, observation_key = await asyncio.wait_for(
+            _market_alert_scan(), timeout=90
+        )
         if not opportunities:
             await msg.edit_text(
                 "⏳ <b>فرصت خرید معتبری پیدا نشد.</b>\n\n"
@@ -2969,6 +3195,7 @@ async def buy_opportunities_menu(update, context):
             )
             return
 
+        # ─── BTC gate ───
         if not btc_status or not btc_status.get("ok"):
             nearest = sorted(
                 opportunities,
@@ -2979,20 +3206,22 @@ async def buy_opportunities_menu(update, context):
                 "🟡 <b>فعلاً خرید تأییدشده‌ای وجود ندارد.</b>",
                 "₿ فیلتر بازار BTC مثبت نیست؛ برای کاهش ریسک، سیگنال خرید صادر نمی‌شود.",
                 "",
+                "<b>نزدیک‌ترین دارایی‌ها برای پایش (نه توصیه خرید):</b>",
             ]
             for item in nearest:
                 m = item.get("m") or {}
                 ta = m.get("ta") or {}
                 body.append(
-                    f"• <b>{escape(item.get('symbol','?'))}</b> — تحت نظر، نه سیگنال خرید | "
+                    f"• <b>{escape(item.get('symbol','?'))}</b> — تحت نظر | "
                     f"امتیاز {_safe_float(m.get('score')):.0f}% | "
                     f"قدرت {_safe_float(m.get('strength')):.0f}% | "
                     f"روند {escape(str(ta.get('trend') or 'نامشخص'))}"
                 )
-            body.append("⚠️ این دارایی‌ها صرفاً برای پایش‌اند؛ تا بهبود وضعیت BTC منتظر بمانید.")
+            body.append("⚠️ این دارایی‌ها صرفاً برای پایش‌اند؛ تا بهبود BTC صبر کنید.")
             await msg.edit_text("\n".join(body), parse_mode=ParseMode.HTML)
             return
 
+        # ─── تأیید سیگنال ───
         qualified_items, pending_items = [], []
         for item in opportunities:
             if not _alert_candidate_ok(item, btc_status):
@@ -3020,6 +3249,7 @@ async def buy_opportunities_menu(update, context):
             ), reverse=True
         )
 
+        # ─── اگر تأیید نشده ───
         if not qualified_items:
             nearest = sorted(
                 [z for z in opportunities if z.get("m")],
@@ -3043,26 +3273,39 @@ async def buy_opportunities_menu(update, context):
                         f"قدرت {_safe_float(m.get('strength')):.0f}% | "
                         f"روند {escape(str(ta.get('trend') or 'نامشخص'))}"
                     )
-            body.append("⏳ کمی بعد دوباره اسکن کنید؛ اگر شرایط تأیید نشود، ربات خرید پیشنهاد نمی‌کند.")
+            body.append("⏳ کمی بعد دوباره اسکن کنید.")
             await msg.edit_text("\n".join(body), parse_mode=ParseMode.HTML)
             return
 
+        # ─── ارسال کارت‌های حرفه‌ای ───
         await msg.delete()
         for i, item in enumerate(qualified_items, 1):
             symbol = item["symbol"]
-            text = (f"🎯 <b>فرصت #{i}</b>\n\n" + _buy_opportunity_text(item) +
-                    "\n\n⚠️ خروجی مدل است؛ سود قطعی تضمین نمی‌شود.")
+            header = f"🎯 <b>فرصت #{i} از {len(qualified_items)}</b>\n\n"
+            body   = _buy_opportunity_text(item)
+            full   = header + body + "\n\n⚠️ خروجی مدل است؛ سود قطعی تضمین نمی‌شود."
+
             markup = InlineKeyboardMarkup([[
                 InlineKeyboardButton("📊 تحلیل", callback_data=f"op:analysis:{symbol}"),
                 InlineKeyboardButton("📡 سیگنال", callback_data=f"op:signal:{symbol}"),
             ]])
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+            # ارسال تکه‌تکه اگر طولانی بود
+            chunks = _split_telegram(full, 3900)
+            for j, chunk in enumerate(chunks):
+                is_last = (j == len(chunks) - 1)
+                await update.message.reply_text(
+                    chunk,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup if is_last else None,
+                )
+
     except asyncio.TimeoutError:
-        await msg.edit_text("⏳ اسکن بیش از ۹۰ ثانیه طول کشید و متوقف شد تا ربات معطل نماند. کمی بعد دوباره تلاش کنید.")
+        await msg.edit_text("⏳ اسکن بیش از ۹۰ ثانیه طول کشید و متوقف شد. کمی بعد دوباره تلاش کنید.")
     except Exception:
         log.exception("professional buy opportunity menu")
         try:
-            await msg.edit_text("⚠️ تحلیل بازار کامل نشد؛ خطا در لاگ Railway ثبت شد. کمی بعد دوباره تلاش کنید.")
+            await msg.edit_text("⚠️ تحلیل بازار کامل نشد؛ خطا در لاگ Railway ثبت شد.")
         except Exception:
             pass
 
