@@ -3561,7 +3561,7 @@ async def buy_opportunities_menu(update, context):
 # ============================================================
 
 async def buy_menu(update, context):
-    buttons = [[InlineKeyboardButton("🎁 شروع دوره رایگان ۵ روزه", callback_data="trial:start")]]
+    buttons = [[InlineKeyboardButton("🎁 شروع دوره رایگان ", callback_data="trial:start")]]
     buttons.extend([
         [InlineKeyboardButton(f"{d} روز — {a:,} تومان", callback_data=f"plan:{p}")]
         for p, (d, a) in PLANS.items()
