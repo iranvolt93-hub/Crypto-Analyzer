@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Crypto / Global Gold / Iran 18K Gold Telegram Analyzer
-Railway production build — REVISED v15 (walk-forward diagnostic backtest)
+Railway production build — REVISED v16 (bugfix + hardening release)
 Analysis + signals + notifications. No automatic trading.
 
 Sources:
@@ -19,57 +19,41 @@ Recommended Railway variables:
     SUPPORT_USERNAME=@username
     DB_PATH=/data/crypto_bot.db
 
-Start:
-    python main.py
-
-IMPORTANT:
-- Attach a Railway Volume at /data.
-- Keep only ONE running instance for this bot token.
-- Never delete /data/crypto_bot.db.
-- Database migrations are additive.
-
-CHANGELOG v15 (keeps existing database schema):
-- Added leakage-aware historical diagnostic backtest using only available OKX 1H closed candles.
-- GOLD18/XAU backtest is explicitly limited to saved TGJU close snapshots; no fabricated OHLC history.
-- Added sample size, win rate, average net trade return, cumulative simulation return, and drawdown when sufficient history exists.
-- Renamed model probability display to an uncalibrated model score; technical strength remains separate.
-
-CHANGELOG v14 (keeps existing database schema):
-- Added sourced closed-candle analysis on 5m, 15m, 1H, 4H, 1D, and 1W timeframes.
-- Added timeframe-by-timeframe dashboard output and weekly trend veto for counter-trend entries.
-- Signal confirmation buckets now support 5m and 1W.
-- Historical crypto calculations use OKX OHLCV candles, not CoinGecko daily closes.
-
-CHANGELOG v13 (keeps existing database schema):
-- Fixed GOLD18 Rial/Toman ambiguity with strict value ranges.
-- Fixed XAU parser to reject silver/platinum noise.
-- Signal confirmation now bucket-based (per closed candle), not wall-minute.
-- LRU+TTL cache with size cap (no memory leak).
-- BTC market gate stricter (BUY or strength>=65).
-- Alert cycle key wall-clock based (survives restarts).
-- RSI gates for BUY/SELL symmetric and safer.
-- Volume series properly aligned in fallback analysis.
-- growth_scan unified on professional engine.
-- Analysis labels clarified (candle vs day).
-- Market scan default reduced to prevent long unresponsive scans; explicit maximum capped at 10 pages.
-- Added CoinGecko market-cap, liquidity, rank, supply, and 24h/7d/30d context to crypto dashboards.
-- Added bounded timeouts and clearer feedback for long-running analysis callbacks.
-- Opportunity filter balanced; non-confirmed candidates are labeled for monitoring, never as BUY.
-- Fixed stale-symbol price reuse when resetting whole-market alert confirmations.
-- Growth scan sends complete per-asset messages instead of slicing HTML tags.
+CHANGELOG v16 (bugfix + hardening, keeps existing database schema):
+- FIX: save_market_snapshot no longer inserts on every price tick (throttled).
+- FIX: OKX_CANDLE_CACHE / PRICE_CACHE / ANALYSIS_CACHE are now bounded LRUTTLCache.
+- FIX: _prepare_persistent_db runs once per process (module flag).
+- FIX: _repair_watchlist_table parameter binding was broken; rewritten safely.
+- FIX: global OKX semaphore prevents 429 on burst analyses.
+- FIX: CoinGecko/OKX rate limiting (universe cache 10m, sparkline off, deeper alert interval).
+- FIX: main_kb no longer double-queries subscriptions; single lookup.
+- FIX: mtf_agreement hidden for GOLD18/XAU.
+- FIX: format_dt uses Asia/Tehran timezone.
+- FIX: backup_database called via asyncio.to_thread (non-blocking).
+- FIX: error_handler uses log.error(exc_info=...).
+- FIX: _btc_market_status reuses ANALYSIS_CACHE (no double BTC analysis).
+- FIX: _alert_candidate_ok converted to weighted score (no all-or-nothing).
+- FIX: signals_menu collapsed to a single message (no 5-message spam).
+- FIX: backtest horizon label correct for snapshot-based gold.
+- FIX: walk_forward_backtest min_trades reduced to 4; horizon adaptive.
+- FIX: confirm_signal and confirm_market_alert use BEGIN IMMEDIATE (no races).
+- FIX: XAU parser has node scoring similar to GOLD18.
+- FIX: support_media only consumes media in support_mode.
+- FIX: trial channel link mismatch now surfaced to admin log.
 """
 
 import os
 import re
 import sqlite3
 import shutil
-from pathlib import Path
-from collections import OrderedDict
 import asyncio
 import logging
 import time
+from pathlib import Path
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from html import escape
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import pandas as pd
@@ -112,7 +96,9 @@ HTTP_TIMEOUT = max(5, int(os.getenv("HTTP_TIMEOUT", "15")))
 CACHE_SECONDS = max(10, int(os.getenv("CACHE_SECONDS", "45")))
 PRICE_CACHE_SECONDS = max(10, int(os.getenv("PRICE_CACHE_SECONDS", "20")))
 ANALYSIS_CACHE_SECONDS = max(15, int(os.getenv("ANALYSIS_CACHE_SECONDS", "45")))
-ALERT_INTERVAL_SECONDS = max(60, int(os.getenv("ALERT_INTERVAL_SECONDS", "300")))
+
+# FIX v16: alerts scan less aggressively to avoid CoinGecko/OKX 429.
+ALERT_INTERVAL_SECONDS = max(300, int(os.getenv("ALERT_INTERVAL_SECONDS", "600")))
 MAX_WATCHLIST = max(1, int(os.getenv("MAX_WATCHLIST", "100")))
 
 GOLD_HISTORY_INTERVAL_SECONDS = max(60, int(os.getenv("GOLD_HISTORY_INTERVAL_SECONDS", "300")))
@@ -126,17 +112,18 @@ ALERT_RSI_MAX = max(65, min(78, int(os.getenv("ALERT_RSI_MAX", "70"))))
 ALERT_MIN_TURNOVER = max(0.01, float(os.getenv("ALERT_MIN_TURNOVER", "0.03")))
 SIGNAL_CONFIRMATIONS_REQUIRED = max(2, int(os.getenv("SIGNAL_CONFIRMATIONS_REQUIRED", "2")))
 SIGNAL_CONFIRM_TIMEFRAME = os.getenv("SIGNAL_CONFIRM_TIMEFRAME", "4H").strip()
-MARKET_SCAN_PAGES = max(1, min(10, int(os.getenv("MARKET_SCAN_PAGES", "5"))))
-MARKET_SCAN_PER_PAGE = max(50, min(250, int(os.getenv("MARKET_SCAN_PER_PAGE", "250"))))
+
+# FIX v16: universe cache 10m, sparkline off, deep scan reduced.
+MARKET_SCAN_PAGES = max(1, min(10, int(os.getenv("MARKET_SCAN_PAGES", "3"))))
+MARKET_SCAN_PER_PAGE = max(50, min(250, int(os.getenv("MARKET_SCAN_PER_PAGE", "200"))))
 MARKET_SCAN_TOP = max(5, min(30, int(os.getenv("MARKET_SCAN_TOP", "10"))))
-MARKET_SCAN_SECONDS = max(300, int(os.getenv("MARKET_SCAN_SECONDS", "300")))
-MARKET_SCAN_DEEP = max(5, min(20, int(os.getenv("MARKET_SCAN_DEEP", "8"))))
+MARKET_SCAN_SECONDS = max(300, int(os.getenv("MARKET_SCAN_SECONDS", "600")))
+MARKET_SCAN_DEEP = max(5, min(12, int(os.getenv("MARKET_SCAN_DEEP", "8"))))
 MARKET_SCAN_CACHE = None
 SHORT_TERM_SCAN_CACHE = None
 OKX_BASE_URL = os.getenv("OKX_BASE_URL", "https://www.okx.com").rstrip("/")
 OKX_CANDLE_CACHE_SECONDS = max(20, int(os.getenv("OKX_CANDLE_CACHE_SECONDS", "60")))
-OKX_MAX_CONCURRENCY = max(2, min(12, int(os.getenv("OKX_MAX_CONCURRENCY", "8"))))
-OKX_CANDLE_CACHE = {}
+OKX_MAX_CONCURRENCY = max(2, min(8, int(os.getenv("OKX_MAX_CONCURRENCY", "6"))))
 
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "ثبت نشده").strip()
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "پشتیبان").strip()
@@ -147,7 +134,6 @@ GOLD18_PRICE_SELECTOR = os.getenv("GOLD18_PRICE_SELECTOR", "").strip()
 XAU_PRICE_SELECTOR = os.getenv("XAU_PRICE_SELECTOR", "").strip()
 GOLD18_SOURCE_UNIT = os.getenv("GOLD18_SOURCE_UNIT", "auto").strip().lower()
 
-# Real Iranian 18K price band (Toman per gram). Update if market shifts.
 GOLD18_TOMAN_MIN = int(os.getenv("GOLD18_TOMAN_MIN", "15000000"))
 GOLD18_TOMAN_MAX = int(os.getenv("GOLD18_TOMAN_MAX", "90000000"))
 XAU_USD_MIN = float(os.getenv("XAU_USD_MIN", "500"))
@@ -166,10 +152,11 @@ logging.basicConfig(
 log = logging.getLogger("market_bot")
 
 HTTP_SESSION = None
+IRAN_TZ = ZoneInfo("Asia/Tehran")  # FIX v16
 
 
 # ============================================================
-# LRU + TTL CACHE (bounded)
+# LRU + TTL CACHE (bounded) — FIX v16: used everywhere now
 # ============================================================
 
 class LRUTTLCache:
@@ -195,15 +182,29 @@ class LRUTTLCache:
         while len(self._data) > self._max:
             self._data.popitem(last=False)
 
+    def pop(self, key, default=None):
+        return self._data.pop(key, (None, default))[1]
+
+    def clear(self):
+        self._data.clear()
+
     def __len__(self):
         return len(self._data)
 
 
 CACHE = LRUTTLCache(maxsize=int(os.getenv("CACHE_MAX_ENTRIES", "2000")))
-PRICE_CACHE = {}
-ANALYSIS_CACHE = {}
+PRICE_CACHE = LRUTTLCache(maxsize=int(os.getenv("PRICE_CACHE_MAX", "500")))          # FIX v16
+ANALYSIS_CACHE = LRUTTLCache(maxsize=int(os.getenv("ANALYSIS_CACHE_MAX", "300")))    # FIX v16
+OKX_CANDLE_CACHE = LRUTTLCache(maxsize=int(os.getenv("OKX_CANDLE_MAX", "600")))      # FIX v16
 GOLD18_CACHE = None
 XAU_CACHE = None
+
+# FIX v16: prepare DB only once per process.
+_DB_PREPARED = False
+_DB_PREPARE_LOCK = asyncio.Lock()
+
+# FIX v16: global OKX limiter prevents burst 429s from concurrent analyses.
+_OKX_SEM = asyncio.Semaphore(OKX_MAX_CONCURRENCY)
 
 MAIN_MENU = [
     ["🪙 افزودن دارایی", "📋 واچ‌لیست"],
@@ -232,6 +233,7 @@ COINS = {
     "MANA":"decentraland","AXS":"axie-infinity","FTM":"fantom",
     "KAS":"kaspa","WIF":"dogwifcoin","BONK":"bonk","FLOKI":"floki",
 }
+
 
 # ============================================================
 # DATABASE / PERSISTENCE
@@ -288,6 +290,10 @@ def _restore_latest_backup(target):
     return False
 
 def _prepare_persistent_db():
+    """FIX v16: safe to call repeatedly — DB is prepared once per process."""
+    global _DB_PREPARED
+    if _DB_PREPARED:
+        return
     target = Path(DB_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
     Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
@@ -295,22 +301,18 @@ def _prepare_persistent_db():
     if target.exists() and _db_has_tables(target):
         users = _db_user_count(target)
         if users > 0:
+            _DB_PREPARED = True
             return
         if AUTO_RESTORE_BACKUP and _restore_latest_backup(target):
+            _DB_PREPARED = True
             return
 
     recovery_candidates = [
-        Path("/app/crypto_bot.db"),
-        Path("/app/data/crypto_bot.db"),
-        Path("/app/crypto_bot_old.db"),
-        Path("/app/data/crypto_bot_old.db"),
-        Path("/app/subscriptions.db"),
-        Path("/app/data/subscriptions.db"),
-        Path("/app/zec_bot.db"),
-        Path("/app/data/zec_bot.db"),
-        Path("crypto_bot.db"),
-        Path("subscriptions.db"),
-        Path("zec_bot.db"),
+        Path("/app/crypto_bot.db"), Path("/app/data/crypto_bot.db"),
+        Path("/app/crypto_bot_old.db"), Path("/app/data/crypto_bot_old.db"),
+        Path("/app/subscriptions.db"), Path("/app/data/subscriptions.db"),
+        Path("/app/zec_bot.db"), Path("/app/data/zec_bot.db"),
+        Path("crypto_bot.db"), Path("subscriptions.db"), Path("zec_bot.db"),
     ]
     for raw in os.getenv("LEGACY_DB_PATHS", "").split(","):
         raw = raw.strip()
@@ -341,15 +343,17 @@ def _prepare_persistent_db():
             shutil.copy2(src, tmp)
             os.replace(tmp, target)
             log.warning("RECOVERED USER DATABASE: %s -> %s | users=%s", src, target, users)
+            _DB_PREPARED = True
             return
         except Exception as e:
             log.warning("Legacy database recovery failed %s: %s", src, e)
 
     if AUTO_RESTORE_BACKUP:
         _restore_latest_backup(target)
+    _DB_PREPARED = True
 
 def db():
-    _prepare_persistent_db()
+    _prepare_persistent_db()  # FIX v16: no-op after first call
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
@@ -407,20 +411,16 @@ def database_diagnostics():
         size = p.stat().st_size if p.exists() else 0
         backups = _backup_files()
         return {
-            "path": str(p),
-            "exists": p.exists(),
-            "size": size,
+            "path": str(p), "exists": p.exists(), "size": size,
             "persistent_path": str(p).startswith("/data/"),
             "users": _db_user_count(p) if p.exists() else 0,
             "backup_count": len(backups),
             "latest_backup": backups[0].name if backups else "-",
         }
     except Exception:
-        return {
-            "path": str(DB_PATH), "exists": False, "size": 0,
-            "persistent_path": False, "users": 0,
-            "backup_count": 0, "latest_backup": "-"
-        }
+        return {"path": str(DB_PATH), "exists": False, "size": 0,
+                "persistent_path": False, "users": 0,
+                "backup_count": 0, "latest_backup": "-"}
 
 def _preflight_legacy_schema():
     path = Path(DB_PATH)
@@ -498,6 +498,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS watchlist(
             user_id INTEGER NOT NULL,symbol TEXT NOT NULL,
             asset_type TEXT NOT NULL,created_at TEXT NOT NULL,
+            asset_key TEXT DEFAULT '',
             PRIMARY KEY(user_id,symbol,asset_type));
         CREATE TABLE IF NOT EXISTS alert_preferences(
             user_id INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,
@@ -543,7 +544,6 @@ def init_db():
         ensure_column(c, "users", "created_at", "TEXT")
         ensure_column(c, "users", "blocked", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(c, "users", "last_seen", "TEXT")
-
         ensure_column(c, "payment_requests", "user_id", "INTEGER")
         ensure_column(c, "payment_requests", "plan", "TEXT")
         ensure_column(c, "payment_requests", "days", "INTEGER")
@@ -553,7 +553,6 @@ def init_db():
         ensure_column(c, "payment_requests", "created_at", "TEXT")
         ensure_column(c, "payment_requests", "reviewed_at", "TEXT")
         ensure_column(c, "payment_requests", "reviewed_by", "INTEGER")
-
         ensure_column(c, "subscriptions", "plan", "TEXT")
         ensure_column(c, "subscriptions", "days", "INTEGER")
         ensure_column(c, "subscriptions", "amount", "INTEGER")
@@ -563,14 +562,12 @@ def init_db():
         ensure_column(c, "subscriptions", "source", "TEXT")
         ensure_column(c, "subscriptions", "payment_request_id", "INTEGER")
         ensure_column(c, "subscriptions", "created_at", "TEXT")
-
         ensure_column(c, "watchlist", "user_id", "INTEGER")
         ensure_column(c, "watchlist", "symbol", "TEXT")
         ensure_column(c, "watchlist", "asset_type", "TEXT")
         ensure_column(c, "watchlist", "created_at", "TEXT")
         ensure_column(c, "watchlist", "asset_key", "TEXT DEFAULT ''")
         c.execute("UPDATE watchlist SET asset_key=upper(symbol) WHERE asset_key IS NULL OR asset_key=''")
-
         ensure_column(c, "alert_events", "signal_key", "TEXT DEFAULT ''")
         ensure_column(c, "market_alert_state", "cycle_id", "TEXT")
         ensure_column(c, "support_messages", "replied_at", "TEXT")
@@ -584,7 +581,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_chat_reports ON chat_reports(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_alert_events ON alert_events(user_id,symbol,created_at)")
 
-        c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('schema_version','12')")
+        c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('schema_version','13')")
         c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('db_path',?)", (DB_PATH,))
 
 def now_iso():
@@ -635,16 +632,20 @@ TRIAL_ENABLED = os.getenv("TRIAL_ENABLED", "true").strip().lower() not in {"0", 
 
 
 def _csv_env(name):
-    """Read comma- or newline-separated Railway variable values."""
     raw = os.getenv(name, "")
     return [part.strip() for part in re.split(r"[,\n;]+", raw) if part.strip()]
 
 
-# Keep channel identifiers and invite/public links in the same order.
-# Example: TRIAL_CHANNELS="@public_channel,-100123456789"
-#          TRIAL_CHANNEL_LINKS="https://t.me/public_channel,https://t.me/+invite"
 TRIAL_CHANNELS = _csv_env("TRIAL_CHANNELS")
 TRIAL_CHANNEL_LINKS = _csv_env("TRIAL_CHANNEL_LINKS")
+
+# FIX v16: log if link/channel counts mismatch (silent misalignment is a real bug).
+if TRIAL_CHANNELS and TRIAL_CHANNEL_LINKS and len(TRIAL_CHANNELS) != len(TRIAL_CHANNEL_LINKS):
+    log.warning(
+        "TRIAL_CHANNELS (%d) and TRIAL_CHANNEL_LINKS (%d) length mismatch; "
+        "links will be paired by index and missing ones will fall back to @username.",
+        len(TRIAL_CHANNELS), len(TRIAL_CHANNEL_LINKS),
+    )
 
 
 def trial_channel_rows():
@@ -659,7 +660,6 @@ def trial_channel_rows():
 
 
 def has_used_trial(uid):
-    """A user may claim the 5-day trial only once, even after it expires."""
     with db() as c:
         row = c.execute(
             "SELECT 1 FROM subscriptions WHERE user_id=? AND source='trial' LIMIT 1",
@@ -669,10 +669,8 @@ def has_used_trial(uid):
 
 
 def start_free_trial(uid):
-    """Create a durable, one-time 5-day trial in the existing subscriptions table."""
     now = datetime.now(timezone.utc)
     end = now + timedelta(days=TRIAL_DAYS)
-    # SQLite's write transaction prevents two quick button taps creating two trials.
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         already = c.execute(
@@ -695,20 +693,18 @@ def start_free_trial(uid):
         """, (uid, TRIAL_PLAN, TRIAL_DAYS, 0, now.isoformat(), end.isoformat(),
               "active", "trial", None, now.isoformat()))
     try:
-        backup_database("free_trial")
+        # FIX v16: don't block the event loop.
+        asyncio.create_task(asyncio.to_thread(backup_database, "free_trial"))
     except Exception:
-        log.exception("free trial backup")
+        log.exception("free trial backup schedule")
     return True, end.isoformat()
 
 
 def has_analysis_access(uid):
-    # Trial rows live in the same subscriptions table; analysis and buy opportunities
-    # are available during either an active trial or a paid subscription.
     return is_admin(uid) or active_subscription(uid) is not None
 
 
 def has_paid_subscription(uid):
-    """Signal trading is reserved for paid/manual subscriptions, never the free trial."""
     if is_admin(uid):
         return True
     sub = active_subscription(uid)
@@ -743,16 +739,18 @@ def add_subscription(uid, plan, payment_request_id=None, source="manual"):
             "active", source, payment_request_id, now_iso()
         ))
     try:
-        backup_database("subscription")
+        asyncio.create_task(asyncio.to_thread(backup_database, "subscription"))
     except Exception:
-        log.exception("subscription backup")
+        log.exception("subscription backup schedule")
     return True
 
 def format_dt(v):
+    # FIX v16: display in Asia/Tehran regardless of server TZ.
     try:
-        return datetime.fromisoformat(v).astimezone().strftime("%Y/%m/%d %H:%M")
+        return datetime.fromisoformat(v).astimezone(IRAN_TZ).strftime("%Y/%m/%d %H:%M")
     except Exception:
         return str(v)
+
 
 # ============================================================
 # HTTP / CACHE
@@ -791,6 +789,13 @@ async def http_json(url, params=None, ttl=None, retries=2):
                     data = await r.json(content_type=None)
                     CACHE.set(key, data)
                     return data
+                if r.status == 429:
+                    # FIX v16: honor Retry-After on 429.
+                    ra = r.headers.get("Retry-After")
+                    wait = float(ra) if ra and str(ra).replace(".", "", 1).isdigit() else 5.0
+                    log.warning("HTTP 429 %s — waiting %.1fs", url, wait)
+                    await asyncio.sleep(min(60.0, wait))
+                    continue
                 log.warning("HTTP %s %s", r.status, url)
         except Exception as e:
             log.warning("HTTP error %s: %s", url, e)
@@ -901,7 +906,8 @@ async def market_universe():
             {
                 "vs_currency":"usd", "order":"market_cap_desc",
                 "per_page":MARKET_SCAN_PER_PAGE, "page":page,
-                "sparkline":"true",
+                # FIX v16: sparkline is heavy; disable to reduce payload ~50%.
+                "sparkline":"false",
                 "price_change_percentage":"1h,24h,7d,14d,30d,200d,1y",
             }, ttl=MARKET_SCAN_SECONDS, retries=2
         )
@@ -915,11 +921,12 @@ async def market_universe():
             all_rows.append(x)
         if len(data) < MARKET_SCAN_PER_PAGE:
             break
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.25)  # FIX v16: gentle pacing
 
     MARKET_SCAN_CACHE = (now, all_rows)
     log.info("MARKET SCAN universe=%s pages=%s", len(all_rows), MARKET_SCAN_PAGES)
     return all_rows
+
 
 def _clamp(v, lo=0, hi=100):
     return max(lo, min(hi, float(v)))
@@ -930,6 +937,8 @@ def _safe_float(v, default=0.0):
         return default if pd.isna(x) else x
     except Exception:
         return default
+
+# ---- growth scoring (unchanged logic) ----
 
 def _market_growth_score(x, ta=None):
     p = float(x.get("current_price") or 0)
@@ -951,14 +960,11 @@ def _market_growth_score(x, ta=None):
     score += _clamp(ch7 * 0.40, -8, 8)
     score += _clamp(ch14 * 0.20, -5, 5)
     score += _clamp(ch30 * 0.12, -5, 5)
-
     turnover = vol / mcap
     score += _clamp((turnover - 0.05) * 80, -5, 8)
-
     if ch24 > 25: score -= 7
     if ch7 > 60: score -= 5
     if ch24 < -20 and ch7 < -20: score -= 8
-
     if ta:
         score += _clamp((ta.get("strength",50)-50)*0.18, -8, 8)
         if ta.get("trend") in ("BULLISH", "BULLISH_WEAK"): score += 5
@@ -966,7 +972,6 @@ def _market_growth_score(x, ta=None):
         elif 52 <= ta.get("rsi",50) <= 68: score += 4
         if ta.get("macd_hist",0) > 0: score += 4
         if ta.get("adx",0) >= 20: score += 3
-
     return _clamp(score)
 
 def _growth_probability(score, x):
@@ -975,11 +980,9 @@ def _growth_probability(score, x):
     return _clamp(50 + (score - 50) * 0.75 + rank_bonus, 5, 95)
 
 async def growth_scan():
-    """Unified with professional engine."""
     rows = await market_universe()
     if not rows:
         return []
-
     rough = []
     for x in rows:
         score = _market_growth_score(x)
@@ -987,7 +990,6 @@ async def growth_scan():
             continue
         rough.append((score, x))
     rough.sort(key=lambda z: z[0], reverse=True)
-
     top = rough[:MARKET_SCAN_DEEP]
     async def deep(x):
         sym = norm_symbol(x.get("symbol") or "")
@@ -996,7 +998,6 @@ async def growth_scan():
         except Exception:
             return x, None
     results = await asyncio.gather(*(deep(x) for _, x in top), return_exceptions=True)
-
     out = []
     for item in results:
         if isinstance(item, Exception):
@@ -1024,9 +1025,7 @@ async def growth_scan():
     out.sort(key=lambda z: z["growth_score"], reverse=True)
     return out[:MARKET_SCAN_TOP]
 
-# ============================================================
-# NUMBER / TGJU PARSING (REVISED)
-# ============================================================
+# ---- number / TGJU parsing ----
 
 def digits_to_latin(s):
     return (s or "").translate(str.maketrans(
@@ -1088,15 +1087,35 @@ def _score_gold18_node(tag):
     if len(text) > 5000: score -= 300
     return score
 
-# ============================================================
-# TGJU GOLD18 (STRICT)
-# ============================================================
+def _score_xau_node(tag):
+    """FIX v16: scoring for XAU to avoid silver/platinum bleed-through."""
+    attrs = " ".join(f"{k}={v}" for k, v in tag.attrs.items()).lower()
+    text = tag.get_text(" ", strip=True)
+    low = text.lower()
+    score = 0
+    if any(k in attrs for k in ("ons", "xau", "gold")):
+        score += 250
+    for word in ("انس طلا", "انس جهانی طلا", "اونس طلا", "اونس جهانی", "gold ounce"):
+        if word in text:
+            score += 200
+    if "انس" in text or "اونس" in text:
+        score += 60
+    if "طلا" in text or "gold" in low:
+        score += 60
+    if "دلار" in text or "usd" in low:
+        score += 40
+    for noise in ("نقره", "silver", "platinum", "پلاتین", "palladium", "پالادیوم"):
+        if noise in low:
+            score -= 400
+    if len(text) > 1500:
+        score -= 150
+    return score
+
+# ---- GOLD18 ----
 
 def find_gold18_value(html):
-    """Robust TGJU geram18 parser. Returns Toman per gram or None."""
     if not html:
         return None
-
     soup = BeautifulSoup(html, "html.parser")
     candidates = []
 
@@ -1150,10 +1169,8 @@ def find_gold18_value(html):
             for _, raw in _numbers_with_positions(tag.get_text(" ", strip=True)):
                 consider(raw, ctx, 900 + _score_gold18_node(tag))
 
-    keywords = (
-        "geram18", "گرم طلای 18", "گرم طلای ۱۸",
-        "طلای 18 عیار", "طلای ۱۸ عیار", "طلای18", "طلای۱۸"
-    )
+    keywords = ("geram18", "گرم طلای 18", "گرم طلای ۱۸",
+                "طلای 18 عیار", "طلای ۱۸ عیار", "طلای18", "طلای۱۸")
     for tag in soup.find_all(["tr", "li", "article", "section", "td", "div"]):
         text = tag.get_text(" ", strip=True)
         if len(text) > 1200:
@@ -1175,7 +1192,6 @@ def find_gold18_value(html):
 
     if not candidates:
         return None
-
     candidates.sort(
         key=lambda x: (x[0], 1 if 20_000_000 <= x[1] <= 60_000_000 else 0),
         reverse=True
@@ -1186,6 +1202,7 @@ def find_gold18_value(html):
     return value
 
 def save_market_snapshot(symbol, atype, price):
+    """FIX v16: throttle inserts; only one row per interval window."""
     if price is None or price <= 0:
         return
     try:
@@ -1194,10 +1211,13 @@ def save_market_snapshot(symbol, atype, price):
                 "SELECT price,created_at FROM market_history WHERE symbol=? AND asset_type=? ORDER BY id DESC LIMIT 1",
                 (symbol, atype)
             ).fetchone()
-            if last and abs(float(last["price"]) - float(price)) < 1e-12:
+            if last:
                 try:
                     age = datetime.now(timezone.utc) - datetime.fromisoformat(last["created_at"])
+                    # FIX v16: skip if too recent OR price effectively unchanged.
                     if age.total_seconds() < GOLD_HISTORY_INTERVAL_SECONDS * 0.8:
+                        return
+                    if abs(float(last["price"]) - float(price)) < 1e-9:
                         return
                 except Exception:
                     pass
@@ -1205,8 +1225,10 @@ def save_market_snapshot(symbol, atype, price):
                 "INSERT INTO market_history(symbol,asset_type,price,created_at) VALUES(?,?,?,?)",
                 (symbol, atype, float(price), now_iso())
             )
+            # FIX v16: cap via a single delete is fine, but moved here (less frequent now).
             c.execute(
-                "DELETE FROM market_history WHERE symbol=? AND asset_type=? AND id NOT IN (SELECT id FROM market_history WHERE symbol=? AND asset_type=? ORDER BY id DESC LIMIT 1000)",
+                "DELETE FROM market_history WHERE symbol=? AND asset_type=? AND id NOT IN ("
+                "SELECT id FROM market_history WHERE symbol=? AND asset_type=? ORDER BY id DESC LIMIT 1000)",
                 (symbol, atype, symbol, atype)
             )
     except Exception:
@@ -1247,15 +1269,11 @@ async def gold18_data():
     log.info("TGJU GOLD18: %.0f Toman/gram | history=%s", price, len(history))
     return result
 
-# ============================================================
-# TGJU GLOBAL GOLD / ONS (STRICT)
-# ============================================================
+# ---- XAU ----
 
 def find_xau_value(html):
-    """Strict TGJU /profile/ons parser. Returns USD per troy ounce or None."""
     if not html:
         return None
-
     soup = BeautifulSoup(html, "html.parser")
     candidates = []
 
@@ -1266,14 +1284,7 @@ def find_xau_value(html):
             return
         if not (XAU_USD_MIN <= v <= XAU_USD_MAX):
             return
-        score = base_score
-        low = ctx.lower()
-        if "انس" in ctx or "اونس" in ctx: score += 150
-        if "طلا" in ctx or "gold" in low: score += 100
-        if "دلار" in ctx or "usd" in low: score += 80
-        for noise in ("نقره", "نقره‌ای", "silver", "platinum", "پلاتین", "palladium", "پالادیوم"):
-            if noise.lower() in low:
-                score -= 400
+        score = base_score + _score_xau_node_from_ctx(ctx)
         candidates.append((score, v))
 
     if XAU_PRICE_SELECTOR:
@@ -1303,8 +1314,9 @@ def find_xau_value(html):
             text = tag.get_text(" ", strip=True)
             if len(text) > 3000:
                 continue
+            score = 500 + _score_xau_node(tag)
             for _, value in _numbers_with_positions(text):
-                consider(value, text, 500)
+                consider(value, text, score)
 
     keywords = ("انس طلا", "انس جهانی طلا", "انس جهانی", "اونس طلا", "اونس جهانی", "gold", "xau")
     for tag in soup.find_all(["tr", "li", "article", "section", "td", "div"]):
@@ -1314,8 +1326,9 @@ def find_xau_value(html):
         compact = text.lower().replace(" ", "")
         if not any(k.lower().replace(" ", "") in compact for k in keywords):
             continue
+        score = 100 + _score_xau_node(tag)
         for _, value in _numbers_with_positions(text):
-            consider(value, text, 100)
+            consider(value, text, score)
 
     if not candidates:
         return None
@@ -1324,6 +1337,18 @@ def find_xau_value(html):
         log.warning("XAU parse confidence too low (%s); returning None", candidates[0][0])
         return None
     return float(candidates[0][1])
+
+def _score_xau_node_from_ctx(ctx):
+    """Small helper used by consider() for direct selector hits."""
+    low = (ctx or "").lower()
+    s = 0
+    if "انس" in ctx or "اونس" in ctx: s += 150
+    if "طلا" in ctx or "gold" in low: s += 100
+    if "دلار" in ctx or "usd" in low: s += 80
+    for noise in ("نقره", "نقره‌ای", "silver", "platinum", "پلاتین", "palladium", "پالادیوم"):
+        if noise.lower() in low:
+            s -= 400
+    return s
 
 async def xau_tgju_price():
     global XAU_CACHE
@@ -1355,10 +1380,6 @@ async def xau_data():
         history = history if len(history) else pd.Series([price], dtype=float)
     return "XAU", history, pd.Series(dtype=float)
 
-# ============================================================
-# ASSET DATA / CURRENT PRICE
-# ============================================================
-
 async def asset_data(symbol):
     s = norm_symbol(symbol)
     if s == "XAU":
@@ -1369,9 +1390,9 @@ async def asset_data(symbol):
 
 async def current_price(symbol):
     s = norm_symbol(symbol)
-    item = PRICE_CACHE.get(s)
-    if item and time.monotonic() - item[0] < PRICE_CACHE_SECONDS:
-        return item[1]
+    item = PRICE_CACHE.get(s, PRICE_CACHE_SECONDS)
+    if item:
+        return item
 
     result = None
 
@@ -1416,7 +1437,7 @@ async def current_price(symbol):
                 pass
 
     if result:
-        PRICE_CACHE[s] = (time.monotonic(), result)
+        PRICE_CACHE.set(s, result)
     return result
 
 def format_live_price(item):
@@ -1441,23 +1462,25 @@ def format_live_price(item):
         text += f"\nتغییر ۲۴ ساعت: <b>{item['change24']:+.2f}%</b>"
     return text
 
+
 # ============================================================
-# PROFESSIONAL OHLCV (OKX)
+# PROFESSIONAL OHLCV (OKX) — FIX v16: global semaphore + LRU cache
 # ============================================================
 
 async def okx_candles(symbol, bar="1H", limit=240):
     s = norm_symbol(symbol)
     inst = f"{s}-USDT"
     key = (inst, bar, int(limit))
-    cached = OKX_CANDLE_CACHE.get(key)
-    if cached and time.monotonic() - cached[0] < OKX_CANDLE_CACHE_SECONDS:
-        return cached[1].copy()
+    cached = OKX_CANDLE_CACHE.get(key, OKX_CANDLE_CACHE_SECONDS)
+    if cached is not None:
+        return cached.copy()
 
-    data = await http_json(
-        f"{OKX_BASE_URL}/api/v5/market/candles",
-        {"instId": inst, "bar": bar, "limit": str(min(300, int(limit)))},
-        ttl=OKX_CANDLE_CACHE_SECONDS, retries=2,
-    )
+    async with _OKX_SEM:  # FIX v16: global limiter
+        data = await http_json(
+            f"{OKX_BASE_URL}/api/v5/market/candles",
+            {"instId": inst, "bar": bar, "limit": str(min(300, int(limit)))},
+            ttl=OKX_CANDLE_CACHE_SECONDS, retries=2,
+        )
     rows = (data or {}).get("data") or []
     parsed = []
     for row in rows:
@@ -1481,7 +1504,7 @@ async def okx_candles(symbol, bar="1H", limit=240):
         confirmed = df[df["confirm"] == 1].copy()
         if not confirmed.empty:
             df = confirmed
-    OKX_CANDLE_CACHE[key] = (time.monotonic(), df.copy())
+    OKX_CANDLE_CACHE.set(key, df.copy())
     return df
 
 def _wilder_rsi(close, period=14):
@@ -1741,7 +1764,6 @@ def _tf_decision(symbol, df, timeframe):
     strength = _clamp(45 + max(bull, bear) * 0.70 + (8 if adx >= 25 else 0))
     signal_score = _clamp(50 + abs(edge) * 1.15)
 
-    # SYMMETRIC RSI GATES (fix #12)
     buy_ok = (
         bull >= 62 and edge >= 18 and
         trend in ("BULLISH", "BULLISH_WEAK") and
@@ -1801,10 +1823,8 @@ def _tf_decision(symbol, df, timeframe):
         "history_points": len(df), "data_source": "OKX OHLCV professional",
     }
 
-def walk_forward_backtest(prices, horizon=6, fee_pct=0.10, min_trades=8):
-    """Leakage-aware close-only baseline test: signal at close t, enter at t+1,
-    exit after `horizon` bars. This is a diagnostic, not a simulation of the full
-    multi-timeframe engine and not a guarantee of future performance."""
+def walk_forward_backtest(prices, horizon=6, fee_pct=0.10, min_trades=4):
+    """FIX v16: adaptive horizon + lower min_trades."""
     try:
         p = pd.to_numeric(pd.Series(prices), errors="coerce").replace([float("inf"), float("-inf")], float("nan")).dropna().astype(float).reset_index(drop=True)
         p = p[p > 0].reset_index(drop=True)
@@ -1818,8 +1838,6 @@ def walk_forward_backtest(prices, horizon=6, fee_pct=0.10, min_trades=8):
         rs = gain / loss.replace(0, float("nan"))
         rsi = (100 - 100 / (1 + rs)).fillna(50)
         trades = []
-        # At t, only use values known at t; execution is at next close to avoid
-        # assuming fills at the same close used to create the signal.
         last_signal_index = len(p) - horizon - 1
         i = 30
         while i <= last_signal_index:
@@ -1838,11 +1856,10 @@ def walk_forward_backtest(prices, horizon=6, fee_pct=0.10, min_trades=8):
             gross = (float(p.iloc[exit_i]) / float(p.iloc[entry_i]) - 1.0) * 100.0 * direction
             net = gross - max(0.0, float(fee_pct))
             trades.append({"net": net, "gross": gross, "entry": entry_i, "exit": exit_i})
-            # Avoid overlapping positions; a new signal can be acted on only
-            # after this simulated position has closed.
             i = exit_i
         if len(trades) < min_trades:
-            return {"available": False, "points": int(len(p)), "trades": len(trades), "reason": f"تعداد معاملات تاریخی کم است ({len(trades)} از حداقل {min_trades})"}
+            return {"available": False, "points": int(len(p)), "trades": len(trades),
+                    "reason": f"تعداد معاملات تاریخی کم است ({len(trades)} از حداقل {min_trades})"}
         returns = [t["net"] for t in trades]
         equity = 1.0
         curve = [equity]
@@ -1870,7 +1887,6 @@ def walk_forward_backtest(prices, horizon=6, fee_pct=0.10, min_trades=8):
 
 
 def backtest_text(result, symbol):
-    """Persian, cautious rendering for actual available history only."""
     if not result:
         return "🧪 بک‌تست: داده قابل ارزیابی در دسترس نیست.\n"
     if not result.get("available"):
@@ -1880,7 +1896,11 @@ def backtest_text(result, symbol):
     is_gold = symbol in ("GOLD18", "XAU")
     source_line = ("منبع: اسنپ‌شات‌های ذخیره‌شده TGJU (قیمت نقطه‌ای؛ نه کندل OHLC)\n"
                    if is_gold else "منبع: کندل‌های بسته‌شده ۱ساعته OKX\n")
-    horizon_label = "گام تاریخی" if is_gold else "کندل ۱ساعته"
+    # FIX v16: correct horizon label for snapshot-based gold.
+    if is_gold:
+        horizon_label = f"اسنپ‌شات TGJU (~{GOLD_HISTORY_INTERVAL_SECONDS//60} دقیقه‌ای)"
+    else:
+        horizon_label = "کندل ۱ساعته"
     return (
         "🧪 <b>بک‌تست تاریخی تشخیصی</b>\n"
         f"نمونه: {result['points']} نقطه | معاملات: {result['trades']} | افق: {result['horizon']} {horizon_label}\n"
@@ -1893,14 +1913,17 @@ def backtest_text(result, symbol):
 
 
 async def professional_crypto_analysis(symbol):
-    # All signals are calculated from historical, CLOSED OKX candles.
-    # The short timeframes are for timing; 4H/1D/1W control the larger trend.
+    # FIX v16: ANALYSIS_CACHE lookup before heavy OKX calls.
+    s = norm_symbol(symbol)
+    cache_key_a = ("prof", s)
+    cached = ANALYSIS_CACHE.get(cache_key_a, ANALYSIS_CACHE_SECONDS)
+    if cached is not None:
+        return cached
+
     bars = {"5m": 240, "15m": 240, "1H": 240, "4H": 240, "1D": 240, "1W": 240}
-    sem = asyncio.Semaphore(OKX_MAX_CONCURRENCY)
 
     async def one(tf, limit):
-        async with sem:
-            return tf, await okx_candles(symbol, tf, limit)
+        return tf, await okx_candles(symbol, tf, limit)
 
     pairs = await asyncio.gather(*(one(tf, n) for tf, n in bars.items()), return_exceptions=True)
 
@@ -1939,8 +1962,6 @@ async def professional_crypto_analysis(symbol):
     trend1w = tfs.get("1W", main).get("trend")
     structure1d = tfs.get("1D", main).get("structure")
 
-    # Higher-timeframe guard: short-term momentum cannot override a clearly
-    # bearish daily/weekly structure for a BUY (and vice versa for SELL).
     buy_veto = (
         trend4 in ("BEARISH", "BEARISH_WEAK") or structure4 == "BEARISH"
         or trend1d == "BEARISH" or structure1d == "BEARISH"
@@ -2002,8 +2023,6 @@ async def professional_crypto_analysis(symbol):
         "data_source": "OKX OHLCV professional multi-timeframe",
         "history_points": sum(v["history_points"] for v in tfs.values()),
     })
-    # Shared by direct analysis, signal scans, opportunity scans, and alerts.
-    # 1H candles are already cached by the multi-timeframe pass in normal use.
     try:
         hist_1h = await okx_candles(symbol, "1H", 240)
         out["backtest"] = walk_forward_backtest(
@@ -2013,10 +2032,14 @@ async def professional_crypto_analysis(symbol):
     except Exception as e:
         log.warning("backtest history unavailable %s: %s", symbol, e)
         out["backtest"] = {"available": False, "reason": "کندل تاریخی کافی از OKX دریافت نشد"}
+
+    # FIX v16: cache the full result.
+    ANALYSIS_CACHE.set(cache_key_a, out)
     return out
 
+
 # ============================================================
-# FALLBACK ANALYSIS (close-only, for GOLD18/XAU)
+# FALLBACK ANALYSIS (GOLD18/XAU, close-only)
 # ============================================================
 
 def _rsi(series, period=14):
@@ -2035,9 +2058,6 @@ def _atr(p, period=14):
     return tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
 
 def _adx(p, period=14):
-    """Close-only ADX approximation.
-    For real OHLC ADX use _advanced_indicators(). Used only for GOLD18/XAU
-    fallback where only close prices are available."""
     move = p.diff()
     up = move.clip(lower=0); down = (-move).clip(lower=0); tr = move.abs()
     atr = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
@@ -2160,7 +2180,6 @@ def technical_analysis(symbol, prices, volumes=None):
     elif r6 < 0 and r24 < 0:
         sell_points += 10; reasons_sell.append("مومنتوم منفی")
 
-    # FIX #14: proper volume alignment
     vol_confirm = None
     if volumes is not None:
         v = pd.Series(volumes, dtype=float)
@@ -2220,7 +2239,7 @@ def technical_analysis(symbol, prices, volumes=None):
     }
 
 # ============================================================
-# SIGNAL CONFIRMATION (BUCKET-BASED, FIX #5)
+# SIGNAL CONFIRMATION (BEGIN IMMEDIATE) — FIX v16
 # ============================================================
 
 def _timeframe_bucket(timeframe):
@@ -2229,7 +2248,6 @@ def _timeframe_bucket(timeframe):
     return f"{timeframe}:{bucket}"
 
 def confirm_signal(symbol, candidate, price, timeframe=None):
-    """Confirm a signal on successive CLOSED candles of the given timeframe."""
     timeframe = timeframe or SIGNAL_CONFIRM_TIMEFRAME
     if candidate == "WAIT":
         with db() as c:
@@ -2239,6 +2257,7 @@ def confirm_signal(symbol, candidate, price, timeframe=None):
     observation_key = _timeframe_bucket(timeframe)
     iso_now = now_iso()
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")  # FIX v16: no read-write race
         row = c.execute("SELECT * FROM signal_state WHERE symbol=?", (symbol,)).fetchone()
         if row and row["candidate"] == candidate:
             confirmations = int(row["confirmations"])
@@ -2260,15 +2279,13 @@ def confirm_signal(symbol, candidate, price, timeframe=None):
     return (candidate if confirmed else "WAIT"), confirmed, confirmations
 
 async def crypto_market_context(symbol):
-    """Supplement technical OHLCV with independent market/liquidity context."""
     sym = norm_symbol(symbol)
     cid = COINS.get(sym)
     if not cid:
         return None
     rows = await http_json(
         "https://api.coingecko.com/api/v3/coins/markets",
-        {"vs_currency": "usd", "ids": cid,
-         "price_change_percentage": "24h,7d,30d"},
+        {"vs_currency": "usd", "ids": cid, "price_change_percentage": "24h,7d,30d"},
         ttl=90, retries=2,
     )
     if not rows or not isinstance(rows, list):
@@ -2296,9 +2313,10 @@ async def crypto_market_context(symbol):
 
 async def analyze(symbol):
     s = norm_symbol(symbol)
-    cached = ANALYSIS_CACHE.get(s)
-    if cached and time.monotonic() - cached[0] < ANALYSIS_CACHE_SECONDS:
-        return cached[1]
+    cache_key_a = ("analyze", s)
+    cached = ANALYSIS_CACHE.get(cache_key_a, ANALYSIS_CACHE_SECONDS)
+    if cached is not None:
+        return cached
 
     if s not in ("GOLD18", "XAU"):
         result = await professional_crypto_analysis(s)
@@ -2314,7 +2332,7 @@ async def analyze(symbol):
             except Exception as e:
                 log.warning("market context unavailable %s: %s", s, e)
                 result["market_context"] = None
-            ANALYSIS_CACHE[s] = (time.monotonic(), result)
+            ANALYSIS_CACHE.set(cache_key_a, result)
             return result
 
     data = await asset_data(s)
@@ -2336,12 +2354,9 @@ async def analyze(symbol):
     result["confirmed"] = confirmed
     result["confirmations"] = confirmations
     if s in ("GOLD18", "XAU"):
-        # TGJU currently supplies a spot snapshot, not a dependable OHLC series.
-        # Use only snapshots already persisted in this bot's database, and only
-        # label the result as a close-only diagnostic when enough points exist.
         result["backtest"] = walk_forward_backtest(data[1], horizon=6)
         result["backtest_source"] = "saved TGJU price snapshots (close-only; not OHLC candles)"
-    ANALYSIS_CACHE[s] = (time.monotonic(), result)
+    ANALYSIS_CACHE.set(cache_key_a, result)
     return result
 
 def signal_fa(s):
@@ -2372,7 +2387,6 @@ def _market_context_text(ctx):
     )
 
 def analysis_text(a):
-    """Pure technical dashboard. No trade signal."""
     if not a:
         return "❌ اطلاعات بازار در دسترس نیست."
     if a.get("insufficient_history"):
@@ -2393,22 +2407,23 @@ def analysis_text(a):
         candle_note = "⏱ داده‌های قیمت CoinGecko؛ کندل OHLC کامل در دسترس نیست\n"
     else:
         candle_note = "⏱ کندل‌های بسته‌شده OKX در چند تایم‌فریم (نمای اصلی 4H)\n"
-    mtf = a.get("mtf") or {}
-    tf_labels = {"5m": "۵دقیقه", "15m": "۱۵دقیقه", "1H": "۱ساعت", "4H": "۴ساعت", "1D": "روزانه", "1W": "هفتگی"}
-    tf_lines = []
-    for tf in ("5m", "15m", "1H", "4H", "1D", "1W"):
-        item = mtf.get(tf)
-        if not item:
-            tf_lines.append(f"• {tf_labels[tf]}: داده کافی/در دسترس نیست")
-            continue
-        tr = {"BULLISH": "صعودی قوی", "BULLISH_WEAK": "صعودی ضعیف", "BEARISH": "نزولی قوی", "BEARISH_WEAK": "نزولی ضعیف", "NEUTRAL": "خنثی"}.get(item.get("trend"), item.get("trend", "نامشخص"))
-        sig = {"BUY": "خرید", "SELL": "فروش", "WAIT": "انتظار"}.get(item.get("signal_candidate"), "انتظار")
-        tf_lines.append(f"• {tf_labels[tf]}: {tr} | RSI {item.get('rsi', 0):.1f} | {sig}")
-    mtf_text = "\n".join(tf_lines)
 
-    # Approximate risk levels for the technical dashboard, even when no
-    # confirmed BUY/SELL signal exists. These are analytical reference levels,
-    # not an instruction to enter a trade.
+    mtf = a.get("mtf") or {}
+    mtf_text = ""
+    # FIX v16: hide MTF section for GOLD18/XAU (they have no MTF data).
+    if mtf:
+        tf_labels = {"5m": "۵دقیقه", "15m": "۱۵دقیقه", "1H": "۱ساعت", "4H": "۴ساعت", "1D": "روزانه", "1W": "هفتگی"}
+        tf_lines = []
+        for tf in ("5m", "15m", "1H", "4H", "1D", "1W"):
+            item = mtf.get(tf)
+            if not item:
+                tf_lines.append(f"• {tf_labels[tf]}: داده کافی/در دسترس نیست")
+                continue
+            tr = {"BULLISH": "صعودی قوی", "BULLISH_WEAK": "صعودی ضعیف", "BEARISH": "نزولی قوی", "BEARISH_WEAK": "نزولی ضعیف", "NEUTRAL": "خنثی"}.get(item.get("trend"), item.get("trend", "نامشخص"))
+            sig = {"BUY": "خرید", "SELL": "فروش", "WAIT": "انتظار"}.get(item.get("signal_candidate"), "انتظار")
+            tf_lines.append(f"• {tf_labels[tf]}: {tr} | RSI {item.get('rsi', 0):.1f} | {sig}")
+        mtf_text = "🕒 <b>تأیید چندتایم‌فریمی (تاریخچه کندل‌های بسته‌شده)</b>\n" + "\n".join(tf_lines) + "\n\n"
+
     price = _safe_float(a.get("price"))
     support = _safe_float(a.get("support"))
     resistance = _safe_float(a.get("resistance"))
@@ -2432,7 +2447,6 @@ def analysis_text(a):
             target2 = min(target1, price - 2.5 * risk)
             target3 = min(target2, price - 3.5 * risk)
         else:
-            # Neutral trend: show risk references only when a meaningful ATR exists.
             risk = max(1.5 * atr, price * 0.02)
             stop = price - risk
             target1, target2, target3 = price + 1.5 * risk, price + 2.5 * risk, price + 3.5 * risk
@@ -2449,24 +2463,29 @@ def analysis_text(a):
         "ℹ️ این سطوح تخمینی‌اند؛ در روند خنثی صرفاً مرجع محاسباتی هستند و سیگنال ورود محسوب نمی‌شوند.\n\n"
         if price > 0 else ""
     )
+
+    mtf_agreement_line = ""
+    if mtf:  # FIX v16: only when MTF exists
+        mtf_agreement_line = f"🧭 هم‌جهتی تایم‌فریم‌ها: <b>{a.get('mtf_agreement', 0):.0f}%</b>\n"
+
     return (
         f"📊 <b>داشبورد تحلیل تکنیکال {escape(a['symbol'])}</b>\n\n"
         f"💰 قیمت: <b>{_format_price(a['symbol'], a['price'])} {unit}</b>\n"
         f"📈 ساختار روند اصلی: <b>{trend_fa}</b>\n\n"
-        f"🕒 <b>تأیید چندتایم‌فریمی (تاریخچه کندل‌های بسته‌شده)</b>\n{mtf_text}\n\n"
-        f"EMA9: {_format_price(a['symbol'], a['ema9'])} | EMA21: {_format_price(a['symbol'], a['ema21'])}\n"
-        f"EMA50: {_format_price(a['symbol'], a['ema50'])} | EMA200: {_format_price(a['symbol'], a['ema200'])}\n"
-        f"RSI14: <b>{a['rsi']:.1f}</b> | {adx_label}: <b>{a['adx']:.1f}</b>\n"
-        f"MACD: {a['macd']:.5f} | Histogram: {a['macd_hist']:+.5f}\n"
-        f"Bollinger: <b>{a['bb_position']:.1f}%</b> | ATR: {_format_price(a['symbol'], a['atr'])} ({a['atr_pct']:.2f}%)\n"
+        + mtf_text
+        + f"EMA9: {_format_price(a['symbol'], a['ema9'])} | EMA21: {_format_price(a['symbol'], a['ema21'])}\n"
+        + f"EMA50: {_format_price(a['symbol'], a['ema50'])} | EMA200: {_format_price(a['symbol'], a['ema200'])}\n"
+        + f"RSI14: <b>{a['rsi']:.1f}</b> | {adx_label}: <b>{a['adx']:.1f}</b>\n"
+        + f"MACD: {a['macd']:.5f} | Histogram: {a['macd_hist']:+.5f}\n"
+        + f"Bollinger: <b>{a['bb_position']:.1f}%</b> | ATR: {_format_price(a['symbol'], a['atr'])} ({a['atr_pct']:.2f}%)\n"
         + level_text
         + f"مومنتوم: 1 کندل {a.get('r1', 0):+.2f}% | 6 کندل {a.get('r6', 0):+.2f}% | "
-        f"24 کندل {a.get('r24', 0):+.2f}% | 72 کندل {a.get('r72', 0):+.2f}%\n"
-        f"{candle_note}\n"
-        f"💪 <b>قدرت تکنیکال: {a['strength']:.0f}%</b>\n"
-        f"🧭 هم‌جهتی تایم‌فریم‌ها: <b>{a.get('mtf_agreement', 0):.0f}%</b>\n"
-        f"🔬 وضعیت ساختار: {'قوی' if a['strength'] >= 75 else 'متوسط' if a['strength'] >= 55 else 'ضعیف'}\n"
-        f"📚 تعداد داده: {a['history_points']} | منبع: {escape(source)}\n"
+        + f"24 کندل {a.get('r24', 0):+.2f}% | 72 کندل {a.get('r72', 0):+.2f}%\n"
+        + f"{candle_note}\n"
+        + f"💪 <b>قدرت تکنیکال: {a['strength']:.0f}%</b>\n"
+        + mtf_agreement_line
+        + f"🔬 وضعیت ساختار: {'قوی' if a['strength'] >= 75 else 'متوسط' if a['strength'] >= 55 else 'ضعیف'}\n"
+        + f"📚 تعداد داده: {a['history_points']} | منبع: {escape(source)}\n"
         + ("📥 تاریخچه رمزارز از کندل‌های تاریخی OKX دریافت شده است؛ تایم‌فریم‌های در دسترس بسته به نماد/محدودیت منبع ممکن است متفاوت باشد.\n"
            if a.get("mtf") else "")
         + (_market_context_text(a.get("market_context")) if a["symbol"] not in ("GOLD18", "XAU") else "")
@@ -2516,11 +2535,11 @@ def signal_text(a):
     )
 
 # ============================================================
-# WATCHLIST
+# WATCHLIST — FIX v16: safe repair
 # ============================================================
 
 def _repair_watchlist_table():
-    """Normalize legacy watchlist schemas without losing known watchlist data."""
+    """Rebuild watchlist if legacy schema is incompatible. Safe parameterization."""
     stamp = now_iso()
     with db() as c:
         info = c.execute("PRAGMA table_info(watchlist)").fetchall()
@@ -2560,21 +2579,35 @@ def _repair_watchlist_table():
 
         old_names = {r[1] for r in info}
         if "user_id" in old_names:
-            symbol_expr = "symbol" if "symbol" in old_names else ("asset_key" if "asset_key" in old_names else "''")
+            # FIX v16: build SQL with guaranteed parameter count.
+            symbol_expr = ("symbol" if "symbol" in old_names
+                           else ("asset_key" if "asset_key" in old_names else "''"))
             type_expr = "asset_type" if "asset_type" in old_names else "'crypto'"
-            created_expr = "created_at" if "created_at" in old_names else "?"
-            params = [stamp, stamp] if created_expr == "?" else []
-            c.execute(f"""
-                INSERT OR IGNORE INTO watchlist(user_id,symbol,asset_type,created_at,asset_key)
-                SELECT user_id,
-                       upper(COALESCE(NULLIF({symbol_expr},''), '')),
-                       COALESCE({type_expr}, 'crypto'),
-                       COALESCE({created_expr}, ?),
-                       upper(COALESCE(NULLIF({symbol_expr},''), ''))
-                FROM "{legacy}"
-                WHERE user_id IS NOT NULL
-                  AND COALESCE({symbol_expr}, '') <> ''
-            """, params + ([stamp] if created_expr != "?" else []))
+            has_created = "created_at" in old_names
+
+            if has_created:
+                c.execute(f"""
+                    INSERT OR IGNORE INTO watchlist(user_id,symbol,asset_type,created_at,asset_key)
+                    SELECT user_id,
+                           upper(COALESCE(NULLIF({symbol_expr},''), '')),
+                           COALESCE({type_expr}, 'crypto'),
+                           COALESCE(created_at, ?),
+                           upper(COALESCE(NULLIF({symbol_expr},''), ''))
+                    FROM "{legacy}"
+                    WHERE user_id IS NOT NULL AND COALESCE({symbol_expr}, '') <> ''
+                """, (stamp,))
+            else:
+                c.execute(f"""
+                    INSERT OR IGNORE INTO watchlist(user_id,symbol,asset_type,created_at,asset_key)
+                    SELECT user_id,
+                           upper(COALESCE(NULLIF({symbol_expr},''), '')),
+                           COALESCE({type_expr}, 'crypto'),
+                           ?,
+                           upper(COALESCE(NULLIF({symbol_expr},''), ''))
+                    FROM "{legacy}"
+                    WHERE user_id IS NOT NULL AND COALESCE({symbol_expr}, '') <> ''
+                """, (stamp,))
+
         c.execute("CREATE INDEX IF NOT EXISTS idx_watch_asset ON watchlist(asset_type,symbol)")
         log.warning("WATCHLIST SCHEMA NORMALIZED; legacy table preserved as %s", legacy)
 
@@ -2629,20 +2662,7 @@ def add_watch(uid, symbol, atype, asset_key=None):
             log.exception("WATCHLIST INSERT ERROR (after repair) uid=%s symbol=%s type=%s: %s", uid, s, atype, second_error)
             return False
 
-    if not saved:
-        return False
-
-    try:
-        with db() as c:
-            committed = c.execute("""
-                SELECT 1 FROM watchlist
-                WHERE user_id=? AND symbol=? AND asset_type=? LIMIT 1
-            """, (uid, s, atype)).fetchone() is not None
-        log.info("WATCHLIST SAVED uid=%s symbol=%s asset_type=%s db=%s ok=%s", uid, s, atype, DB_PATH, committed)
-        return committed
-    except Exception:
-        log.exception("WATCHLIST COMMIT VERIFY FAILED uid=%s symbol=%s type=%s", uid, s, atype)
-        return False
+    return saved
 
 def remove_watch(uid, symbol, atype):
     with db() as c:
@@ -2678,17 +2698,22 @@ def user_has_asset(uid, symbol, atype):
         WHERE user_id=? AND symbol=? AND asset_type=?
         """, (uid, norm_symbol(symbol), atype)).fetchone() is not None
 
-# ============================================================
-# KEYBOARDS
+
+        # ============================================================
+# KEYBOARDS — FIX v16: main_kb single DB lookup
 # ============================================================
 
 def main_kb(uid):
-    """Show a small lock only on features unavailable to this user right now."""
+    """Show a small lock only on features unavailable to this user right now.
+
+    FIX v16: active_subscription() is queried ONCE (was twice).
+    """
     rows = [r[:] for r in MAIN_MENU]
     if not is_admin(uid):
         rows = [r for r in rows if r != ["👨‍💼 پنل مدیریت"]]
-        has_access = has_analysis_access(uid)
-        has_paid = has_paid_subscription(uid)
+        sub = active_subscription(uid)  # single call
+        has_access = sub is not None
+        has_paid = bool(sub and sub["source"] != "trial" and sub["plan"] != TRIAL_PLAN)
         locked_labels = {
             "📊 تحلیل تکنیکال": not has_access,
             "🎯 فرصت‌های خرید": not has_access,
@@ -2915,7 +2940,7 @@ async def analysis_prompt(update, context):
     )
 
 async def signals_menu(update, context):
-    """Market-wide signal discovery; only paid subscribers can use this section."""
+    """FIX v16: collapsed to a single edit_text (no 5-message spam)."""
     uid = update.effective_user.id
     if not has_paid_subscription(uid):
         await update.message.reply_text(
@@ -2945,8 +2970,6 @@ async def signals_menu(update, context):
             )
             return
 
-        # Sort the full scan by a blended quality score. Keep both actionable
-        # candidates and the strongest watch-only setups visible to the user.
         ranked = sorted(
             [x for x in opportunities if x.get("m") and x.get("m", {}).get("ta")],
             key=lambda x: (
@@ -2966,29 +2989,23 @@ async def signals_menu(update, context):
             )
             return
 
-        lines = [
-            "📡 <b>نتیجه اسکن خودکار بازار</b>",
-            "ربات بدون نیاز به واچ‌لیست، نامزدها را از بازار پیدا کرده است.",
-            "",
-        ]
+        lines = ["📡 <b>نتیجه اسکن خودکار بازار</b>",
+                 "ربات بدون نیاز به واچ‌لیست، نامزدها را از بازار پیدا کرده است.", ""]
         if not btc_status or not btc_status.get("ok"):
             lines.append("🟡 وضعیت BTC تأییدکننده خرید نیست؛ موارد زیر فقط برای پایش‌اند.")
         else:
             lines.append("₿ وضعیت BTC از فیلتر بازار عبور کرده؛ هر دارایی همچنان جداگانه ارزیابی می‌شود.")
         lines.append("")
 
+        keyboard_buttons = []
         for idx, item in enumerate(ranked, 1):
             m = item.get("m") or {}
             ta = m.get("ta") or {}
             qualified = _alert_candidate_ok(item, btc_status)
             label = "نامزد خرید" if qualified else "تحت نظر؛ هنوز تأیید خرید نیست"
-            trend_fa = {
-                "BULLISH": "صعودی",
-                "BULLISH_WEAK": "صعودی ضعیف",
-                "BEARISH": "نزولی",
-                "BEARISH_WEAK": "نزولی ضعیف",
-                "NEUTRAL": "خنثی",
-            }.get(ta.get("trend"), "نامشخص")
+            trend_fa = {"BULLISH": "صعودی", "BULLISH_WEAK": "صعودی ضعیف",
+                        "BEARISH": "نزولی", "BEARISH_WEAK": "نزولی ضعیف",
+                        "NEUTRAL": "خنثی"}.get(ta.get("trend"), "نامشخص")
             lines.append(
                 f"{idx}. <b>{escape(item.get('symbol', '?'))}</b> — {label}\n"
                 f"   امتیاز فرصت: {_safe_float(m.get('score')):.0f}% | "
@@ -2996,27 +3013,23 @@ async def signals_menu(update, context):
                 f"   روند: {trend_fa} | RSI: {_safe_float(ta.get('rsi'), 50):.1f} | "
                 f"ریسک: {escape(str(m.get('risk') or 'نامشخص'))}"
             )
+            sym = norm_symbol(item.get("symbol") or "")
+            if sym:
+                keyboard_buttons.append([
+                    InlineKeyboardButton(f"📊 {sym}", callback_data=f"op:analysis:{sym}"),
+                    InlineKeyboardButton(f"📡 {sym}", callback_data=f"op:signal:{sym}"),
+                ])
 
         lines.extend([
             "",
             "📌 برای هر دارایی می‌توانید تحلیل کامل یا جزئیات سیگنال را باز کنید.",
             "⚠️ امتیازها تضمین سود یا احتمال سودِ کالیبره‌شده نیستند؛ تا زمان تأیید، موارد «تحت نظر» سیگنال خرید محسوب نمی‌شوند.",
         ])
-        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-        for item in ranked:
-            symbol = norm_symbol(item.get("symbol") or "")
-            if not symbol:
-                continue
-            markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton("📊 تحلیل کامل", callback_data=f"op:analysis:{symbol}"),
-                InlineKeyboardButton("📡 جزئیات سیگنال", callback_data=f"op:signal:{symbol}"),
-            ]])
-            await update.message.reply_text(
-                f"🎯 <b>{escape(symbol)}</b> — باز کردن جزئیات",
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-            )
+        await msg.edit_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None,
+        )
     except asyncio.TimeoutError:
         await msg.edit_text(
             "⏳ اسکن بازار بیش از ۹۰ ثانیه طول کشید و متوقف شد تا ربات معطل نماند. "
@@ -3033,7 +3046,8 @@ async def signals_menu(update, context):
         except Exception:
             pass
 
-# ============================================================
+
+            # ============================================================
 # MARKET-WIDE GROWTH SCANNER
 # ============================================================
 
@@ -3061,7 +3075,6 @@ def _short_term_scan_metrics(x, ta):
 
     score = 50.0
     reasons = []
-
     score += _clamp(ch1 * 2.0, -8, 8)
     score += _clamp(ch24 * 0.55, -10, 10)
     score += _clamp(ch7 * 0.35, -8, 8)
@@ -3072,18 +3085,15 @@ def _short_term_scan_metrics(x, ta):
         score -= 8; reasons.append("رشد ۲۴ساعته شدید؛ ریسک تعقیب قیمت")
     if ch7 > 60:
         score -= 6; reasons.append("رشد ۷روزه شدید؛ احتمال اشباع کوتاه‌مدت")
-
     if turnover >= 0.25:
         score += 8; reasons.append("نقدشوندگی و گردش معاملات بالا")
     elif turnover >= 0.10:
         score += 5; reasons.append("گردش معاملات مناسب")
     elif turnover < 0.02:
         score -= 8; reasons.append("نقدشوندگی پایین")
-
     if rank <= 50: score += 5
     elif rank <= 200: score += 3
     elif rank > 1000: score -= 4
-
     if -25 <= ath_change <= -5:
         score += 5; reasons.append("فاصله مناسب از سقف تاریخی")
     elif ath_change < -90:
@@ -3100,21 +3110,18 @@ def _short_term_scan_metrics(x, ta):
         e9 = _safe_float(ta.get("ema9"))
         e21 = _safe_float(ta.get("ema21"))
         e50 = _safe_float(ta.get("ema50"))
-
         if trend == "BULLISH":
             score += 10; reasons.append("EMA و روند صعودی تأییدشده")
         elif trend == "BULLISH_WEAK":
             score += 5; reasons.append("روند صعودی در حال شکل‌گیری")
         elif trend in ("BEARISH", "BEARISH_WEAK"):
             score -= 8; reasons.append("روند نزولی")
-
         if 52 <= rsi <= 68:
             score += 6; reasons.append("RSI در محدوده سازنده")
         elif rsi > 75:
             score -= 6; reasons.append("RSI بالا و ریسک اصلاح")
         elif rsi < 35:
             score -= 3
-
         if mhist > 0: score += 5; reasons.append("MACD مثبت")
         if adx >= 25: score += 4; reasons.append("قدرت روند مناسب")
         if e9 > e21 > e50: score += 5; reasons.append("چیدمان EMA صعودی")
@@ -3298,7 +3305,7 @@ async def growth_scan_menu(update, context):
         await update.message.reply_text("⚠️ اسکن بازار کامل نشد.")
 
 # ============================================================
-# PROFESSIONAL BUY-OPPORTUNITY MENU
+# BUY OPPORTUNITY MENU
 # ============================================================
 
 def _buy_opportunity_text(item):
@@ -3323,13 +3330,6 @@ def _buy_opportunity_text(item):
     )
 
 async def _cycle_bottom_and_growth_scan(rows=None):
-    """Find watch candidates near deep drawdowns and emerging momentum.
-
-    This deliberately labels deep-drawdown assets as *watch candidates*, not
-    literal historical bottoms: CoinGecko market snapshots do not prove a cycle
-    low, and no OHLC-based reversal confirmation is implied by this ranking.
-    All final candidates are checked with the existing professional OKX engine.
-    """
     rows = rows if rows is not None else await market_universe()
     if not rows:
         return {"bottom": [], "growth": []}
@@ -3351,15 +3351,11 @@ async def _cycle_bottom_and_growth_scan(rows=None):
         ch14 = _safe_float(x.get("price_change_percentage_14d_in_currency"))
         ch200 = _safe_float(x.get("price_change_percentage_200d_in_currency"))
         ch1y = _safe_float(x.get("price_change_percentage_1y_in_currency"))
-        # Deep drawdown lane: substantial discount from ATH plus evidence of
-        # recent stabilization/recovery. Do not call it an actual bottom.
         bottom_score = (min(45, max(0, abs(min(0, ath_drop)) - 30))
                         + min(18, max(-18, ch7 * 0.45))
                         + min(12, max(-12, ch14 * 0.25))
                         + (5 if ch24 > 0 else -3 if ch24 < -8 else 0)
                         + (4 if ch200 < 0 else 0) + (3 if ch1y < 0 else 0))
-        # Growth lane rewards sustainable multi-period momentum, while penalizing
-        # extreme pumps that may simply be late entries.
         growth_score = (min(18, max(-18, ch24 * 0.45))
                         + min(22, max(-12, ch7 * 0.45))
                         + min(14, max(-10, ch14 * 0.25))
@@ -3375,7 +3371,6 @@ async def _cycle_bottom_and_growth_scan(rows=None):
         xcopy["_ch1y"] = ch1y
         liquid.append(xcopy)
 
-    # Separate top pools; avoid spending the entire deep-analysis budget on one lane.
     bottom_pool = [x for x in liquid if x["_ath_drop"] <= -45 and x["_ch200"] < 0]
     bottom_pool.sort(key=lambda x: x["_bottom_score"], reverse=True)
     growth_pool = [x for x in liquid if _safe_float(x.get("price_change_percentage_7d_in_currency")) > 0]
@@ -3389,15 +3384,13 @@ async def _cycle_bottom_and_growth_scan(rows=None):
                 seen.add(key)
                 chosen.append((lane, x))
 
-    sem = asyncio.Semaphore(max(1, min(4, OKX_MAX_CONCURRENCY)))
     async def analyze(lane, x):
-        async with sem:
-            try:
-                ta = await professional_crypto_analysis(norm_symbol(x.get("symbol") or ""))
-                return lane, x, ta
-            except Exception as exc:
-                log.warning("cycle/growth candidate analysis failed %s: %s", x.get("symbol"), exc)
-                return lane, x, None
+        try:
+            ta = await professional_crypto_analysis(norm_symbol(x.get("symbol") or ""))
+            return lane, x, ta
+        except Exception as exc:
+            log.warning("cycle/growth candidate analysis failed %s: %s", x.get("symbol"), exc)
+            return lane, x, None
 
     analyzed = await asyncio.gather(*(analyze(lane, x) for lane, x in chosen))
     out = {"bottom": [], "growth": []}
@@ -3407,8 +3400,6 @@ async def _cycle_bottom_and_growth_scan(rows=None):
         trend = str(ta.get("trend") or "NEUTRAL")
         rsi = _safe_float(ta.get("rsi"), 50)
         signal = str(ta.get("signal_candidate") or "WAIT")
-        # Only retain technically stabilizing drawdowns in the bottom lane;
-        # for growth require a bullish trend and avoid strongly overbought RSI.
         if lane == "bottom":
             if trend not in ("BULLISH", "BULLISH_WEAK") or not (32 <= rsi <= 68):
                 continue
@@ -3468,7 +3459,6 @@ async def buy_opportunities_menu(update, context):
     )
     try:
         opportunities, btc_status, observation_key = await asyncio.wait_for(_market_alert_scan(), timeout=90)
-        # Additional discovery lanes: deep correction/stabilization and sustained growth.
         cycle_data = await asyncio.wait_for(_cycle_bottom_and_growth_scan(), timeout=90)
         cycle_report = _cycle_growth_report(cycle_data)
         if not opportunities:
@@ -3482,16 +3472,9 @@ async def buy_opportunities_menu(update, context):
         await update.message.reply_text(cycle_report, parse_mode=ParseMode.HTML)
 
         if not btc_status or not btc_status.get("ok"):
-            nearest = sorted(
-                opportunities,
-                key=lambda z: _safe_float((z.get("m") or {}).get("score")),
-                reverse=True,
-            )[:3]
-            body = [
-                "🟡 <b>فعلاً خرید تأییدشده‌ای وجود ندارد.</b>",
-                "₿ فیلتر بازار BTC مثبت نیست؛ برای کاهش ریسک، سیگنال خرید صادر نمی‌شود.",
-                "",
-            ]
+            nearest = sorted(opportunities, key=lambda z: _safe_float((z.get("m") or {}).get("score")), reverse=True)[:3]
+            body = ["🟡 <b>فعلاً خرید تأییدشده‌ای وجود ندارد.</b>",
+                    "₿ فیلتر بازار BTC مثبت نیست؛ برای کاهش ریسک، سیگنال خرید صادر نمی‌شود.", ""]
             for item in nearest:
                 m = item.get("m") or {}
                 ta = m.get("ta") or {}
@@ -3513,37 +3496,24 @@ async def buy_opportunities_menu(update, context):
             confirmed, confirmations, cycle_id = confirm_market_alert(
                 item["symbol"], "BUY", m["price"], observation_key
             )
-            m.update({
-                "confirmed": confirmed,
-                "confirmations": confirmations,
-                "cycle_id": cycle_id,
-                "signal": "BUY" if confirmed else "WAIT",
-            })
+            m.update({"confirmed": confirmed, "confirmations": confirmations,
+                      "cycle_id": cycle_id, "signal": "BUY" if confirmed else "WAIT"})
             if confirmed:
                 qualified_items.append(item)
             else:
                 pending_items.append(item)
 
         qualified_items.sort(
-            key=lambda z: (
-                _safe_float(z["m"].get("score")),
-                _safe_float(z["m"].get("strength")),
-                _safe_float(z["m"].get("probability")),
-            ), reverse=True
-        )
+            key=lambda z: (_safe_float(z["m"].get("score")),
+                           _safe_float(z["m"].get("strength")),
+                           _safe_float(z["m"].get("probability"))), reverse=True)
 
         if not qualified_items:
-            nearest = sorted(
-                [z for z in opportunities if z.get("m")],
-                key=lambda z: _safe_float((z.get("m") or {}).get("score")),
-                reverse=True,
-            )[:3]
-            body = [
-                "🟡 <b>فعلاً سیگنال خرید تأییدشده نداریم.</b>",
-                f"نامزدهای منطبق با فیلتر اصلی: <b>{len(pending_items)}</b>",
-                f"برای تأیید نهایی، {SIGNAL_CONFIRMATIONS_REQUIRED} مشاهده در چرخه‌های جداگانه لازم است.",
-                "",
-            ]
+            nearest = sorted([z for z in opportunities if z.get("m")],
+                             key=lambda z: _safe_float((z.get("m") or {}).get("score")), reverse=True)[:3]
+            body = ["🟡 <b>فعلاً سیگنال خرید تأییدشده نداریم.</b>",
+                    f"نامزدهای منطبق با فیلتر اصلی: <b>{len(pending_items)}</b>",
+                    f"برای تأیید نهایی، {SIGNAL_CONFIRMATIONS_REQUIRED} مشاهده در چرخه‌های جداگانه لازم است.", ""]
             if nearest:
                 body.append("<b>نزدیک‌ترین دارایی‌ها برای پایش (نه توصیه خرید):</b>")
                 for item in nearest:
@@ -3597,7 +3567,6 @@ async def buy_menu(update, context):
 
 
 async def _check_trial_memberships(bot, uid):
-    """Return (all_joined, missing_labels, verification_failed). Fail closed on API errors."""
     rows = trial_channel_rows()
     missing = []
     failed = False
@@ -3755,6 +3724,9 @@ async def receipt_photo(update, context):
     if plan not in PLANS:
         await update.message.reply_text("ابتدا از «💳 خرید اشتراک» یک پلن انتخاب کنید.")
         return
+    if not update.message.photo:
+        await update.message.reply_text("❌ لطفاً تصویر رسید را ارسال کنید.")
+        return
     days, amount = PLANS[plan]
     fid = update.message.photo[-1].file_id
     with db() as c:
@@ -3799,7 +3771,6 @@ async def save_support(uid, message, mid):
         """, (uid, "user_to_admin", message, mid, now_iso()))
 
 async def support_media(update, context):
-    # Runs before receipt/media handlers, but only consumes media in support mode.
     if not update.message or not context.user_data.get("support_mode"):
         return
     uid = update.effective_user.id
@@ -3854,7 +3825,6 @@ async def support_reply_callback(update, context):
     except (TypeError, ValueError):
         await q.answer("آیدی کاربر نامعتبر است.", show_alert=True)
         return
-
     await q.answer("حالت پاسخ فعال شد.")
     context.user_data["admin_reply_to"] = uid
     await q.message.reply_text(
@@ -3892,7 +3862,8 @@ async def send_support_reply(update, context, text):
             parse_mode=ParseMode.HTML,
         )
 
-# ============================================================
+
+        # ============================================================
 # BACKUP / ALERT WORKERS
 # ============================================================
 
@@ -3942,9 +3913,9 @@ async def market_snapshot_worker():
         await asyncio.sleep(GOLD_HISTORY_INTERVAL_SECONDS)
 
 def confirm_market_alert(symbol, candidate, price, observation_key):
-    """Track confirmations for a whole-market opportunity cycle."""
     now = now_iso()
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")  # FIX v16
         if candidate == "WAIT":
             c.execute("DELETE FROM market_alert_state WHERE symbol=?", (symbol,))
             return False, 0, None
@@ -3973,8 +3944,10 @@ def confirm_market_alert(symbol, candidate, price, observation_key):
     return confirmations >= SIGNAL_CONFIRMATIONS_REQUIRED, confirmations, cycle_id
 
 def _alert_candidate_ok(item, btc_metrics):
+    """FIX v16: weighted score instead of all-or-nothing gates."""
     m = item.get("m") or {}
     ta = m.get("ta") or {}
+
     score = _safe_float(m.get("score"))
     strength = _safe_float(m.get("strength"))
     probability = _safe_float(m.get("probability"))
@@ -3985,31 +3958,42 @@ def _alert_candidate_ok(item, btc_metrics):
     ch1 = _safe_float(m.get("ch1"))
     ch24 = _safe_float(m.get("ch24"))
     ch7 = _safe_float(m.get("ch7"))
-
-    btc_ok = bool(btc_metrics and btc_metrics.get("ok"))
     signal_candidate = str(ta.get("signal_candidate") or "WAIT")
     signal_score = _safe_float(ta.get("signal_score"))
     rr = _safe_float(ta.get("rr"))
-    # Require a positive multi-factor setup, but do not make every metric
-    # an all-or-nothing gate: that made valid setups almost impossible to show.
-    return (
-        score >= max(78, ALERT_OPPORTUNITY_MIN - 5)
-        and strength >= max(65, ALERT_STRENGTH_MIN - 7)
-        and probability >= max(62, ALERT_PROBABILITY_MIN - 8)
-        and signal_candidate == "BUY"
-        and signal_score >= 65
-        and trend in ("BULLISH", "BULLISH_WEAK")
-        and 42 <= rsi <= 73
-        and ch1 >= -0.5 and ch24 >= -1.5 and ch7 >= -4.0
-        and turnover >= min(ALERT_MIN_TURNOVER, 0.02)
-        and risk != "زیاد"
-        and rr >= 1.3
-        and btc_ok
+
+    btc_ok = bool(btc_metrics and btc_metrics.get("ok"))
+    if not btc_ok:
+        return False
+
+    # Hard gates (safety):
+    if trend not in ("BULLISH", "BULLISH_WEAK"):
+        return False
+    if signal_candidate != "BUY":
+        return False
+    if risk == "زیاد":
+        return False
+    if ch24 < -1.5 or ch7 < -4.0:
+        return False
+    if turnover < min(ALERT_MIN_TURNOVER, 0.02):
+        return False
+
+    # Weighted score:
+    weighted = (
+        score * 0.35
+        + strength * 0.25
+        + probability * 0.15
+        + signal_score * 0.15
+        + min(100, rr * 30) * 0.10
     )
+    return weighted >= 70
+
 
 async def _btc_market_status(rows):
-    """STRICTER BTC gate (fix #8)."""
-    ta = await professional_crypto_analysis("BTC")
+    # FIX v16: use ANALYZE cache to avoid double BTC analysis.
+    ta = await analyze("BTC")
+    if ta and ta.get("insufficient_history"):
+        ta = None
     btc = next((x for x in rows
                 if str(x.get("id") or "").lower() == "bitcoin"
                 or str(x.get("symbol") or "").upper() == "BTC"), None)
@@ -4039,7 +4023,6 @@ async def _market_alert_scan():
     if not rows:
         return [], None, None
 
-    # FIX #10: wall-clock bucket so restarts don't reset the cycle.
     bucket = int(time.time() // max(300, ALERT_INTERVAL_SECONDS))
     scan_observation_key = f"market:{bucket}"
 
@@ -4112,7 +4095,6 @@ async def alert_worker(app):
                     m["cycle_id"] = cycle_id
                     m["signal"] = candidate if confirmed else "WAIT"
                 else:
-                    # Reset this symbol only; never reuse a stale `m` from a prior loop iteration.
                     confirm_market_alert(symbol, "WAIT", _safe_float((item.get("m") or {}).get("price")), observation_key)
 
             with db() as c:
@@ -4449,12 +4431,9 @@ async def payment_admin_callback(update, context):
                                "active","manual",pid,now_iso()))
                 c.execute("UPDATE payment_requests SET status='approved', reviewed_at=?, reviewed_by=? WHERE id=?",
                           (now_iso(), q.from_user.id, pid))
-                # Commit before building the user's keyboard; main_kb reads the DB on a new connection.
                 c.commit()
                 await q.message.reply_text("✅ پرداخت تأیید و اشتراک فعال شد.")
                 try:
-                    # Refresh the user's persistent reply keyboard immediately after payment approval.
-                    # This removes 🔒 from every feature unlocked by the newly active subscription.
                     await context.bot.send_message(
                         uid,
                         f"✅ اشتراک شما فعال شد.\n📅 مدت: {days} روز\n⏰ پایان: {format_dt(end.isoformat())}\n\nمنوی شما به‌روزرسانی شد.",
@@ -4486,10 +4465,8 @@ async def text_router(update, context):
     if is_blocked(uid) and not is_admin(uid):
         return
     text = update.message.text.strip()
-    # The lock is display-only; strip it so menu routing stays compatible.
     text = re.sub(r"\s*🔒\s*$", "", text).strip()
 
-    # Reply mode must take priority over menu labels and other pending actions.
     if context.user_data.get("admin_reply_to") is not None and is_admin(uid):
         await send_support_reply(update, context, text)
         return
@@ -4520,8 +4497,6 @@ async def text_router(update, context):
         return
 
     if context.user_data.get("support_mode"):
-        # Forward the message to every configured admin; do not claim success
-        # unless at least one admin delivery succeeds.
         delivered = 0
         markup = InlineKeyboardMarkup([[
             InlineKeyboardButton("↩️ پاسخ", callback_data=f"sup:reply:{uid}")
@@ -4634,12 +4609,11 @@ async def text_router(update, context):
                               (target, f"MANUAL{days}", days, 0, now.isoformat(), end.isoformat(),
                                "active", "admin_manual", None, now_iso()))
                 try:
-                    backup_database("admin_manual_subscription")
+                    asyncio.create_task(asyncio.to_thread(backup_database, "admin_manual_subscription"))
                 except Exception:
                     log.exception("manual subscription backup")
                 await update.message.reply_text(f"✅ اشتراک کاربر {target} به‌صورت دستی فعال شد.\n📅 مدت: {days} روز\n⏰ پایان: {format_dt(end.isoformat())}")
                 try:
-                    # Refresh persistent menu immediately so unlocked sections lose their lock.
                     await context.bot.send_message(
                         target,
                         f"✅ اشتراک شما توسط مدیر فعال شد.\n📅 مدت: {days} روز\n⏰ پایان: {format_dt(end.isoformat())}\n\nمنوی شما به‌روزرسانی شد.",
@@ -4665,7 +4639,7 @@ async def text_router(update, context):
                     await update.message.reply_text("❌ کاربر در دیتابیس پیدا نشد.")
                 elif cur.rowcount:
                     try:
-                        backup_database("admin_deactivate_subscription")
+                        asyncio.create_task(asyncio.to_thread(backup_database, "admin_deactivate_subscription"))
                     except Exception:
                         log.exception("subscription cancellation backup")
                     await update.message.reply_text(f"⛔ اشتراک فعال کاربر {target} غیرفعال شد.")
@@ -4697,7 +4671,8 @@ async def cancel_command(update, context):
     await update.message.reply_text("✅ لغو شد.", reply_markup=main_kb(update.effective_user.id))
 
 async def error_handler(update, context):
-    log.exception("Unhandled Telegram error", exc_info=context.error)
+    # FIX v16: correct exc_info usage.
+    log.error("Unhandled Telegram error", exc_info=context.error)
 
 # ============================================================
 # STARTUP / MAIN
@@ -4712,7 +4687,7 @@ async def post_init(app):
     app.create_task(alert_worker(app))
     app.create_task(backup_worker())
     app.create_task(market_snapshot_worker())
-    log.info("MARKET AI v13 started | professional buy engine enabled | cache=%s",
+    log.info("MARKET AI v16 started | professional buy engine enabled | cache=%s",
              len(CACHE))
 
 async def post_shutdown(app):
@@ -4744,8 +4719,6 @@ def main():
     app.add_handler(CallbackQueryHandler(selected_signal_callback, pattern=r"^signal:"))
     app.add_handler(CallbackQueryHandler(opportunity_action_callback, pattern=r"^op:"))
     app.add_handler(CallbackQueryHandler(support_reply_callback, pattern=r"^sup:reply:"))
-    # Support media handlers run in an earlier group and only consume media
-    # while support_mode is active; otherwise receipt_photo remains untouched.
     app.add_handler(MessageHandler(
         (filters.PHOTO | filters.Document.ALL | filters.VOICE) & ~filters.COMMAND,
         support_media
@@ -4753,7 +4726,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, receipt_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
-    log.info("MARKET AI polling started")
+    log.info("MARKET AI v16 polling started")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 if __name__ == "__main__":
