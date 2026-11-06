@@ -970,10 +970,14 @@ def _market_growth_score(x, ta=None):
     score += _clamp(ch30 * 0.12, -5, 5)
     turnover = vol / mcap
     score += _clamp((turnover - 0.05) * 80, -5, 8)
-    if ch24 > 25: score -= 7
-    if ch7 > 60: score -= 5
+    if ch24 > 6: score -= 10
+    if ch24 > 12: score -= 10
+    if ch7 > 18: score -= 10
+    if ch7 > 30: score -= 10
     if ch24 < -20 and ch7 < -20: score -= 8
     if ta:
+        if ta.get("late_move_risk") or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20:
+            score -= 22
         score += _clamp((ta.get("strength",50)-50)*0.18, -8, 8)
         if ta.get("trend") in ("BULLISH", "BULLISH_WEAK"): score += 5
         if ta.get("rsi",50) > 75: score -= 5
@@ -1012,6 +1016,12 @@ async def growth_scan():
             continue
         x, ta = item
         if not ta:
+            continue
+        if (ta.get("late_move_risk")
+                or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20
+                or _safe_float(ta.get("rsi"), 50) >= 68
+                or _safe_float(x.get("price_change_percentage_24h_in_currency")) > 6
+                or _safe_float(x.get("price_change_percentage_7d_in_currency")) > 18):
             continue
         score = _market_growth_score(x, ta) or 50.0
         out.append({
@@ -1768,9 +1778,12 @@ def _tf_decision(symbol, df, timeframe):
     elif divergence == "BEARISH":
         bear += 6; rs.append("واگرایی منفی RSI")
 
-    extension = (current - e21) / atr if atr else 0
-    if extension > 2.0:
-        bull -= 9; rb.append("قیمت از EMA21 بیش از حد کشیده شده")
+    extension = (current - e21) / atr if atr else 99.0
+    prev_close = float(c.iloc[-2]) if len(c) >= 2 else current
+    prev_e21 = _safe_float(z["ema21"].iloc[-2], e21) if len(z["ema21"]) >= 2 else e21
+    prev_extension = (prev_close - prev_e21) / atr if atr else 99.0
+    if extension > 1.35:
+        bull -= 12; rb.append("قیمت از EMA21 فاصله گرفته؛ ورود تعقیبی پرریسک است")
     if extension < -2.0:
         bear -= 9; rs.append("قیمت از EMA21 بیش از حد نزولی کشیده شده")
 
@@ -1799,30 +1812,44 @@ def _tf_decision(symbol, df, timeframe):
     # Early-entry detector: prefer the first controlled pullback/turn before
     # a fully mature trend. This is deliberately separate from a late breakout.
     # It requires improving momentum, a non-bearish structure and price near EMA21.
-    ema21_distance_atr = (current - e21) / atr if atr > 0 else 99.0
-    early_entry = (
-        trend in ("BULLISH", "BULLISH_WEAK", "NEUTRAL")
-        and structure["structure"] != "BEARISH"
-        and (e9 >= e21 * 0.998 or current >= e21)
-        and current >= e21 - 0.35 * atr
-        and current <= e21 + 0.90 * atr
-        and 44 <= rsi <= 62
-        and hist > prev_hist
-        and (dip >= dim * 0.90 or stoch_k > stoch_d)
-        and adx >= 12
-        and vol_ratio >= 0.75
-        and ema21_distance_atr <= 0.90
-        and not fakeout_risk
+    ema21_distance_atr = extension
+    # EARLY means a controlled first reclaim/pullback near EMA21, not an already
+    # extended green candle. Requiring the previous close near/below EMA21
+    # prevents a mature rally from being relabelled as an early entry.
+    reclaim_or_pullback = (
+        (-0.35 <= ema21_distance_atr <= 0.75)
+        and (prev_extension <= 0.45 or (prev_close <= prev_e21 and current > e21))
     )
-    # Avoid buying after an already extended impulse, even if the trend is strong.
-    late_move_risk = ema21_distance_atr > 1.60 or rsi >= 72
+    early_entry = (
+        timeframe in ("15m", "1H", "4H")
+        and trend in ("BULLISH", "BULLISH_WEAK", "NEUTRAL")
+        and structure["structure"] != "BEARISH"
+        and e9 >= e21 * 0.995
+        and reclaim_or_pullback
+        and 45 <= rsi <= 62
+        and hist > prev_hist
+        and (dip >= dim * 0.95 or stoch_k > stoch_d)
+        and adx >= 12
+        and vol_ratio >= 0.85
+        and not fakeout_risk
+        and not breakout_up
+    )
+    # Hard anti-chasing: reject stretched price, overbought RSI, or an impulse
+    # candle that has already travelled too far from its short-term mean.
+    late_move_risk = (
+        ema21_distance_atr > 1.25
+        or rsi >= 68
+        or roc5 >= 5.0
+        or (breakout_up and not breakout_confirmed)
+    )
     standard_buy_ok = (
         bull >= 65 and edge >= 22 and
         trend == "BULLISH" and
         structure["structure"] == "BULLISH" and
-        45 < rsi < 68 and
+        45 < rsi < 66 and
         adx >= ADX_MIN_TREND and
         vol_ratio >= 1.10 and
+        ema21_distance_atr <= 1.20 and
         not fakeout_risk and not late_move_risk
     )
     buy_ok = standard_buy_ok or (early_entry and bull >= 38 and edge >= 8)
@@ -1873,7 +1900,9 @@ def _tf_decision(symbol, df, timeframe):
         "early_entry": bool(early_entry),
         "entry_stage": "EARLY" if (buy_ok and early_entry and not standard_buy_ok) else "CONFIRMED" if buy_ok else "WAIT",
         "ema21_distance_atr": ema21_distance_atr,
+        "prev_ema21_distance_atr": prev_extension,
         "late_move_risk": bool(late_move_risk),
+        "roc5": roc5, "roc20": roc20,
         "buy_score": bull, "sell_score": bear,
         "signal_candidate": candidate, "signal_score": signal_score,
         "strength": strength,
@@ -2248,6 +2277,20 @@ async def professional_crypto_analysis(symbol):
         or trend1w == "BULLISH" or bearish_trend_weight < 0.55
     )
 
+    entry_tfs = [tfs[k] for k in ("15m", "1H", "4H") if k in tfs]
+    early_tfs = [v for v in entry_tfs if v.get("early_entry")]
+    late_tfs = [v for v in entry_tfs if v.get("late_move_risk")]
+    aggregate_late_risk = bool(late_tfs) or any(
+        _safe_float(v.get("ema21_distance_atr"), 99) > 1.25
+        or _safe_float(v.get("rsi"), 50) >= 68
+        for v in entry_tfs
+    )
+    aggregate_early_entry = len(early_tfs) >= 2 and not aggregate_late_risk
+    aggregate_extension = max(
+        (_safe_float(v.get("ema21_distance_atr"), 99) for v in entry_tfs),
+        default=_safe_float(main.get("ema21_distance_atr"), 99),
+    )
+
     candidate = "WAIT"
     mature_buy = bull >= 65 and edge >= 22 and buy_agreement >= 0.55 and not mature_buy_veto
     early_buy = (
@@ -2256,7 +2299,7 @@ async def professional_crypto_analysis(symbol):
         and buy_agreement >= 0.20
         and not early_buy_veto
     )
-    if mature_buy or early_buy:
+    if (mature_buy or early_buy) and not aggregate_late_risk:
         candidate = "BUY"
     elif bear >= 65 and edge <= -22 and sell_agreement >= 0.55 and not sell_veto:
         candidate = "SELL"
@@ -2287,6 +2330,7 @@ async def professional_crypto_analysis(symbol):
         reasons = ["شرایط هم‌زمان روند، ساختار و تأیید چندتایم‌فریمی برای ورود کافی نیست"]
 
     out = dict(main)
+    # The aggregate execution-timeframe flags above are also surfaced for the UI.
     out.update({
         "symbol": norm_symbol(symbol),
         "signal_candidate": candidate,
@@ -2302,8 +2346,12 @@ async def professional_crypto_analysis(symbol):
         "bear_weight": bear,
         "buy_agreement": buy_agreement * 100,
         "sell_agreement": sell_agreement * 100,
-        "early_entry": bool(candidate == "BUY" and early_buy and not mature_buy),
-        "entry_stage": "EARLY" if candidate == "BUY" and early_buy and not mature_buy else "CONFIRMED" if candidate == "BUY" else "WAIT",
+        "early_entry": bool(candidate == "BUY" and early_buy and not mature_buy and aggregate_early_entry),
+        "entry_stage": "EARLY" if candidate == "BUY" and early_buy and not mature_buy and aggregate_early_entry else "CONFIRMED" if candidate == "BUY" and not aggregate_late_risk else "WAIT",
+        "late_move_risk": aggregate_late_risk,
+        "ema21_distance_atr": aggregate_extension,
+        "early_timeframes": len(early_tfs),
+        "execution_timeframes": len(entry_tfs),
         "early_buy_weight": early_buy_weight * 100,
         "data_source": "OKX OHLCV professional multi-timeframe",
         "history_points": sum(v["history_points"] for v in tfs.values()),
@@ -2732,8 +2780,8 @@ def _short_term_scan_metrics(x, ta):
         if e9 > e21 > e50: score += 3; reasons.append("چیدمان EMA صعودی")
         if ta.get("early_entry"):
             score += 8; reasons.append("ورود زودهنگام نزدیک EMA21؛ پیش از کشیدگی قیمت")
-        if ta.get("late_move_risk"):
-            score -= 12; reasons.append("قیمت از نقطه ورود مناسب فاصله گرفته؛ تعقیب نکن")
+        if ta.get("late_move_risk") or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20:
+            score -= 22; reasons.append("حرکت از نقطه ورود مناسب عبور کرده؛ خرید تعقیبی ممنوع")
 
     if 0.5 <= volatility <= 3.0:
         score += 4; reasons.append("نوسان مناسب برای معاملات کوتاه‌مدت")
@@ -2810,6 +2858,7 @@ def _alert_candidate_ok(item, btc_metrics):
     trend = ta.get("trend")
     turnover = _safe_float(m.get("turnover"))
     risk = m.get("risk")
+    ch1 = _safe_float(m.get("ch1"))
     ch24 = _safe_float(m.get("ch24"))
     ch7 = _safe_float(m.get("ch7"))
     signal_candidate = str(ta.get("signal_candidate") or "WAIT")
@@ -2859,7 +2908,10 @@ def _alert_candidate_ok(item, btc_metrics):
     if ch24 < -1.5 or ch7 < -4.0:
         return False
     # Hard anti-chasing guard: do not issue a fresh buy after a vertical move.
-    if ch24 > 10 or ch7 > 35 or ta.get("late_move_risk"):
+    if (ch24 > 6.0 or ch7 > 18.0 or ch1 > 3.0
+            or ta.get("late_move_risk")
+            or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20
+            or rsi >= 68):
         return False
     if turnover < max(0.02, MIN_TURNOVER_SIGNAL):
         return False
@@ -2902,14 +2954,22 @@ async def _market_alert_scan():
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
         turnover = volume / mcap
         # Rank for early formation, not coins that have already pumped.
-        rough_score = 50 + _clamp(ch1 * 0.80, -5, 5) + _clamp(ch24 * 0.12, -4, 4) + _clamp(ch7 * 0.05, -3, 3)
-        rough_score += _clamp((turnover - .05) * 70, -7, 9)
-        if ch24 > 8: rough_score -= 4
-        if ch24 > 15: rough_score -= 5
-        if ch7 > 25: rough_score -= 5
-        if ch7 > 40: rough_score -= 5
-        if ch24 < -10: rough_score -= 3
-        if ch7 < -30: rough_score -= 3
+        # Seek the first acceleration phase: modest positive 1h momentum while
+        # 24h/7d performance is still contained. Do not let a large turnover
+        # score promote a coin that has already made its move.
+        rough_score = 50 + _clamp(ch1 * 1.10, -4, 4)
+        rough_score += _clamp(ch24 * 0.10, -3, 3) + _clamp(ch7 * 0.035, -3, 3)
+        rough_score += _clamp((turnover - .05) * 45, -5, 6)
+        if 0.15 <= ch1 <= 2.5: rough_score += 4
+        if -2.0 <= ch24 <= 4.5: rough_score += 4
+        if -5.0 <= ch7 <= 12.0: rough_score += 4
+        if ch1 > 3.0: rough_score -= 10
+        if ch24 > 6.0: rough_score -= 14
+        if ch24 > 10.0: rough_score -= 10
+        if ch7 > 18.0: rough_score -= 12
+        if ch7 > 30.0: rough_score -= 10
+        if ch24 < -12.0: rough_score -= 5
+        if ch7 < -25.0: rough_score -= 5
         rough.append((rough_score, x))
 
     rough.sort(key=lambda z: z[0], reverse=True)
@@ -3892,14 +3952,18 @@ async def short_term_growth_scan():
         turnover = volume / mcap
         # Prefer quiet accumulation / first momentum, penalize late vertical moves.
         ch1 = _safe_float(x.get("price_change_percentage_1h_in_currency"))
-        rough_score = 50 + _clamp(ch1 * 0.80, -5, 5) + _clamp(ch24 * 0.12, -4, 4) + _clamp(ch7 * 0.05, -3, 3)
-        rough_score += _clamp((turnover - .05) * 70, -7, 9)
-        if ch24 > 8: rough_score -= 4
-        if ch24 > 15: rough_score -= 5
-        if ch7 > 25: rough_score -= 5
-        if ch7 > 40: rough_score -= 5
-        if ch24 < -10: rough_score -= 3
-        if ch7 < -30: rough_score -= 3
+        rough_score = 50 + _clamp(ch1 * 1.10, -4, 4) + _clamp(ch24 * 0.10, -3, 3) + _clamp(ch7 * 0.035, -3, 3)
+        rough_score += _clamp((turnover - .05) * 45, -5, 6)
+        if 0.15 <= ch1 <= 2.5: rough_score += 4
+        if -2.0 <= ch24 <= 4.5: rough_score += 4
+        if -5.0 <= ch7 <= 12.0: rough_score += 4
+        if ch1 > 3.0: rough_score -= 10
+        if ch24 > 6.0: rough_score -= 14
+        if ch24 > 10.0: rough_score -= 10
+        if ch7 > 18.0: rough_score -= 12
+        if ch7 > 30.0: rough_score -= 10
+        if ch24 < -12.0: rough_score -= 5
+        if ch7 < -25.0: rough_score -= 5
         rough.append((rough_score, x))
 
     rough.sort(key=lambda z: z[0], reverse=True)
@@ -3922,6 +3986,12 @@ async def short_term_growth_scan():
             continue
         m = _short_term_scan_metrics(x, ta)
         if not m:
+            continue
+        if (ta.get("late_move_risk")
+                or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20
+                or _safe_float(ta.get("rsi"), 50) >= 68
+                or _safe_float(x.get("price_change_percentage_24h_in_currency")) > 6
+                or _safe_float(x.get("price_change_percentage_7d_in_currency")) > 18):
             continue
         result.append({
             "id": x.get("id"), "symbol": norm_symbol(x.get("symbol") or ""),
@@ -4037,6 +4107,7 @@ def _buy_opportunity_text(item):
         f"🟢 <b>{'ورود زودهنگام' if ta.get('entry_stage') == 'EARLY' or ta.get('early_entry') else 'فرصت خرید تأییدشده'}</b> | 🔁 {confirmations}/{SIGNAL_CONFIRMATIONS_REQUIRED}\n"
         f"💎 فرصت: <b>{_safe_float(m.get('score')):.0f}%</b> | 💪 تکنیکال: <b>{_safe_float(m.get('strength')):.0f}%</b> | 🧠 مدل: <b>{_safe_float(m.get('probability')):.0f}%</b>\n"
         f"📈 روند: <b>{trend_fa}</b> | RSI: <b>{_safe_float(ta.get('rsi')):.1f}</b> | ADX: <b>{_safe_float(ta.get('adx')):.1f}</b>\n"
+        f"🎯 فاصله از EMA21: <b>{_safe_float(ta.get('ema21_distance_atr')):.2f} ATR</b> | تایم‌فریم‌های ورود زودهنگام: <b>{int(ta.get('early_timeframes', 0))}/{int(ta.get('execution_timeframes', 0))}</b>\n"
         f"📊 مومنتوم: 1H {_safe_float(m.get('ch1')):+.2f}% | 24H {_safe_float(m.get('ch24')):+.2f}% | 7D {_safe_float(m.get('ch7')):+.2f}%\n"
         f"💰 قیمت: <b>{_format_price(symbol, _safe_float(m.get('price')))}</b>\n"
         f"🛑 SL: <b>{_format_price(symbol, _safe_float(ta.get('stop')))}</b> | 🎯 TP1: <b>{_format_price(symbol, _safe_float((ta.get('targets') or [0])[0]))}</b>\n"
@@ -4088,7 +4159,9 @@ async def _cycle_bottom_and_growth_scan(rows=None):
 
     bottom_pool = [x for x in liquid if x["_ath_drop"] <= -45 and x["_ch200"] < 0]
     bottom_pool.sort(key=lambda x: x["_bottom_score"], reverse=True)
-    growth_pool = [x for x in liquid if _safe_float(x.get("price_change_percentage_7d_in_currency")) > 0]
+    growth_pool = [x for x in liquid
+                   if 0 < _safe_float(x.get("price_change_percentage_7d_in_currency")) <= 18
+                   and _safe_float(x.get("price_change_percentage_24h_in_currency")) <= 6]
     growth_pool.sort(key=lambda x: x["_growth_score"], reverse=True)
     chosen = []
     seen = set()
@@ -4115,11 +4188,16 @@ async def _cycle_bottom_and_growth_scan(rows=None):
         trend = str(ta.get("trend") or "NEUTRAL")
         rsi = _safe_float(ta.get("rsi"), 50)
         signal = str(ta.get("signal_candidate") or "WAIT")
+        late_entry = (bool(ta.get("late_move_risk"))
+                      or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20
+                      or rsi >= 68)
+        if late_entry:
+            continue
         if lane == "bottom":
-            if trend not in ("BULLISH", "BULLISH_WEAK") or not (32 <= rsi <= 68):
+            if trend not in ("BULLISH", "BULLISH_WEAK") or not (32 <= rsi <= 64):
                 continue
         else:
-            if trend not in ("BULLISH", "BULLISH_WEAK") or rsi > 75:
+            if trend not in ("BULLISH", "BULLISH_WEAK") or not (42 <= rsi <= 64):
                 continue
         out[lane].append({"symbol": norm_symbol(x.get("symbol") or ""),
                           "name": x.get("name") or norm_symbol(x.get("symbol") or ""),
