@@ -781,19 +781,30 @@ def norm_symbol(value):
         "01234567890123456789"
     ))
     value = value.replace(" ", "").replace("‌", "").replace("_", "")
+    # Accept common exchange notation such as BTC/USDT, BTC-USDT and BTCUSDT.
+    value = value.replace("\\", "/")
+    if "/" in value:
+        left, right = value.split("/", 1)
+        if right in {"USDT", "USDC", "USD", "BTC", "ETH"}:
+            value = left
+    elif "-" in value:
+        left, right = value.rsplit("-", 1)
+        if right in {"USDT", "USDC", "USD", "BTC", "ETH"}:
+            value = left
     aliases = {
         "GOLD":"XAU","GOLDUSD":"XAU","XAUUSD":"XAU","XAU/USD":"XAU",
         "XAU/USDT":"XAU","XAUUSDT":"XAU","طلا":"XAU","طلایجهانی":"XAU",
         "GERAM18":"GOLD18","GERAM18K":"GOLD18","18K":"GOLD18",
         "GOLD18K":"GOLD18","IRANGOLD":"GOLD18","طلای18":"GOLD18",
-        "طلای۱۸":"GOLD18","طلای۱۸عیار":"GOLD18","طلایداخلی":"GOLD18",
+        "طلای۱۸":"GOLD18","طلای۱۸عیار":"GOLD18",
+        "طلای18":"GOLD18","طلای18عیار":"GOLD18","طلایداخلی":"GOLD18",
     }
     if value in aliases:
         return aliases[value]
-    for suffix in ("USDT", "USD"):
+    for suffix in ("USDT", "USDC", "USD"):
         if value.endswith(suffix) and len(value) > len(suffix):
             base = value[:-len(suffix)].replace("/", "").replace("-", "")
-            if base in COINS:
+            if base.isalnum():
                 return base
     return value
 
@@ -802,24 +813,70 @@ def asset_type(symbol):
     return "gold" if s == "XAU" else "gold18" if s == "GOLD18" else "crypto"
 
 async def crypto_search(query):
-    query = (query or "").strip()
-    direct = norm_symbol(query)
+    raw = (query or "").strip()
+    if not raw:
+        return []
+    direct = norm_symbol(raw)
     if direct in COINS:
         return [(direct, COINS[direct], direct)]
-    data = await http_json(
-        "https://api.coingecko.com/api/v3/search",
-        {"query": query}, ttl=60
-    )
-    out, seen = [], set()
-    for coin in (data or {}).get("coins", [])[:20]:
-        s = norm_symbol(coin.get("symbol") or "")
-        cid = coin.get("id")
-        name = coin.get("name") or s
-        if not s or not cid or (s, cid) in seen:
-            continue
-        seen.add((s, cid))
-        out.append((s, cid, name))
-    return out
+
+    # Search both the user's original text and its normalized ticker/name form.
+    # This covers common pairs (e.g. PEPE/USDT) and avoids depending on one query.
+    terms = []
+    for term in (raw, direct, raw.replace("/", " ").replace("-", " ")):
+        term = term.strip()
+        if term and term.casefold() not in {x.casefold() for x in terms}:
+            terms.append(term)
+
+    found, seen = [], set()
+    for term in terms[:3]:
+        data = await http_json(
+            "https://api.coingecko.com/api/v3/search",
+            {"query": term}, ttl=60, retries=2
+        )
+        for coin in (data or {}).get("coins", [])[:30]:
+            sym = norm_symbol(coin.get("symbol") or "")
+            cid = str(coin.get("id") or "").strip()
+            name = str(coin.get("name") or sym).strip()
+            if not sym or not cid or cid in seen:
+                continue
+            seen.add(cid)
+            found.append({
+                "symbol": sym, "id": cid, "name": name,
+                "rank": int(coin.get("market_cap_rank") or 10**9),
+                "exact_symbol": sym.casefold() == direct.casefold(),
+                "exact_name": name.casefold() == raw.casefold(),
+            })
+        # Avoid needless extra requests if we already have exact ticker matches.
+        if any(x["exact_symbol"] for x in found):
+            break
+
+    # The search endpoint can occasionally return no rows (or be throttled).
+    # Fall back to the cached public coin directory for exact ticker/name matches.
+    if not found:
+        directory = await http_json(
+            "https://api.coingecko.com/api/v3/coins/list",
+            {"include_platform": "false"}, ttl=21600, retries=2
+        )
+        query_symbol = direct.casefold()
+        query_name = raw.casefold().strip()
+        fallback = []
+        for coin in directory or []:
+            sym = norm_symbol(coin.get("symbol") or "")
+            cid = str(coin.get("id") or "").strip()
+            name = str(coin.get("name") or sym).strip()
+            if not sym or not cid:
+                continue
+            if sym.casefold() == query_symbol or name.casefold() == query_name or cid.casefold() == query_name:
+                fallback.append((sym, cid, name))
+        # Exact symbol matches first; keep multiple same-ticker assets selectable.
+        fallback.sort(key=lambda x: (x[0].casefold() != query_symbol, x[2].casefold()))
+        return fallback[:20]
+
+    found.sort(key=lambda x: (
+        not x["exact_symbol"], not x["exact_name"], x["rank"], x["name"].casefold()
+    ))
+    return [(x["symbol"], x["id"], x["name"]) for x in found[:20]]
 
 async def crypto_data(symbol, coin_id=None):
     s = norm_symbol(symbol)
@@ -832,7 +889,7 @@ async def crypto_data(symbol, coin_id=None):
 
     data = await http_json(
         f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart",
-        {"vs_currency":"usd","days":"2","interval":"hourly"},
+        {"vs_currency":"usd","days":"7","interval":"hourly"},
         ttl=CACHE_SECONDS
     )
     if not data or not data.get("prices"):
@@ -1351,13 +1408,13 @@ async def xau_data():
         history = history if len(history) else pd.Series([price], dtype=float)
     return "XAU", history, pd.Series(dtype=float)
 
-async def asset_data(symbol):
+async def asset_data(symbol, coin_id=None):
     s = norm_symbol(symbol)
     if s == "XAU":
         return await xau_data()
     if s == "GOLD18":
         return await gold18_data()
-    return await crypto_data(s)
+    return await crypto_data(s, coin_id=coin_id)
 
 async def current_price(symbol, coin_id=None):
     s = norm_symbol(symbol)
@@ -1739,15 +1796,36 @@ def _tf_decision(symbol, df, timeframe):
     strength = _clamp(45 + max(bull, bear) * 0.70 + (8 if adx >= 25 else 0))
     signal_score = _clamp(50 + abs(edge) * 1.15)
 
-    buy_ok = (
+    # Early-entry detector: prefer the first controlled pullback/turn before
+    # a fully mature trend. This is deliberately separate from a late breakout.
+    # It requires improving momentum, a non-bearish structure and price near EMA21.
+    ema21_distance_atr = (current - e21) / atr if atr > 0 else 99.0
+    early_entry = (
+        trend in ("BULLISH", "BULLISH_WEAK", "NEUTRAL")
+        and structure["structure"] != "BEARISH"
+        and (e9 >= e21 * 0.998 or current >= e21)
+        and current >= e21 - 0.35 * atr
+        and current <= e21 + 0.90 * atr
+        and 44 <= rsi <= 62
+        and hist > prev_hist
+        and (dip >= dim * 0.90 or stoch_k > stoch_d)
+        and adx >= 12
+        and vol_ratio >= 0.75
+        and ema21_distance_atr <= 0.90
+        and not fakeout_risk
+    )
+    # Avoid buying after an already extended impulse, even if the trend is strong.
+    late_move_risk = ema21_distance_atr > 1.60 or rsi >= 72
+    standard_buy_ok = (
         bull >= 65 and edge >= 22 and
         trend == "BULLISH" and
         structure["structure"] == "BULLISH" and
         45 < rsi < 68 and
         adx >= ADX_MIN_TREND and
         vol_ratio >= 1.10 and
-        not fakeout_risk
+        not fakeout_risk and not late_move_risk
     )
+    buy_ok = standard_buy_ok or (early_entry and bull >= 38 and edge >= 8)
     sell_ok = (
         bear >= 65 and edge <= -22 and
         trend == "BEARISH" and
@@ -1792,6 +1870,10 @@ def _tf_decision(symbol, df, timeframe):
         "bos_up": structure["bos_up"], "bos_down": structure["bos_down"],
         "divergence": divergence, "breakout_confirmed": breakout_confirmed,
         "fakeout_risk": fakeout_risk,
+        "early_entry": bool(early_entry),
+        "entry_stage": "EARLY" if (buy_ok and early_entry and not standard_buy_ok) else "CONFIRMED" if buy_ok else "WAIT",
+        "ema21_distance_atr": ema21_distance_atr,
+        "late_move_risk": bool(late_move_risk),
         "buy_score": bull, "sell_score": bear,
         "signal_candidate": candidate, "signal_score": signal_score,
         "strength": strength,
@@ -2142,11 +2224,24 @@ async def professional_crypto_analysis(symbol):
     trend1w = tfs.get("1W", main).get("trend")
     structure1d = tfs.get("1D", main).get("structure")
 
-    buy_veto = (
+    early_buy_weight = sum(
+        weights[k] for k in tfs
+        if tfs[k].get("early_entry") and k in ("15m", "1H", "4H")
+    )
+    # Mature setups need full 4H structure confirmation. Early setups may pass
+    # while 4H structure is forming, but daily/weekly bearish regimes still veto.
+    early_buy_veto = (
+        trend4 == "BEARISH" or structure4 == "BEARISH"
+        or trend1d == "BEARISH" or structure1d == "BEARISH"
+        or trend1w == "BEARISH"
+        or bullish_trend_weight < 0.30
+    )
+    mature_buy_veto = (
         trend4 != "BULLISH" or structure4 != "BULLISH"
         or trend1d == "BEARISH" or structure1d == "BEARISH"
         or trend1w == "BEARISH" or bullish_trend_weight < 0.55
     )
+    buy_veto = mature_buy_veto and (early_buy_weight < 0.25 or early_buy_veto)
     sell_veto = (
         trend4 != "BEARISH" or structure4 != "BEARISH"
         or trend1d == "BULLISH" or structure1d == "BULLISH"
@@ -2154,7 +2249,14 @@ async def professional_crypto_analysis(symbol):
     )
 
     candidate = "WAIT"
-    if bull >= 65 and edge >= 22 and buy_agreement >= 0.55 and not buy_veto:
+    mature_buy = bull >= 65 and edge >= 22 and buy_agreement >= 0.55 and not mature_buy_veto
+    early_buy = (
+        bull >= 48 and edge >= 12
+        and early_buy_weight >= 0.25
+        and buy_agreement >= 0.20
+        and not early_buy_veto
+    )
+    if mature_buy or early_buy:
         candidate = "BUY"
     elif bear >= 65 and edge <= -22 and sell_agreement >= 0.55 and not sell_veto:
         candidate = "SELL"
@@ -2200,6 +2302,9 @@ async def professional_crypto_analysis(symbol):
         "bear_weight": bear,
         "buy_agreement": buy_agreement * 100,
         "sell_agreement": sell_agreement * 100,
+        "early_entry": bool(candidate == "BUY" and early_buy and not mature_buy),
+        "entry_stage": "EARLY" if candidate == "BUY" and early_buy and not mature_buy else "CONFIRMED" if candidate == "BUY" else "WAIT",
+        "early_buy_weight": early_buy_weight * 100,
         "data_source": "OKX OHLCV professional multi-timeframe",
         "history_points": sum(v["history_points"] for v in tfs.values()),
     })
@@ -2321,14 +2426,18 @@ async def crypto_market_context(symbol):
         log.exception("market context parse failed: %s", sym)
         return None
 
-async def analyze(symbol):
+async def analyze(symbol, coin_id=None):
     s = norm_symbol(symbol)
-    cache_key_a = ("analyze", s)
+    cache_key_a = ("analyze", s, coin_id or COINS.get(s) or s)
     cached = ANALYSIS_CACHE.get(cache_key_a, ANALYSIS_CACHE_SECONDS)
     if cached is not None:
         return cached
 
-    if s not in ("GOLD18", "XAU"):
+    # OKX symbols are not a universal asset directory. For a CoinGecko result
+    # whose id differs from the built-in mapping, use that exact id's history
+    # instead of silently analyzing a different token with the same ticker.
+    use_okx = (not coin_id) or (coin_id == COINS.get(s))
+    if s not in ("GOLD18", "XAU") and use_okx:
         result = await professional_crypto_analysis(s)
         if result:
             confirmed_signal, confirmed, confirmations = confirm_signal(
@@ -2345,7 +2454,7 @@ async def analyze(symbol):
             ANALYSIS_CACHE.set(cache_key_a, result)
             return result
 
-    data = await asset_data(s)
+    data = await asset_data(s, coin_id=coin_id)
     if not data:
         return None
     if s in ("GOLD18", "XAU") and len(data[1]) < GOLD_MIN_HISTORY_POINTS:
@@ -2573,10 +2682,14 @@ def _short_term_scan_metrics(x, ta):
     score += _clamp(ch14 * 0.15, -4, 4)
     if ch1 > 0 and ch24 > 0 and ch7 > 0:
         score += 5; reasons.append("مومنتوم چندبازه‌ای مثبت")
-    if ch24 > 20:
-        score -= 8; reasons.append("رشد ۲۴ساعته شدید؛ ریسک تعقیب قیمت")
-    if ch7 > 60:
-        score -= 6; reasons.append("رشد ۷روزه شدید؛ احتمال اشباع کوتاه‌مدت")
+    if ch24 > 10:
+        score -= 10; reasons.append("رشد ۲۴ساعته زیاد؛ احتمال ورود دیرهنگام")
+    elif ch24 > 6:
+        score -= 5; reasons.append("حرکت روزانه تا حدی انجام شده؛ ورود روی پولبک بهتر است")
+    if ch7 > 35:
+        score -= 10; reasons.append("رشد ۷روزه زیاد؛ ریسک تعقیب موج")
+    elif ch7 > 20:
+        score -= 5; reasons.append("بخش قابل‌توجهی از حرکت هفتگی انجام شده")
     if turnover >= 0.25:
         score += 8; reasons.append("نقدشوندگی و گردش معاملات بالا")
     elif turnover >= 0.10:
@@ -2603,9 +2716,9 @@ def _short_term_scan_metrics(x, ta):
         e21 = _safe_float(ta.get("ema21"))
         e50 = _safe_float(ta.get("ema50"))
         if trend == "BULLISH":
-            score += 10; reasons.append("EMA و روند صعودی تأییدشده")
+            score += 7; reasons.append("روند صعودی تأییدشده")
         elif trend == "BULLISH_WEAK":
-            score += 5; reasons.append("روند صعودی در حال شکل‌گیری")
+            score += 7; reasons.append("روند صعودی در حال شکل‌گیری")
         elif trend in ("BEARISH", "BEARISH_WEAK"):
             score -= 8; reasons.append("روند نزولی")
         if 52 <= rsi <= 68:
@@ -2616,7 +2729,11 @@ def _short_term_scan_metrics(x, ta):
             score -= 3
         if mhist > 0: score += 5; reasons.append("MACD مثبت")
         if adx >= 25: score += 4; reasons.append("قدرت روند مناسب")
-        if e9 > e21 > e50: score += 5; reasons.append("چیدمان EMA صعودی")
+        if e9 > e21 > e50: score += 3; reasons.append("چیدمان EMA صعودی")
+        if ta.get("early_entry"):
+            score += 8; reasons.append("ورود زودهنگام نزدیک EMA21؛ پیش از کشیدگی قیمت")
+        if ta.get("late_move_risk"):
+            score -= 12; reasons.append("قیمت از نقطه ورود مناسب فاصله گرفته؛ تعقیب نکن")
 
     if 0.5 <= volatility <= 3.0:
         score += 4; reasons.append("نوسان مناسب برای معاملات کوتاه‌مدت")
@@ -2703,30 +2820,50 @@ def _alert_candidate_ok(item, btc_metrics):
     # BTC is retained as macro context, but must not veto an otherwise valid
     # asset-specific setup. Each asset passes its own trend/structure/risk gates.
     rsi = _safe_float(ta.get("rsi"), 50)
-    if score < ALERT_OPPORTUNITY_MIN:
-        return False
-    if strength < ALERT_STRENGTH_MIN:
-        return False
-    if probability < ALERT_PROBABILITY_MIN:
-        return False
-    if not (ALERT_RSI_MIN <= rsi <= ALERT_RSI_MAX):
-        return False
+    early_entry = bool(ta.get("early_entry"))
+    if early_entry:
+        if score < min(ALERT_OPPORTUNITY_MIN, 76):
+            return False
+        if strength < min(ALERT_STRENGTH_MIN, 58):
+            return False
+        if probability < min(ALERT_PROBABILITY_MIN, 58):
+            return False
+        if not (43 <= rsi <= 63):
+            return False
+    else:
+        if score < ALERT_OPPORTUNITY_MIN:
+            return False
+        if strength < ALERT_STRENGTH_MIN:
+            return False
+        if probability < ALERT_PROBABILITY_MIN:
+            return False
+        if not (ALERT_RSI_MIN <= rsi <= ALERT_RSI_MAX):
+            return False
     if turnover < ALERT_MIN_TURNOVER:
         return False
 
-    if trend != "BULLISH":
-        return False
-    if ta.get("structure") != "BULLISH":
-        return False
     if signal_candidate != "BUY":
         return False
+    if early_entry:
+        if trend not in ("BULLISH", "BULLISH_WEAK", "NEUTRAL"):
+            return False
+        if ta.get("structure") == "BEARISH":
+            return False
+        if _safe_float(ta.get("ema21_distance_atr"), 99) > 0.90:
+            return False
+    else:
+        if trend != "BULLISH" or ta.get("structure") != "BULLISH":
+            return False
     if risk == "زیاد":
         return False
     if ch24 < -1.5 or ch7 < -4.0:
         return False
+    # Hard anti-chasing guard: do not issue a fresh buy after a vertical move.
+    if ch24 > 10 or ch7 > 35 or ta.get("late_move_risk"):
+        return False
     if turnover < max(0.02, MIN_TURNOVER_SIGNAL):
         return False
-    if adx < ADX_MIN_TREND:
+    if adx < (12 if early_entry else ADX_MIN_TREND):
         return False
     if rr < MIN_RR_RATIO:
         return False
@@ -2738,9 +2875,9 @@ def _alert_candidate_ok(item, btc_metrics):
         + signal_score * 0.15
         + min(100, rr * 30) * 0.10
     )
-    if weighted < 72:
+    if weighted < (64 if early_entry else 72):
         return False
-    if signal_score < 60:
+    if signal_score < (54 if early_entry else 60):
         return False
     return True
 
@@ -2764,10 +2901,15 @@ async def _market_alert_scan():
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
         turnover = volume / mcap
-        rough_score = 50 + _clamp(ch1 * 2.0, -8, 8) + _clamp(ch24 * .55, -10, 10) + _clamp(ch7 * .35, -8, 8)
+        # Rank for early formation, not coins that have already pumped.
+        rough_score = 50 + _clamp(ch1 * 0.80, -5, 5) + _clamp(ch24 * 0.12, -4, 4) + _clamp(ch7 * 0.05, -3, 3)
         rough_score += _clamp((turnover - .05) * 70, -7, 9)
-        if ch24 > 25: rough_score -= 8
-        if ch7 > 70: rough_score -= 6
+        if ch24 > 8: rough_score -= 4
+        if ch24 > 15: rough_score -= 5
+        if ch7 > 25: rough_score -= 5
+        if ch7 > 40: rough_score -= 5
+        if ch24 < -10: rough_score -= 3
+        if ch7 < -30: rough_score -= 3
         rough.append((rough_score, x))
 
     rough.sort(key=lambda z: z[0], reverse=True)
@@ -2844,9 +2986,6 @@ def watchlist_selector_keyboard(rows, prefix):
         elif r["asset_type"] == "gold18":
             label += " — طلای ۱۸ عیار"
         callback = f"{prefix}:{r['asset_type']}:{r['symbol']}"
-        asset_key = str(r["asset_key"] or "").strip()
-        if prefix == "price" and asset_key and asset_key.upper() != str(r["symbol"]).upper():
-            callback = f"{callback}:{asset_key}"
         buttons.append([InlineKeyboardButton(label, callback_data=callback)])
     return InlineKeyboardMarkup(buttons)
 
@@ -3018,6 +3157,15 @@ def user_has_asset(uid, symbol, atype):
         WHERE user_id=? AND symbol=? AND asset_type=?
         """, (uid, norm_symbol(symbol), atype)).fetchone() is not None
 
+
+def user_asset_key(uid, symbol, atype):
+    with db() as c:
+        row = c.execute("""
+        SELECT asset_key FROM watchlist
+        WHERE user_id=? AND symbol=? AND asset_type=? LIMIT 1
+        """, (int(uid), norm_symbol(symbol), str(atype))).fetchone()
+    return str(row["asset_key"] or "").strip() if row else None
+
 # ============================================================
 # BASIC COMMANDS
 # ============================================================
@@ -3167,8 +3315,10 @@ async def live_price_menu(update, context):
         await update.message.reply_text("📋 واچ‌لیست خالی است؛ ابتدا دارایی اضافه کنید.")
         return
     buttons = [[
-        InlineKeyboardButton(f"💰 {r['symbol']}",
-                             callback_data=f"price:{r['asset_type']}:{r['symbol']}")
+        InlineKeyboardButton(
+            f"💰 {r['symbol']}",
+            callback_data=f"price:{r['asset_type']}:{r['symbol']}"
+        )
     ] for r in rows]
     await update.message.reply_text(
         "💰 <b>قیمت لحظه‌ای</b>\nرایگان و بدون نیاز به اشتراک:",
@@ -3187,6 +3337,7 @@ async def selected_price_callback(update, context):
         if not user_has_asset(q.from_user.id, s, at):
             await q.message.reply_text("❌ این دارایی در واچ‌لیست شما نیست.")
             return
+        coin_id = coin_id or user_asset_key(q.from_user.id, s, at)
         item = await current_price(s, coin_id=coin_id)
         await q.message.reply_text(format_live_price(item), parse_mode=ParseMode.HTML)
     except Exception:
@@ -3739,10 +3890,16 @@ async def short_term_growth_scan():
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
         turnover = volume / mcap
-        rough_score = 50 + _clamp(ch24 * .55, -12, 12) + _clamp(ch7 * .30, -8, 8)
+        # Prefer quiet accumulation / first momentum, penalize late vertical moves.
+        ch1 = _safe_float(x.get("price_change_percentage_1h_in_currency"))
+        rough_score = 50 + _clamp(ch1 * 0.80, -5, 5) + _clamp(ch24 * 0.12, -4, 4) + _clamp(ch7 * 0.05, -3, 3)
         rough_score += _clamp((turnover - .05) * 70, -7, 9)
-        if ch24 > 25: rough_score -= 8
-        if ch7 > 70: rough_score -= 6
+        if ch24 > 8: rough_score -= 4
+        if ch24 > 15: rough_score -= 5
+        if ch7 > 25: rough_score -= 5
+        if ch7 > 40: rough_score -= 5
+        if ch24 < -10: rough_score -= 3
+        if ch7 < -30: rough_score -= 3
         rough.append((rough_score, x))
 
     rough.sort(key=lambda z: z[0], reverse=True)
@@ -3877,7 +4034,7 @@ def _buy_opportunity_text(item):
     confirmations = int(m.get("confirmations", 0))
     return (
         f"🎯 <b>{escape(symbol)} — {escape(name)}</b>\n"
-        f"🟢 <b>فرصت خرید تأییدشده</b> | 🔁 {confirmations}/{SIGNAL_CONFIRMATIONS_REQUIRED}\n"
+        f"🟢 <b>{'ورود زودهنگام' if ta.get('entry_stage') == 'EARLY' or ta.get('early_entry') else 'فرصت خرید تأییدشده'}</b> | 🔁 {confirmations}/{SIGNAL_CONFIRMATIONS_REQUIRED}\n"
         f"💎 فرصت: <b>{_safe_float(m.get('score')):.0f}%</b> | 💪 تکنیکال: <b>{_safe_float(m.get('strength')):.0f}%</b> | 🧠 مدل: <b>{_safe_float(m.get('probability')):.0f}%</b>\n"
         f"📈 روند: <b>{trend_fa}</b> | RSI: <b>{_safe_float(ta.get('rsi')):.1f}</b> | ADX: <b>{_safe_float(ta.get('adx')):.1f}</b>\n"
         f"📊 مومنتوم: 1H {_safe_float(m.get('ch1')):+.2f}% | 24H {_safe_float(m.get('ch24')):+.2f}% | 7D {_safe_float(m.get('ch7')):+.2f}%\n"
@@ -4415,14 +4572,17 @@ async def selected_analysis_callback(update, context):
         await q.message.reply_text("🚫 دسترسی شما توسط مدیر محدود شده است.")
         return
     try:
-        _, atype, sym = q.data.split(":", 2)
+        parts = q.data.split(":", 3)
+        _, atype, sym = parts[:3]
+        coin_id = parts[3] if len(parts) > 3 else None
         if not has_analysis_access(q.from_user.id):
             await q.message.reply_text("🔒 تحلیل فقط برای مشترکین فعال است.")
             return
         if not user_has_asset(q.from_user.id, sym, atype):
             await q.message.reply_text("❌ این دارایی در واچ‌لیست شما نیست.")
             return
-        a = await asyncio.wait_for(analyze(norm_symbol(sym)), timeout=45)
+        coin_id = coin_id or user_asset_key(q.from_user.id, sym, atype)
+        a = await asyncio.wait_for(analyze(norm_symbol(sym), coin_id=coin_id), timeout=45)
         await q.message.reply_text(analysis_text(a), parse_mode=ParseMode.HTML)
     except asyncio.TimeoutError:
         await q.message.reply_text("⏳ دریافت داده بیش از حد طول کشید. ۳۰ تا ۶۰ ثانیه دیگر دوباره تلاش کنید.")
@@ -4437,14 +4597,17 @@ async def selected_signal_callback(update, context):
         await q.message.reply_text("🚫 دسترسی شما توسط مدیر محدود شده است.")
         return
     try:
-        _, atype, sym = q.data.split(":", 2)
+        parts = q.data.split(":", 3)
+        _, atype, sym = parts[:3]
+        coin_id = parts[3] if len(parts) > 3 else None
         if not has_paid_subscription(q.from_user.id):
             await q.message.reply_text("🔒 سیگنال معاملاتی فقط برای مشترکین پولی فعال است.")
             return
         if not user_has_asset(q.from_user.id, sym, atype):
             await q.message.reply_text("❌ این دارایی در واچ‌لیست شما نیست.")
             return
-        a = await asyncio.wait_for(analyze(norm_symbol(sym)), timeout=45)
+        coin_id = coin_id or user_asset_key(q.from_user.id, sym, atype)
+        a = await asyncio.wait_for(analyze(norm_symbol(sym), coin_id=coin_id), timeout=45)
         await q.message.reply_text(signal_text(a), parse_mode=ParseMode.HTML)
     except asyncio.TimeoutError:
         await q.message.reply_text("⏳ دریافت داده بیش از حد طول کشید. ۳۰ تا ۶۰ ثانیه دیگر دوباره تلاش کنید.")
