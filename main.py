@@ -84,7 +84,7 @@ MARKET_SCAN_PAGES = max(1, min(10, int(os.getenv("MARKET_SCAN_PAGES", "2"))))
 MARKET_SCAN_PER_PAGE = max(50, min(250, int(os.getenv("MARKET_SCAN_PER_PAGE", "250"))))
 MARKET_SCAN_TOP = max(5, min(30, int(os.getenv("MARKET_SCAN_TOP", "10"))))
 MARKET_SCAN_SECONDS = max(300, int(os.getenv("MARKET_SCAN_SECONDS", "600")))
-MARKET_SCAN_DEEP = max(5, min(12, int(os.getenv("MARKET_SCAN_DEEP", "8"))))
+MARKET_SCAN_DEEP = max(5, min(12, int(os.getenv("MARKET_SCAN_DEEP", "12"))))
 MARKET_SCAN_CACHE = None
 SHORT_TERM_SCAN_CACHE = None
 NOBITEX_BASE_URL = os.getenv("NOBITEX_BASE_URL", "https://apiv2.nobitex.ir").rstrip("/")
@@ -893,8 +893,8 @@ async def market_universe():
     for rank, row in enumerate(unique, 1):
         row["market_cap_rank"] = rank  # local liquidity rank, not global market-cap rank
 
-    # 25 × (1H + 1D) requests stay below the documented public OHLC request budget.
-    candidates = unique[:12]
+    # Enrich a broader liquid USDT shortlist; bounded concurrency protects the public API.
+    candidates = unique[:20]
     sem = asyncio.Semaphore(4)
     async def enrich(row):
         async with sem:
@@ -920,7 +920,7 @@ async def market_universe():
     await asyncio.gather(*(enrich(row) for row in candidates), return_exceptions=True)
 
     MARKET_SCAN_CACHE = (now, unique)
-    log.info("NOBITEX MARKET SCAN markets=%s enriched=%s", len(unique), len(candidates))
+    log.info("NOBITEX MARKET SCAN quote=USDT markets=%s enriched=%s", len(unique), len(candidates))
     return unique
 
 def _clamp(v, lo=0, hi=100):
@@ -1473,57 +1473,96 @@ def format_live_price(item):
 # ============================================================
 
 async def nobitex_candles(symbol, bar="1H", limit=240):
-    """Nobitex OHLC candles. All crypto OHLC values are quoted in USDT."""
+    """Fetch closed USDT OHLCV bars from Nobitex, paging backward when needed."""
     s = norm_symbol(symbol)
     resolution = {"5m":"5", "15m":"15", "1H":"60", "4H":"240", "1D":"D", "D":"D"}.get(bar, str(bar))
     if bar == "1W":
-        # Weekly candles are not natively offered; derive them from daily candles.
+        # Weekly candles are derived from daily data; a shorter history is enough
+        # for the weekly trend context and avoids rejecting newer listed markets.
         daily = await nobitex_candles(s, "1D", min(500, max(240, int(limit))))
-        if daily is None or len(daily) < 200:
+        if daily is None or len(daily) < 50:
             return None
         weekly = daily.set_index(pd.to_datetime(daily["ts"], unit="s", utc=True)).resample("W-SUN").agg(
             {"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"}
         ).dropna().reset_index(names="ts")
         weekly["ts"] = (weekly["ts"].astype("int64") // 10**9).astype(int)
-        return weekly.tail(min(500, int(limit))).reset_index(drop=True) if len(weekly) >= 200 else None
+        return weekly.tail(min(500, int(limit))).reset_index(drop=True) if len(weekly) >= 20 else None
 
     market_symbol = f"{s}{NOBITEX_QUOTE}"
+    desired = min(500, max(2, int(limit)))
     key = ("NOBITEX", market_symbol, resolution, int(limit))
     cached = NOBITEX_CANDLE_CACHE.get(key, NOBITEX_CANDLE_CACHE_SECONDS)
     if cached is not None:
         return cached.copy()
-    params = {"symbol": market_symbol, "resolution": resolution,
-              "to": str(int(time.time())), "countback": str(min(500, max(2, int(limit))))}
+
+    # UDF history supports countback. Request the maximum page and move the
+    # `to` cursor backward if the exchange returns fewer bars than requested.
+    all_rows = []
+    cursor_to = int(time.time())
+    seen_oldest = None
+    max_pages = 4
     async with _NOBITEX_SEM:
-        data = await http_json(f"{NOBITEX_BASE_URL}/market/udf/history", params,
-                               ttl=NOBITEX_CANDLE_CACHE_SECONDS, retries=2)
-    # No fallback to IRT/RLS: mixing quote currencies would corrupt indicators,
-    # support/resistance, risk levels and backtests. Missing USDT pairs fail clearly.
-    price_factor = 1.0
-    if not data or data.get("s") != "ok":
+        for page_no in range(max_pages):
+            params = {"symbol": market_symbol, "resolution": resolution,
+                      "to": str(cursor_to), "countback": "500"}
+            data = await http_json(f"{NOBITEX_BASE_URL}/market/udf/history", params,
+                                   ttl=NOBITEX_CANDLE_CACHE_SECONDS if page_no == 0 else 0, retries=2)
+            if not data or data.get("s") != "ok":
+                if page_no == 0:
+                    log.warning("Nobitex OHLC unavailable market=%s tf=%s response=%s",
+                                market_symbol, resolution, str(data)[:180])
+                break
+            try:
+                ts, oo, hh, ll, cc, vv = (data.get(k) or [] for k in ("t","o","h","l","c","v"))
+                n = min(map(len, (ts,oo,hh,ll,cc,vv)))
+                if n <= 0:
+                    break
+                page = pd.DataFrame({"ts":ts[:n], "open":oo[:n], "high":hh[:n],
+                                     "low":ll[:n], "close":cc[:n], "volume":vv[:n]})
+                all_rows.append(page)
+                page_ts = pd.to_numeric(page["ts"], errors="coerce").dropna()
+                if page_ts.empty:
+                    break
+                oldest = int(page_ts.min())
+                if seen_oldest is not None and oldest >= seen_oldest:
+                    break
+                seen_oldest = oldest
+                if sum(len(x) for x in all_rows) >= desired:
+                    break
+                cursor_to = oldest - 1
+            except Exception:
+                log.exception("Nobitex OHLC page parse failed market=%s tf=%s page=%s",
+                              market_symbol, resolution, page_no + 1)
+                break
+
+    if not all_rows:
+        log.warning("Nobitex USDT pair/history unavailable market=%s tf=%s", market_symbol, resolution)
         return None
     try:
-        ts, oo, hh, ll, cc, vv = (data.get(k) or [] for k in ("t","o","h","l","c","v"))
-        n = min(map(len, (ts,oo,hh,ll,cc,vv)))
-        if n < 2:
-            return None
-        df = pd.DataFrame({"ts":ts[:n], "open":oo[:n], "high":hh[:n], "low":ll[:n], "close":cc[:n], "volume":vv[:n]})
+        df = pd.concat(all_rows, ignore_index=True)
         for col in ("open","high","low","close"):
-            df[col] = pd.to_numeric(df[col], errors="coerce") * price_factor
+            df[col] = pd.to_numeric(df[col], errors="coerce")
         df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
         df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
         df = df.dropna().drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
         seconds = {"1":"60", "5":"300", "15":"900", "30":"1800", "60":"3600", "180":"10800", "240":"14400", "360":"21600", "720":"43200", "D":"86400"}.get(resolution, 3600)
-        # Exclude the currently forming candle; indicators only see closed bars.
         now = int(time.time())
-        df = df[(df["ts"].astype(int) + seconds) <= now].copy().reset_index(drop=True)
-        required_bars = min(200, max(2, int(limit)))
-        if len(df) < required_bars:
-            log.warning("Nobitex confirmed candle history short %s %s: %s/%s", market_symbol, resolution, len(df), required_bars)
+        df = df[(df["ts"].astype(int) + int(seconds)) <= now].copy().reset_index(drop=True)
+        # Minimum history is timeframe-aware. EMA200 remains optional and is
+        # never fabricated from EMA50; shorter histories still support RSI,
+        # MACD, EMA50, ATR, ADX, VWAP and structure analysis.
+        min_by_resolution = {"5":60, "15":60, "60":80, "240":80, "D":50}
+        min_required = min(min_by_resolution.get(resolution, 60), desired)
+        if len(df) < min_required:
+            log.warning("Nobitex candle history short market=%s tf=%s bars=%s min_required=%s requested=%s pages=%s",
+                        market_symbol, resolution, len(df), min_required, desired, len(all_rows))
             return None
         df["confirm"] = 1
-        NOBITEX_CANDLE_CACHE.set(key, df.copy())
-        return df.tail(min(500, int(limit))).reset_index(drop=True)
+        result = df.tail(desired).reset_index(drop=True)
+        NOBITEX_CANDLE_CACHE.set(key, result.copy())
+        log.info("Nobitex candles market=%s tf=%s bars=%s requested=%s pages=%s",
+                 market_symbol, resolution, len(result), desired, len(all_rows))
+        return result
     except Exception:
         log.exception("Nobitex OHLC parse failed %s %s", market_symbol, resolution)
         return None
@@ -1586,7 +1625,7 @@ def _advanced_indicators(df):
             (x["low"] <= x[["open", "close"]].min(axis=1))
         )
         x = x.loc[valid].reset_index(drop=True)
-    if len(x) < 200:
+    if len(x) < 50:
         return None
 
     c = x["close"].astype(float); h = x["high"].astype(float)
@@ -1689,7 +1728,10 @@ def _divergence(close, rsi, window=35):
 
 def _tf_decision(symbol, df, timeframe):
     """v17: strict entry gates — trend==BULLISH, structure==BULLISH, ADX≥20, vol≥1.10, RR≥1.8"""
-    if df is None or len(df) < 200:
+    min_history = {"5m":60, "15m":60, "1H":80, "4H":80, "1D":50, "1W":20}.get(timeframe, 60)
+    if df is None or len(df) < min_history:
+        log.warning("TF history insufficient symbol=%s tf=%s bars=%s required=%s",
+                    norm_symbol(symbol), timeframe, 0 if df is None else len(df), min_history)
         return None
     z = _advanced_indicators(df)
     if not z:
@@ -1697,7 +1739,8 @@ def _tf_decision(symbol, df, timeframe):
     c, h, l, v = z["c"], z["h"], z["l"], z["v"]
     current = float(c.iloc[-1])
     e9, e21, e50 = map(lambda s: float(s.iloc[-1]), (z["ema9"], z["ema21"], z["ema50"]))
-    e200 = _safe_float(z["ema200"].iloc[-1], e50)
+    ema200_available = bool(pd.notna(z["ema200"].iloc[-1]))
+    e200 = _safe_float(z["ema200"].iloc[-1]) if ema200_available else None
     rsi = _safe_float(z["rsi"].iloc[-1], 50)
     macd = _safe_float(z["macd"].iloc[-1]); macd_sig = _safe_float(z["macd_sig"].iloc[-1])
     hist = _safe_float(z["macd_hist"].iloc[-1]); prev_hist = _safe_float(z["macd_hist"].iloc[-2], hist)
@@ -1717,8 +1760,8 @@ def _tf_decision(symbol, df, timeframe):
     divergence = _divergence(c, z["rsi"])
 
     trend = (
-        "BULLISH" if current > e21 > e50 > e200
-        else "BEARISH" if current < e21 < e50 < e200
+        "BULLISH" if ema200_available and current > e21 > e50 > e200
+        else "BEARISH" if ema200_available and current < e21 < e50 < e200
         else "BULLISH_WEAK" if current > e50
         else "BEARISH_WEAK" if current < e50
         else "NEUTRAL"
@@ -1727,9 +1770,9 @@ def _tf_decision(symbol, df, timeframe):
     bull, bear = 0.0, 0.0
     rb, rs = [], []
 
-    if current > e21 > e50 > e200:
+    if ema200_available and current > e21 > e50 > e200:
         bull += 20; rb.append("روند اصلی صعودی و EMAها هم‌راستا هستند")
-    elif current < e21 < e50 < e200:
+    elif ema200_available and current < e21 < e50 < e200:
         bear += 20; rs.append("روند اصلی نزولی و EMAها هم‌راستا هستند")
     elif current > e50:
         bull += 9; rb.append("قیمت بالای EMA50 است")
@@ -1896,6 +1939,7 @@ def _tf_decision(symbol, df, timeframe):
     return {
         "timeframe": timeframe, "price": current,
         "ema9": e9, "ema21": e21, "ema50": e50, "ema200": e200,
+        "ema200_available": ema200_available,
         "rsi": rsi, "macd": macd, "macd_signal": macd_sig, "macd_hist": hist,
         "bb_upper": bb_u, "bb_mid": bb_m, "bb_lower": bb_l,
         "bb_position": ((current - bb_l) / (bb_u - bb_l) * 100 if bb_u > bb_l else 50),
@@ -2617,24 +2661,29 @@ async def professional_crypto_analysis(symbol):
     pairs = await asyncio.gather(*(one(tf, n) for tf, n in bars.items()), return_exceptions=True)
 
     tfs = {}
+    bar_counts = {tf: 0 for tf in bars}
     for item in pairs:
         if isinstance(item, Exception):
-            log.warning("TF analysis failed %s: %s", symbol, item)
+            log.warning("TF download exception symbol=%s error=%s", s, item)
             continue
         tf, df = item
+        bar_counts[tf] = 0 if df is None else len(df)
         try:
             a = _tf_decision(symbol, df, tf)
-            if a: tfs[tf] = a
+            if a:
+                tfs[tf] = a
+            else:
+                log.warning("TF decision unavailable symbol=%s tf=%s bars=%s", s, tf, bar_counts[tf])
         except Exception:
             log.exception("TF engine error %s %s", symbol, tf)
 
-    # 4H and 1D are mandatory regime filters. Substituting a lower
-    # timeframe here can falsely validate a signal when higher-TF data is absent.
-    if len(tfs) < 3 or "4H" not in tfs or "1D" not in tfs:
-        log.warning(
-            "Insufficient MTF coverage for %s: available=%s required=4H,1D",
-            s, sorted(tfs)
-        )
+    # 1H execution context plus 4H and 1D regime confirmation are mandatory.
+    # 5m/15m are optional; their absence must not discard valid higher-TF analysis.
+    mandatory_tfs = ("1H", "4H", "1D")
+    missing_tfs = [tf for tf in mandatory_tfs if tf not in tfs]
+    if missing_tfs:
+        log.warning("Insufficient MTF coverage symbol=%s bars=%s available=%s missing=%s",
+                    s, bar_counts, sorted(tfs), missing_tfs)
         return None
 
     weights = {"5m": 0.05, "15m": 0.10, "1H": 0.20, "4H": 0.30, "1D": 0.25, "1W": 0.10}
@@ -3430,6 +3479,7 @@ async def _market_alert_scan():
 
     rough.sort(key=lambda z: z[0], reverse=True)
     candidates = rough[:MARKET_SCAN_DEEP]
+    log.info("Nobitex alert scan quote=USDT markets=%s shortlist=%s", len(rows), len(candidates))
     result = []
 
     async def deep_alert_one(x):
@@ -3456,6 +3506,8 @@ async def _market_alert_scan():
         })
 
     result.sort(key=lambda z: _safe_float((z.get("m") or {}).get("score")), reverse=True)
+    log.info("Nobitex alert scan complete shortlist=%s analyzed=%s opportunities=%s",
+             len(candidates), sum(1 for item in deep_results if not isinstance(item, Exception) and item[1]), len(result))
     return result, btc_status, scan_observation_key
 
 
@@ -3899,8 +3951,8 @@ async def signals_menu(update, context):
         if not opportunities:
             await msg.edit_text(
                 "⏳ <b>فعلاً نامزد قابل بررسی پیدا نشد.</b>\n\n"
-                "داده کافی از بازار دریافت نشد یا نامزدها از فیلتر اولیه عبور نکردند. "
-                "کمی بعد دوباره تلاش کنید.",
+                "بازارهای تتری دریافت شدند، اما در این نوبت هیچ دارایی از فیلترهای ورود عبور نکرد. "
+                "گزارش تعداد کندل‌ها و تایم‌فریم‌های ناقص در لاگ سرور ثبت شده است. کمی بعد دوباره تلاش کنید.",
                 parse_mode=ParseMode.HTML,
             )
             return
