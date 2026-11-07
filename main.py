@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Crypto / Global Gold / Iran 18K Gold Telegram Analyzer
-Railway production build — v17 (accuracy + strict filters release)
+Railway production build — v17.2 (live OKX WebSocket + indicator correctness + MTF safety release)
 """
 
 import os
@@ -88,6 +88,13 @@ MARKET_SCAN_DEEP = max(5, min(12, int(os.getenv("MARKET_SCAN_DEEP", "8"))))
 MARKET_SCAN_CACHE = None
 SHORT_TERM_SCAN_CACHE = None
 OKX_BASE_URL = os.getenv("OKX_BASE_URL", "https://www.okx.com").rstrip("/")
+OKX_WS_URL = os.getenv("OKX_WS_URL", "wss://ws.okx.com:8443/ws/v5/public").strip()
+OKX_WS_ENABLED = os.getenv("OKX_WS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+OKX_WS_STALE_SECONDS = max(5, int(os.getenv("OKX_WS_STALE_SECONDS", "20")))
+OKX_WS_SYMBOLS = set()
+OKX_WS_PRICES = {}
+OKX_WS_TASK = None
+OKX_WS_STATUS = {"connected": False, "last_message": None, "last_error": None}
 OKX_CANDLE_CACHE_SECONDS = max(20, int(os.getenv("OKX_CANDLE_CACHE_SECONDS", "60")))
 OKX_MAX_CONCURRENCY = max(2, min(8, int(os.getenv("OKX_MAX_CONCURRENCY", "6"))))
 
@@ -890,7 +897,7 @@ async def crypto_data(symbol, coin_id=None):
 
     data = await http_json(
         f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart",
-        {"vs_currency":"usd","days":"7","interval":"hourly"},
+        {"vs_currency":"usd","days":"30","interval":"hourly"},
         ttl=CACHE_SECONDS
     )
     if not data or not data.get("prices"):
@@ -1427,11 +1434,115 @@ async def asset_data(symbol, coin_id=None):
         return await gold18_data()
     return await crypto_data(s, coin_id=coin_id)
 
+async def okx_ws_worker():
+    """Maintain a reconnecting public OKX ticker stream; no API key is required."""
+    if not OKX_WS_ENABLED:
+        log.info("OKX WebSocket disabled by configuration")
+        return
+    backoff = 2
+    while True:
+        ws = None
+        try:
+            session = await get_session()
+            ws = await session.ws_connect(
+                OKX_WS_URL, heartbeat=20, receive_timeout=45,
+                timeout=aiohttp.ClientTimeout(total=20), max_msg_size=2**20,
+            )
+            OKX_WS_STATUS.update(connected=True, last_error=None)
+            log.info("OKX public WebSocket connected")
+            subscribed = set()
+            backoff = 2
+            while not ws.closed:
+                pending = sorted(OKX_WS_SYMBOLS - subscribed)
+                if pending:
+                    args = [{"channel": "tickers", "instId": inst} for inst in pending]
+                    # OKX accepts bounded subscribe batches.
+                    for offset in range(0, len(args), 50):
+                        await ws.send_json({"op": "subscribe", "args": args[offset:offset+50]})
+                    subscribed.update(pending)
+                try:
+                    msg = await ws.receive(timeout=2)
+                except asyncio.TimeoutError:
+                    continue
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        payload = json.loads(msg.data)
+                    except Exception:
+                        continue
+                    if payload.get("event") == "error":
+                        log.warning("OKX WS subscription error: %s", payload)
+                        continue
+                    arg = payload.get("arg") or {}
+                    if arg.get("channel") != "tickers":
+                        continue
+                    for row in payload.get("data") or []:
+                        try:
+                            inst = str(row.get("instId") or "").upper()
+                            last = float(row.get("last") or 0)
+                            open24 = float(row.get("open24h") or 0)
+                            if not inst or last <= 0:
+                                continue
+                            change24 = ((last / open24) - 1.0) * 100.0 if open24 > 0 else None
+                            OKX_WS_PRICES[inst] = {
+                                "price": last, "change24": change24,
+                                "received_at": time.monotonic(),
+                                "exchange_ts": row.get("ts"),
+                            }
+                            OKX_WS_STATUS.update(last_message=time.time())
+                        except (TypeError, ValueError):
+                            continue
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE,
+                                  aiohttp.WSMsgType.ERROR):
+                    raise ConnectionError(f"OKX WebSocket closed: {msg.type}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            OKX_WS_STATUS.update(connected=False, last_error=str(exc)[:300])
+            log.warning("OKX WebSocket disconnected: %s; retry in %ss", exc, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(30, backoff * 2)
+        finally:
+            OKX_WS_STATUS["connected"] = False
+            if ws is not None and not ws.closed:
+                await ws.close()
+
+
+def okx_ws_price(symbol):
+    inst = f"{norm_symbol(symbol)}-USDT".upper()
+    item = OKX_WS_PRICES.get(inst)
+    if not item or time.monotonic() - item.get("received_at", 0) > OKX_WS_STALE_SECONDS:
+        return None
+    result = {
+        "symbol": norm_symbol(symbol), "price": float(item["price"]),
+        "unit": "دلار", "source": "OKX WebSocket زنده",
+        "live": True, "exchange_ts": item.get("exchange_ts"),
+    }
+    if item.get("change24") is not None:
+        result["change24"] = float(item["change24"])
+    return result
+
+
 async def current_price(symbol, coin_id=None):
     s = norm_symbol(symbol)
     cache_key_price = (s, coin_id or COINS.get(s) or s)
+    # Prefer a fresh exchange stream tick over cached REST prices.
+    if s not in ("GOLD18", "XAU") and OKX_WS_ENABLED:
+        inst = f"{s}-USDT".upper()
+        OKX_WS_SYMBOLS.add(inst)
+        live = okx_ws_price(s)
+        if live:
+            PRICE_CACHE.set(cache_key_price, live)
+            return live
+        # Give the on-demand WebSocket subscription a brief chance to deliver.
+        for _ in range(4):
+            await asyncio.sleep(0.25)
+            live = okx_ws_price(s)
+            if live:
+                PRICE_CACHE.set(cache_key_price, live)
+                return live
+
     item = PRICE_CACHE.get(cache_key_price, PRICE_CACHE_SECONDS)
-    if item:
+    if item and not item.get("live"):
         return item
 
     result = None
@@ -1543,22 +1654,48 @@ async def okx_candles(symbol, bar="1H", limit=240):
     # OKX marks the currently forming candle with confirm=0. Never use it
     # for indicators or signal confirmation.
     df = df[df["confirm"] == 1].copy().reset_index(drop=True)
-    if len(df) < 100:
-        log.warning("OKX confirmed candle history too short %s %s: %s", inst, bar, len(df))
+    if len(df) < 200:
+        log.warning("OKX confirmed candle history too short for EMA200 %s %s: %s", inst, bar, len(df))
         return None
     OKX_CANDLE_CACHE.set(key, df.copy())
     return df
 
+def _wilder_smooth(series, period=14):
+    """Wilder smoothing seeded with the first period's simple average."""
+    values = pd.to_numeric(pd.Series(series), errors="coerce").astype(float).tolist()
+    out = [float("nan")] * len(values)
+    if period < 1 or len(values) < period:
+        return pd.Series(out, index=getattr(series, "index", None), dtype=float)
+
+    seed_end = None
+    for end in range(period - 1, len(values)):
+        window = values[end - period + 1:end + 1]
+        if all(pd.notna(v) for v in window):
+            seed_end = end
+            out[end] = sum(window) / period
+            break
+    if seed_end is not None:
+        for i in range(seed_end + 1, len(values)):
+            value = values[i]
+            if pd.notna(value):
+                out[i] = (out[i - 1] * (period - 1) + value) / period
+            else:
+                out[i] = out[i - 1]
+    return pd.Series(out, index=getattr(series, "index", None), dtype=float)
+
+
 def _wilder_rsi(close, period=14):
-    close = pd.to_numeric(close, errors="coerce").astype(float)
+    close = pd.to_numeric(pd.Series(close), errors="coerce").astype(float)
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    ag = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    al = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    rs = ag / al.replace(0, float("nan"))
+    avg_gain = _wilder_smooth(gain, period)
+    avg_loss = _wilder_smooth(loss, period)
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
     out = 100 - (100 / (1 + rs))
-    out = out.where(al != 0, 100)
+    out = out.where(avg_loss != 0, 100.0)
+    out = out.where(avg_gain != 0, 0.0)
+    out = out.where((avg_gain != 0) | (avg_loss != 0), 50.0)
     return out.astype(float).fillna(50.0)
 
 def _advanced_indicators(df):
@@ -1575,10 +1712,13 @@ def _advanced_indicators(df):
     if not x.empty:
         valid = (
             (x["open"] > 0) & (x["high"] > 0) & (x["low"] > 0) &
-            (x["close"] > 0) & (x["volume"] >= 0) & (x["high"] >= x["low"])
+            (x["close"] > 0) & (x["volume"] >= 0) &
+            (x["high"] >= x["low"]) &
+            (x["high"] >= x[["open", "close"]].max(axis=1)) &
+            (x["low"] <= x[["open", "close"]].min(axis=1))
         )
         x = x.loc[valid].reset_index(drop=True)
-    if len(x) < 100:
+    if len(x) < 200:
         return None
 
     c = x["close"].astype(float); h = x["high"].astype(float)
@@ -1587,23 +1727,23 @@ def _advanced_indicators(df):
     ema9 = c.ewm(span=9, adjust=False).mean()
     ema21 = c.ewm(span=21, adjust=False).mean()
     ema50 = c.ewm(span=50, adjust=False).mean()
-    ema200 = c.ewm(span=200, adjust=False, min_periods=100).mean()
+    ema200 = c.ewm(span=200, adjust=False, min_periods=200).mean()
     rsi = _wilder_rsi(c, 14)
     macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     macd_sig = macd.ewm(span=9, adjust=False).mean()
     macd_hist = macd - macd_sig
 
     tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    atr = _wilder_smooth(tr, 14)
 
     up = h.diff(); down = -l.diff()
     plus_dm = up.where((up > down) & (up > 0), 0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
-    atr_w = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    plus_di = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean() / atr_w.replace(0, float('nan'))
-    minus_di = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean() / atr_w.replace(0, float('nan'))
+    atr_w = _wilder_smooth(tr, 14)
+    plus_di = 100 * _wilder_smooth(plus_dm, 14) / atr_w.replace(0, float('nan'))
+    minus_di = 100 * _wilder_smooth(minus_dm, 14) / atr_w.replace(0, float('nan'))
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, float('nan'))
-    adx = dx.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    adx = _wilder_smooth(dx, 14)
 
     bb_mid = c.rolling(20).mean(); bb_std = c.rolling(20).std(ddof=0)
     bb_upper = bb_mid + 2 * bb_std; bb_lower = bb_mid - 2 * bb_std
@@ -1681,7 +1821,7 @@ def _divergence(close, rsi, window=35):
 
 def _tf_decision(symbol, df, timeframe):
     """v17: strict entry gates — trend==BULLISH, structure==BULLISH, ADX≥20, vol≥1.10, RR≥1.8"""
-    if df is None or len(df) < 100:
+    if df is None or len(df) < 200:
         return None
     z = _advanced_indicators(df)
     if not z:
@@ -1925,25 +2065,28 @@ def _rsi(series, period=14):
     series = pd.to_numeric(series, errors="coerce").astype(float)
     delta = series.diff()
     gain = delta.clip(lower=0); loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    avg_gain = _wilder_smooth(gain, period)
+    avg_loss = _wilder_smooth(loss, period)
     rs = avg_gain / avg_loss.replace(0, float('nan'))
     out = 100 - (100 / (1 + rs))
-    out = out.where(avg_loss != 0, 100)
+    out = out.where(avg_loss != 0, 100.0)
+    out = out.where(avg_gain != 0, 0.0)
+    out = out.where((avg_gain != 0) | (avg_loss != 0), 50.0)
     return out
 
 def _atr(p, period=14):
     tr = p.diff().abs()
-    return tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    return _wilder_smooth(tr, period)
 
 def _adx(p, period=14):
+    """Close-only directional-strength proxy; not standard OHLC Wilder ADX."""
     move = p.diff()
     up = move.clip(lower=0); down = (-move).clip(lower=0); tr = move.abs()
-    atr = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    dip = 100 * up.ewm(alpha=1/period, adjust=False, min_periods=period).mean() / atr.replace(0, float('nan'))
-    dim = 100 * down.ewm(alpha=1/period, adjust=False, min_periods=period).mean() / atr.replace(0, float('nan'))
+    atr = _wilder_smooth(tr, period)
+    dip = 100 * _wilder_smooth(up, period) / atr.replace(0, float('nan'))
+    dim = 100 * _wilder_smooth(down, period) / atr.replace(0, float('nan'))
     dx = (100 * (dip - dim).abs() / (dip + dim).replace(0, float('nan')))
-    adx = dx.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    adx = _wilder_smooth(dx, period)
     return adx, dip, dim
 
 def _format_price(symbol, value):
@@ -1962,7 +2105,7 @@ def technical_analysis(symbol, prices, volumes=None):
     ema9 = p.ewm(span=9, adjust=False).mean()
     ema21 = p.ewm(span=21, adjust=False).mean()
     ema50 = p.ewm(span=50, adjust=False).mean()
-    ema200 = p.ewm(span=200, adjust=False, min_periods=50).mean()
+    ema200 = p.ewm(span=200, adjust=False, min_periods=200).mean()
 
     rsi_s = _rsi(p, 14)
     rsi = _safe_float(rsi_s.iloc[-1], 50)
@@ -1985,6 +2128,7 @@ def technical_analysis(symbol, prices, volumes=None):
 
     current = float(p.iloc[-1])
     e9, e21, e50 = float(ema9.iloc[-1]), float(ema21.iloc[-1]), float(ema50.iloc[-1])
+    ema200_available = bool(pd.notna(ema200.iloc[-1]))
     e200 = _safe_float(ema200.iloc[-1], e50)
     mline, msignal, mhist = float(macd_line.iloc[-1]), float(macd_signal.iloc[-1]), float(macd_hist.iloc[-1])
     prev_hist = _safe_float(macd_hist.iloc[-2], mhist)
@@ -2002,9 +2146,9 @@ def technical_analysis(symbol, prices, volumes=None):
     atr_pct = (atr / current * 100) if current else 0
     bb_position = ((current - lower) / (upper - lower) * 100) if upper > lower else 50
 
-    if current > e9 > e21 > e50 and current > e200:
+    if ema200_available and current > e9 > e21 > e50 and current > e200:
         trend = "BULLISH"
-    elif current < e9 < e21 < e50 and current < e200:
+    elif ema200_available and current < e9 < e21 < e50 and current < e200:
         trend = "BEARISH"
     elif current > e50:
         trend = "BULLISH_WEAK"
@@ -2017,7 +2161,7 @@ def technical_analysis(symbol, prices, volumes=None):
         1 if current > e21 else -1,
         1 if e9 > e21 else -1,
         1 if e21 > e50 else -1,
-        1 if current > e200 else -1,
+        (1 if current > e200 else -1) if ema200_available else 0,
         1 if 50 <= rsi <= 68 else -1 if rsi < 40 or rsi > 75 else 0,
         1 if mhist > 0 else -1,
         1 if adx >= 20 else 0,
@@ -2112,7 +2256,11 @@ def technical_analysis(symbol, prices, volumes=None):
         "buy_score": buy_points, "sell_score": sell_points,
         "probability": probability, "reasons_buy": reasons_buy, "reasons_sell": reasons_sell,
         "stop": stop, "targets": targets, "rr": rr, "volume_confirm": vol_confirm,
+        "ema200": e200 if ema200_available else None,
+        "ema200_available": ema200_available,
         "history_points": len(p),
+        "adx_method": "close-only directional proxy",
+        "data_quality_warning": "این تحلیل از قیمت بسته‌شدن استفاده می‌کند؛ ADX/DI آن جایگزین ADX استاندارد مبتنی بر OHLC نیست.",
         "signal": "WAIT", "confirmed": False, "confirmations": 0,
         "data_source": "TGJU (close-only)" if symbol in ("GOLD18", "XAU") else "CoinGecko (close-only)",
     }
@@ -2583,7 +2731,13 @@ async def professional_crypto_analysis(symbol):
         except Exception:
             log.exception("TF engine error %s %s", symbol, tf)
 
-    if len(tfs) < 3:
+    # 4H and 1D are mandatory regime filters. Substituting a lower
+    # timeframe here can falsely validate a signal when higher-TF data is absent.
+    if len(tfs) < 3 or "4H" not in tfs or "1D" not in tfs:
+        log.warning(
+            "Insufficient MTF coverage for %s: available=%s required=4H,1D",
+            s, sorted(tfs)
+        )
         return None
 
     weights = {"5m": 0.05, "15m": 0.10, "1H": 0.20, "4H": 0.30, "1D": 0.25, "1W": 0.10}
@@ -2603,7 +2757,7 @@ async def professional_crypto_analysis(symbol):
     trend4 = tfs.get("4H", main).get("trend")
     structure4 = tfs.get("4H", main).get("structure")
     trend1d = tfs.get("1D", main).get("trend")
-    trend1w = tfs.get("1W", main).get("trend")
+    trend1w = tfs.get("1W", {}).get("trend", "UNAVAILABLE")
     structure1d = tfs.get("1D", main).get("structure")
 
     early_buy_weight = sum(
@@ -2983,6 +3137,9 @@ def analysis_text(a):
             tf_lines.append(f"• {tf_labels[tf]}: {tr} | RSI {item.get('rsi', 0):.1f} | {sig}")
         mtf_text = "🕒 <b>تأیید چندتایم‌فریمی (تاریخچه کندل‌های بسته‌شده)</b>\n" + "\n".join(tf_lines) + "\n\n"
 
+    ema200_text = (_format_price(a["symbol"], a["ema200"])
+                   if a.get("ema200_available", a.get("ema200") is not None) and a.get("ema200") is not None
+                   else "داده کافی نیست")
     price = _safe_float(a.get("price"))
     support = _safe_float(a.get("support"))
     resistance = _safe_float(a.get("resistance"))
@@ -3033,7 +3190,7 @@ def analysis_text(a):
         f"📈 ساختار روند اصلی: <b>{trend_fa}</b>\n\n"
         + mtf_text
         + f"EMA9: {_format_price(a['symbol'], a['ema9'])} | EMA21: {_format_price(a['symbol'], a['ema21'])}\n"
-        + f"EMA50: {_format_price(a['symbol'], a['ema50'])} | EMA200: {_format_price(a['symbol'], a['ema200'])}\n"
+        + f"EMA50: {_format_price(a['symbol'], a['ema50'])} | EMA200: {ema200_text}\n"
         + f"RSI14: <b>{a['rsi']:.1f}</b> | {adx_label}: <b>{a['adx']:.1f}</b>\n"
         + f"MACD: {a['macd']:.5f} | Histogram: {a['macd_hist']:+.5f}\n"
         + f"Bollinger: <b>{a['bb_position']:.1f}%</b> | ATR: {_format_price(a['symbol'], a['atr'])} ({a['atr_pct']:.2f}%)\n"
@@ -3045,6 +3202,7 @@ def analysis_text(a):
         + mtf_agreement_line
         + f"🔬 وضعیت ساختار: {'قوی' if a['strength'] >= 75 else 'متوسط' if a['strength'] >= 55 else 'ضعیف'}\n"
         + f"📚 تعداد داده: {a['history_points']} | منبع: {escape(source)}\n"
+        + (f"⚠️ {escape(a['data_quality_warning'])}\n" if a.get("data_quality_warning") else "")
         + ("📥 تاریخچه رمزارز از کندل‌های تاریخی OKX دریافت شده است؛ تایم‌فریم‌های در دسترس بسته به نماد/محدودیت منبع ممکن است متفاوت باشد.\n"
            if a.get("mtf") else "")
         + (_market_context_text(a.get("market_context")) if a["symbol"] not in ("GOLD18", "XAU") else "")
@@ -5934,6 +6092,29 @@ def dashboard_main():
 # STARTUP / MAIN
 # ============================================================
 
+async def live_status_command(update, context):
+    """Show public exchange stream health for Railway diagnostics."""
+    connected = bool(OKX_WS_STATUS.get("connected"))
+    last = OKX_WS_STATUS.get("last_message")
+    age = (max(0, int(time.time() - last)) if last else None)
+    fresh = sum(
+        1 for item in OKX_WS_PRICES.values()
+        if time.monotonic() - item.get("received_at", 0) <= OKX_WS_STALE_SECONDS
+    )
+    status = "🟢 متصل" if connected else "🔴 قطع / در حال اتصال مجدد"
+    text = (
+        "📡 <b>وضعیت اتصال زنده بازار</b>\n\n"
+        f"وضعیت WebSocket: <b>{status}</b>\n"
+        f"دارایی‌های درخواست‌شده: <b>{len(OKX_WS_SYMBOLS)}</b>\n"
+        f"قیمت‌های زنده تازه: <b>{fresh}</b>\n"
+        f"آخرین پیام دریافتی: <b>{str(age) + ' ثانیه قبل' if age is not None else 'هنوز دریافت نشده'}</b>\n"
+        f"فعال‌بودن اتصال: <b>{'بله' if OKX_WS_ENABLED else 'خیر'}</b>"
+    )
+    if OKX_WS_STATUS.get("last_error"):
+        text += "\n\nآخرین خطا: <code>" + escape(str(OKX_WS_STATUS['last_error'])[:250]) + "</code>"
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 async def post_init(app):
     init_db()
     v2_init_db()
@@ -5944,10 +6125,19 @@ async def post_init(app):
     app.create_task(alert_worker(app))
     app.create_task(backup_worker())
     app.create_task(market_snapshot_worker())
-    log.info("MARKET AI v2 started | v17 compatibility + Bayesian learning + paper trading | cache=%s", len(CACHE))
+    global OKX_WS_TASK
+    if OKX_WS_ENABLED:
+        OKX_WS_TASK = app.create_task(okx_ws_worker())
+    log.info("MARKET AI v2 started | v17.2 live OKX WebSocket=%s | cache=%s", OKX_WS_ENABLED, len(CACHE))
 
 async def post_shutdown(app):
-    global HTTP_SESSION
+    global HTTP_SESSION, OKX_WS_TASK
+    if OKX_WS_TASK and not OKX_WS_TASK.done():
+        OKX_WS_TASK.cancel()
+        try:
+            await OKX_WS_TASK
+        except asyncio.CancelledError:
+            pass
     if HTTP_SESSION and not HTTP_SESSION.closed:
         await HTTP_SESSION.close()
 
@@ -5964,6 +6154,7 @@ def main():
     app.add_handler(CommandHandler("dbstatus", db_status_command))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("performance", performance_command))
+    app.add_handler(CommandHandler("live", live_status_command))
     app.add_handler(CommandHandler("paper", performance_command))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(payment_admin_callback, pattern=r"^pay:(approve|reject):"))
