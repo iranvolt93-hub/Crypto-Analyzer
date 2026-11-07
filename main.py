@@ -88,7 +88,7 @@ MARKET_SCAN_DEEP = max(5, min(12, int(os.getenv("MARKET_SCAN_DEEP", "8"))))
 MARKET_SCAN_CACHE = None
 SHORT_TERM_SCAN_CACHE = None
 NOBITEX_BASE_URL = os.getenv("NOBITEX_BASE_URL", "https://apiv2.nobitex.ir").rstrip("/")
-NOBITEX_QUOTE = "IRT"  # Keep every crypto OHLC series on the Toman-quoted IRT market
+NOBITEX_QUOTE = "USDT"  # Entire crypto analysis engine uses USDT-quoted Nobitex markets
 NOBITEX_CANDLE_CACHE_SECONDS = max(20, int(os.getenv("NOBITEX_CANDLE_CACHE_SECONDS", "60")))
 NOBITEX_MAX_CONCURRENCY = max(2, min(8, int(os.getenv("NOBITEX_MAX_CONCURRENCY", "4"))))
 
@@ -842,22 +842,22 @@ async def market_universe():
     if MARKET_SCAN_CACHE and now - MARKET_SCAN_CACHE[0] < MARKET_SCAN_SECONDS:
         return MARKET_SCAN_CACHE[1]
 
-    data = await http_json(f"{NOBITEX_BASE_URL}/market/stats", {"dstCurrency": "rls"}, ttl=MARKET_SCAN_SECONDS, retries=2)
+    data = await http_json(f"{NOBITEX_BASE_URL}/market/stats", {"dstCurrency": "usdt"}, ttl=MARKET_SCAN_SECONDS, retries=2)
     stats = (data or {}).get("stats") or {}
     rows = []
     for key, item in stats.items():
         if not isinstance(item, dict) or "-" not in key or item.get("isClosed") is True:
             continue
         base, quote = key.lower().split("-", 1)
-        if quote not in {"rls", "irt"}:
+        if quote != "usdt":
             continue
         sym = base.upper()
         if not sym or sym in {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE"}:
             continue
-        # Stats dstCurrency=rls is explicitly Rial. Normalize it to Toman.
+        # Nobitex USDT market stats are already denominated in Tether.
         raw_price = _safe_float(item.get("latest") or item.get("dayClose"))
-        price = raw_price / 10.0 if quote == "rls" else raw_price
-        quote_volume = _safe_float(item.get("volumeDst")) / (10.0 if quote == "rls" else 1.0)
+        price = raw_price
+        quote_volume = _safe_float(item.get("volumeDst"))
         base_volume = _safe_float(item.get("volumeSrc"))
         if price <= 0 or quote_volume <= 0:
             continue
@@ -875,14 +875,14 @@ async def market_universe():
             "price_change_percentage_200d_in_currency": 0.0,
             "price_change_percentage_1y_in_currency": 0.0,
             "ath_change_percentage": 0.0, "atl_change_percentage": 0.0,
-            "day_high": _safe_float(item.get("dayHigh")) / (10.0 if quote == "rls" else 1.0),
-            "day_low": _safe_float(item.get("dayLow")) / (10.0 if quote == "rls" else 1.0),
-            "day_open": _safe_float(item.get("dayOpen")) / (10.0 if quote == "rls" else 1.0),
+            "day_high": _safe_float(item.get("dayHigh")),
+            "day_low": _safe_float(item.get("dayLow")),
+            "day_open": _safe_float(item.get("dayOpen")),
             "source": "Nobitex",
         })
 
-    # Prefer IRT markets; never mix IRT and USDT candles in one analysis.
-    rows.sort(key=lambda x: (x["market_symbol"].endswith("IRT"), x["total_volume"]), reverse=True)
+    # Only USDT-quoted spot markets enter the analysis universe.
+    rows.sort(key=lambda x: x["total_volume"], reverse=True)
     unique, seen = [], set()
     for row in rows:
         if row["symbol"] in seen:
@@ -1420,7 +1420,7 @@ async def asset_data(symbol, coin_id=None):
 
 async def current_price(symbol, coin_id=None):
     s = norm_symbol(symbol)
-    cache_key_price = (s, "nobitex")
+    cache_key_price = (s, "nobitex_usdt")
     cached = PRICE_CACHE.get(cache_key_price, PRICE_CACHE_SECONDS)
     if cached is not None:
         return cached
@@ -1431,14 +1431,13 @@ async def current_price(symbol, coin_id=None):
         value = await xau_tgju_price()
         result = {"symbol": s, "price": float(value), "unit": "دلار برای هر اونس", "source": "TGJU"} if value is not None else None
     else:
-        data = await http_json(f"{NOBITEX_BASE_URL}/market/stats", {"srcCurrency": s.lower(), "dstCurrency": "rls"}, ttl=PRICE_CACHE_SECONDS, retries=2)
+        data = await http_json(f"{NOBITEX_BASE_URL}/market/stats", {"srcCurrency": s.lower(), "dstCurrency": "usdt"}, ttl=PRICE_CACHE_SECONDS, retries=2)
         stats = (data or {}).get("stats") or {}
-        item = stats.get(f"{s.lower()}-rls") or stats.get(f"{s.lower()}-irt")
+        item = stats.get(f"{s.lower()}-usdt")
         if item:
-            raw = _safe_float(item.get("latest") or item.get("dayClose"))
-            price = raw / 10.0 if f"{s.lower()}-rls" in stats else raw
+            price = _safe_float(item.get("latest") or item.get("dayClose"))
             result = {"symbol": s, "price": price, "change24": _safe_float(item.get("dayChange")),
-                      "unit": "تومان", "source": "Nobitex"}
+                      "unit": "USDT", "source": "Nobitex"}
         else:
             result = None
     if result:
@@ -1456,7 +1455,7 @@ def format_live_price(item):
         value = f"{p:,.2f}"
     else:
         number = f"{p:,.0f}" if p >= 1000 else (f"{p:,.4f}".rstrip("0").rstrip(".") if p >= 1 else f"{p:,.8f}".rstrip("0").rstrip("."))
-        value = number + " تومان"
+        value = number + " USDT"
     text = (
         f"💰 <b>{s}</b>\n"
         f"قیمت فعلی: <b>{value}</b>\n"
@@ -1474,7 +1473,7 @@ def format_live_price(item):
 # ============================================================
 
 async def nobitex_candles(symbol, bar="1H", limit=240):
-    """Nobitex OHLC candles. Returned price series use IRT (Toman) consistently."""
+    """Nobitex OHLC candles. All crypto OHLC values are quoted in USDT."""
     s = norm_symbol(symbol)
     resolution = {"5m":"5", "15m":"15", "1H":"60", "4H":"240", "1D":"D", "D":"D"}.get(bar, str(bar))
     if bar == "1W":
@@ -1498,19 +1497,9 @@ async def nobitex_candles(symbol, bar="1H", limit=240):
     async with _NOBITEX_SEM:
         data = await http_json(f"{NOBITEX_BASE_URL}/market/udf/history", params,
                                ttl=NOBITEX_CANDLE_CACHE_SECONDS, retries=2)
-    if not data or data.get("s") != "ok":
-        # Some markets are listed only against RLS; use their explicitly Rial ticker,
-        # then normalize all OHLC prices to Toman before analysis.
-        if NOBITEX_QUOTE == "IRT":
-            params["symbol"] = f"{s}RLS"
-            async with _NOBITEX_SEM:
-                data = await http_json(f"{NOBITEX_BASE_URL}/market/udf/history", params,
-                                       ttl=NOBITEX_CANDLE_CACHE_SECONDS, retries=1)
-            price_factor = 0.1
-        else:
-            price_factor = 1.0
-    else:
-        price_factor = 1.0
+    # No fallback to IRT/RLS: mixing quote currencies would corrupt indicators,
+    # support/resistance, risk levels and backtests. Missing USDT pairs fail clearly.
+    price_factor = 1.0
     if not data or data.get("s") != "ok":
         return None
     try:
@@ -1978,7 +1967,7 @@ def _format_price(symbol, value):
         number = f"{value:,.4f}".rstrip("0").rstrip(".")
     else:
         number = f"{value:,.8f}".rstrip("0").rstrip(".")
-    return number + " تومان"
+    return number + " USDT"
 
 def technical_analysis(symbol, prices, volumes=None):
     p = pd.to_numeric(pd.Series(prices), errors="coerce")
@@ -2774,7 +2763,7 @@ async def professional_crypto_analysis(symbol):
         "early_timeframes": len(early_tfs),
         "execution_timeframes": len(entry_tfs),
         "early_buy_weight": early_buy_weight * 100,
-        "data_source": "Nobitex OHLCV professional multi-timeframe (IRT/Toman)",
+        "data_source": "Nobitex OHLCV professional multi-timeframe (USDT)",
         "history_points": sum(v["history_points"] for v in tfs.values()),
     })
     try:
@@ -2995,12 +2984,12 @@ def _market_context_text(ctx):
     def money(v):
         v = _safe_float(v)
         if v >= 1_000_000_000:
-            return f"{v/1_000_000_000:.2f} میلیارد تومان"
+            return f"{v/1_000_000_000:.2f} میلیارد USDT"
         if v >= 1_000_000:
-            return f"{v/1_000_000:.2f} میلیون تومان"
+            return f"{v/1_000_000:.2f} میلیون USDT"
         if v >= 1_000:
-            return f"{v/1_000:.2f} هزار تومان"
-        return f"{v:.0f} تومان"
+            return f"{v/1_000:.2f} هزار USDT"
+        return f"{v:.2f} USDT"
     rank = f"#{ctx['rank']}" if ctx.get("rank") else "نامشخص"
     supply = ctx.get("circulating_supply", 0)
     supply_text = f"{supply:,.0f}" if supply else "نامشخص"
@@ -3008,7 +2997,7 @@ def _market_context_text(ctx):
     max_text = f"{max_supply:,.0f}" if max_supply else "نامحدود/نامشخص"
     return (
         "🌐 <b>نمای کلی بازار نوبیتکس</b>\n"
-        f"رتبه نقدشوندگی نوبیتکس: {rank} | ارزش بازار: در API عمومی موجود نیست | حجم ۲۴ساعته: {money(ctx.get('volume_24h'))} تومان\n"
+        f"رتبه نقدشوندگی نوبیتکس: {rank} | ارزش بازار: در API عمومی موجود نیست | حجم ۲۴ساعته: {money(ctx.get('volume_24h'))}\n"
         f"تغییر: ۲۴ساعت {ctx.get('change_24h', 0):+.2f}% | ۷روز {ctx.get('change_7d', 0):+.2f}% | ۳۰روز {ctx.get('change_30d', 0):+.2f}%\n"
         f"عرضه در گردش: {supply_text} | حداکثر عرضه: {max_text}\n"
     )
@@ -3030,7 +3019,7 @@ def analysis_text(a):
     if a["symbol"] in ("GOLD18", "XAU"):
         candle_note = "⏱ داده‌های نقطه‌ای TGJU (تقریباً هر ۵ دقیقه؛ کندل OHLC واقعی نیست)\n"
     elif is_close_only:
-        candle_note = "⏱ داده‌های بسته‌شده OHLCV نوبیتکس (واحد قیمت: تومان)\n"
+        candle_note = "⏱ داده‌های بسته‌شده OHLCV نوبیتکس (واحد قیمت: USDT)\n"
     else:
         candle_note = "⏱ کندل‌های بسته‌شده نوبیتکس در چند تایم‌فریم (نمای اصلی 4H)\n"
 
@@ -6010,21 +5999,20 @@ def dashboard_main():
 
 async def live_status_command(update, context):
     """Check public Nobitex market-data API health."""
-    data = await http_json(f"{NOBITEX_BASE_URL}/market/stats", {"srcCurrency":"btc", "dstCurrency":"rls"}, ttl=5, retries=1)
+    data = await http_json(f"{NOBITEX_BASE_URL}/market/stats", {"srcCurrency":"btc", "dstCurrency":"usdt"}, ttl=5, retries=1)
     stats = (data or {}).get("stats") or {}
-    btc = stats.get("btc-rls") or stats.get("btc-irt")
+    btc = stats.get("btc-usdt")
     if btc:
-        raw = _safe_float(btc.get("latest") or btc.get("dayClose"))
-        price = raw / 10.0 if "btc-rls" in stats else raw
+        price = _safe_float(btc.get("latest") or btc.get("dayClose"))
         status = "🟢 API نوبیتکس در دسترس است"
-        detail = f"\nقیمت BTC: <b>{price:,.0f} تومان</b>\nتغییر ۲۴ساعت: <b>{_safe_float(btc.get('dayChange')):+.2f}%</b>"
+        detail = f"\nقیمت BTC: <b>{price:,.2f} USDT</b>\nتغییر ۲۴ساعت: <b>{_safe_float(btc.get('dayChange')):+.2f}%</b>"
     else:
         status = "🔴 دریافت اطلاعات از API نوبیتکس ناموفق بود"
         detail = "\nاتصال شبکه، محدودیت IP یا وضعیت API را بررسی کنید."
     await update.effective_message.reply_text(
         "📡 <b>وضعیت منبع داده بازار</b>\n\n"
         f"منبع رمزارز: <b>Nobitex Public API</b>\n{status}{detail}\n"
-        "قیمت و کندل‌های تحلیل از بازارهای نوبیتکس دریافت می‌شوند.",
+        "قیمت، کندل‌ها، اندیکاتورها و تمام سطوح تحلیل رمزارز بر اساس بازارهای USDT نوبیتکس محاسبه می‌شوند.",
         parse_mode=ParseMode.HTML,
     )
 
