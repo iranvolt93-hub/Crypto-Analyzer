@@ -1,5 +1,5 @@
 python-telegram-bot>=20.7,<23
-httpx>=0.25,<1
-pandas
-numpy
-streamlit>=1.40.0
+aiohttp>=3.9
+pandas>=2.0
+beautifulsoup4>=4.12
+streamlit>=1.40
