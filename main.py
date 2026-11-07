@@ -84,7 +84,7 @@ MARKET_SCAN_PAGES = max(1, min(10, int(os.getenv("MARKET_SCAN_PAGES", "2"))))
 MARKET_SCAN_PER_PAGE = max(50, min(250, int(os.getenv("MARKET_SCAN_PER_PAGE", "250"))))
 MARKET_SCAN_TOP = max(5, min(30, int(os.getenv("MARKET_SCAN_TOP", "10"))))
 MARKET_SCAN_SECONDS = max(300, int(os.getenv("MARKET_SCAN_SECONDS", "600")))
-MARKET_SCAN_DEEP = max(5, min(12, int(os.getenv("MARKET_SCAN_DEEP", "12"))))
+MARKET_SCAN_DEEP = max(5, min(20, int(os.getenv("MARKET_SCAN_DEEP", "15"))))
 MARKET_SCAN_CACHE = None
 SHORT_TERM_SCAN_CACHE = None
 NOBITEX_BASE_URL = os.getenv("NOBITEX_BASE_URL", "https://apiv2.nobitex.ir").rstrip("/")
@@ -865,8 +865,9 @@ async def market_universe():
             "id": f"{sym.lower()}-{quote}", "symbol": sym, "name": sym,
             "market_symbol": f"{sym}{NOBITEX_QUOTE}",
             "current_price": price, "total_volume": quote_volume,
-            "volume_src": base_volume, "market_cap": 0.0,
-            "market_cap_rank": 0,
+            "volume_24h_usdt": quote_volume, "volume_src": base_volume,
+            "market_cap": 0.0, "market_cap_rank": 0,
+            "liquidity_score": 0.0,
             "price_change_percentage_1h_in_currency": 0.0,
             "price_change_percentage_24h_in_currency": _safe_float(item.get("dayChange")),
             "price_change_percentage_7d_in_currency": 0.0,
@@ -890,22 +891,29 @@ async def market_universe():
         seen.add(row["symbol"])
         unique.append(row)
     unique.sort(key=lambda x: x["total_volume"], reverse=True)
+    total_markets = len(unique)
     for rank, row in enumerate(unique, 1):
-        row["market_cap_rank"] = rank  # local liquidity rank, not global market-cap rank
+        row["market_cap_rank"] = rank  # legacy field: local quote-volume rank, not market cap
+        row["liquidity_rank"] = rank
+        row["liquidity_score"] = (1.0 - (rank - 1) / max(1, total_markets - 1)) if total_markets else 0.0
 
-    # Enrich a broader liquid USDT shortlist; bounded concurrency protects the public API.
-    candidates = unique[:20]
+    # Enrich a broader liquid USDT shortlist with hourly volatility and daily regime.
+    candidates = unique[:25]
     sem = asyncio.Semaphore(4)
     async def enrich(row):
         async with sem:
             try:
                 h1, d1 = await asyncio.gather(
-                    nobitex_candles(row["symbol"], "1H", 3),
+                    nobitex_candles(row["symbol"], "1H", 168),
                     nobitex_candles(row["symbol"], "1D", 250),
                 )
                 if h1 is not None and len(h1) >= 2:
-                    row["price_change_percentage_1h_in_currency"] = (float(h1.close.iloc[-1]) / float(h1.close.iloc[-2]) - 1) * 100
-                    row["current_price"] = float(h1.close.iloc[-1])
+                    hc = h1.close.astype(float)
+                    row["price_change_percentage_1h_in_currency"] = (float(hc.iloc[-1]) / float(hc.iloc[-2]) - 1) * 100
+                    row["current_price"] = float(hc.iloc[-1])
+                    row["sparkline_in_7d"] = {"price": hc.tail(168).tolist()}
+                    hourly_returns = hc.pct_change().dropna() * 100
+                    row["realized_volatility_1h"] = float(hourly_returns.tail(168).std()) if len(hourly_returns) >= 24 else 0.0
                 if d1 is not None and len(d1) >= 2:
                     c = d1.close.astype(float)
                     for days, field in ((7,"price_change_percentage_7d_in_currency"),(14,"price_change_percentage_14d_in_currency"),(30,"price_change_percentage_30d_in_currency"),(200,"price_change_percentage_200d_in_currency")):
@@ -913,8 +921,8 @@ async def market_universe():
                             row[field] = (float(c.iloc[-1]) / float(c.iloc[-days-1]) - 1) * 100
                     peak = float(d1.high.max()) if len(d1) else 0
                     if peak > 0:
-                        row["ath_change_percentage"] = (float(c.iloc[-1]) / peak - 1) * 100
-                    row["sparkline_in_7d"] = {"price": c.tail(7).tolist()}
+                        # This is a 250-day high drawdown, not an all-time-high metric.
+                        row["drawdown_250d_pct"] = (float(c.iloc[-1]) / peak - 1) * 100
             except Exception as exc:
                 log.warning("Nobitex market enrichment failed %s: %s", row["symbol"], exc)
     await asyncio.gather(*(enrich(row) for row in candidates), return_exceptions=True)
@@ -959,9 +967,10 @@ def _market_growth_score(x, ta=None):
     score += _clamp(ch14 * 0.20, -5, 5)
     score += _clamp(ch30 * 0.12, -5, 5)
     # Nobitex does not publish circulating supply/market cap in public stats.
-    # Use exchange quote-volume rank as a transparent liquidity proxy.
-    rank = int(x.get("market_cap_rank") or 999)
-    score += _clamp((26 - rank) * 0.18, -4, 4)
+    # Use the percentile of actual USDT quote volume as a transparent liquidity proxy.
+    rank = int(x.get("liquidity_rank") or x.get("market_cap_rank") or 999)
+    liquidity = _clamp(_safe_float(x.get("liquidity_score"), 0.0), 0.0, 1.0)
+    score += _clamp((liquidity - 0.5) * 8.0, -4, 4)
     if ch24 > 6: score -= 10
     if ch24 > 12: score -= 10
     if ch7 > 18: score -= 10
@@ -979,9 +988,10 @@ def _market_growth_score(x, ta=None):
     return _clamp(score, 0, 100)
 
 def _growth_probability(score, x):
-    rank = float(x.get("market_cap_rank") or 10000)
-    rank_bonus = _clamp(10 - (rank / 25), -5, 10)
-    return _clamp(50 + (score - 50) * 0.75 + rank_bonus, 5, 95)
+    # Uncalibrated model confidence index, not a statistical win probability.
+    liquidity = _clamp(_safe_float(x.get("liquidity_score"), 0.0), 0.0, 1.0)
+    liquidity_adjustment = (liquidity - 0.5) * 10.0
+    return _clamp(50 + (score - 50) * 0.75 + liquidity_adjustment, 5, 95)
 
 async def growth_scan():
     rows = await market_universe()
@@ -1712,18 +1722,31 @@ def _market_structure(df, lookback=80):
         "swing_high": prev_res, "swing_low": prev_sup,
     }
 
-def _divergence(close, rsi, window=35):
-    c = close.tail(window).reset_index(drop=True)
-    r = rsi.tail(window).reset_index(drop=True)
-    if len(c) < 15:
+def _divergence(close, rsi, window=50):
+    """Detect regular RSI/MACD divergence from two confirmed swing pivots."""
+    c = pd.to_numeric(pd.Series(close).tail(window), errors="coerce").reset_index(drop=True)
+    r = pd.to_numeric(pd.Series(rsi).tail(window), errors="coerce").reset_index(drop=True)
+    valid = c.notna() & r.notna()
+    c, r = c[valid].reset_index(drop=True), r[valid].reset_index(drop=True)
+    if len(c) < 18:
         return "NONE"
-    half = max(5, len(c) // 2)
-    c1, c2 = float(c.iloc[:half].min()), float(c.iloc[half:].min())
-    r1, r2 = float(r.iloc[:half].min()), float(r.iloc[half:].min())
-    h1, h2 = float(c.iloc[:half].max()), float(c.iloc[half:].max())
-    rh1, rh2 = float(r.iloc[:half].max()), float(r.iloc[half:].max())
-    if c2 < c1 and r2 > r1 + 2: return "BULLISH"
-    if h2 > h1 and rh2 < rh1 - 2: return "BEARISH"
+    radius = 2
+    lows, highs = [], []
+    # Exclude the last two bars: a pivot is not confirmed until right-side bars close.
+    for i in range(radius, len(c) - radius):
+        cwin = c.iloc[i-radius:i+radius+1]
+        if float(c.iloc[i]) <= float(cwin.min()):
+            lows.append((float(c.iloc[i]), float(r.iloc[i])))
+        if float(c.iloc[i]) >= float(cwin.max()):
+            highs.append((float(c.iloc[i]), float(r.iloc[i])))
+    if len(lows) >= 2:
+        p1, p2 = lows[-2], lows[-1]
+        if p2[0] < p1[0] * 0.997 and p2[1] > p1[1] + 2.5:
+            return "BULLISH"
+    if len(highs) >= 2:
+        p1, p2 = highs[-2], highs[-1]
+        if p2[0] > p1[0] * 1.003 and p2[1] < p1[1] - 2.5:
+            return "BEARISH"
     return "NONE"
 
 def _tf_decision(symbol, df, timeframe):
@@ -2599,7 +2622,7 @@ def universal_crypto_prompt_report(a):
     if bt.get("available"):
         pf = f"{bt['profit_factor']:.2f}" if bt.get("profit_factor") is not None else "نامحدود/بدون زیان ثبت‌شده"
         bt_text = (
-            f"بک‌تست ۶ماهه روزانه: {bt['trades']} معامله | برد {bt['win_rate']:.1f}% | "
+            f"بک‌تست مرجع مستقل ۶ماهه روزانه: {bt['trades']} معامله | برد {bt['win_rate']:.1f}% | "
             f"Profit Factor {pf} | Max Drawdown {bt['max_drawdown']:.2f}% | "
             f"بازده شبیه‌سازی {bt['total_return']:+.2f}%\n"
         )
@@ -2613,11 +2636,11 @@ def universal_crypto_prompt_report(a):
           f"واگرایی روزانه: {b.get('daily_divergence', 'NONE')}\n"
         + f"📊 پروفایل حجم ۴ساعته: {vp}\n"
         + f"🔺 الگوهای احتمالی: {escape(pattern_text)}\n"
-        + f"🎯 خروجی شروط سخت‌گیرانه استراتژی: <b>{sig}</b>\n"
+        + f"🧪 تأیید مستقل استراتژی سخت‌گیرانه: <b>{sig}</b> (عامل کمکی، نه تصمیم نهایی)\n"
         + levels
         + bt_text
         + "📰 آن‌چین/اخبار/ترس‌وطمع: " + escape(b.get("fundamental_status", "داده معتبر در دسترس نیست")) + "\n"
-        + "🛡 مدیریت ریسک: ریسک هر معامله حداکثر ۲٪ سرمایه؛ حدضرر مرجع ۰.۷۵٪، هدف اول ۲.۲۵٪ (RR حداقل ۳:۱)، استفاده از تریلینگ‌استاپ پس از حرکت قیمت به سود.\n"
+        + "🛡 مدیریت ریسک: فاصله حدضرر با ATR و ساختار ۱ساعته تنظیم می‌شود؛ ریسک سرمایه پیشنهادی هر معامله حداکثر ۱٪ تا ۲٪ و اندازه موقعیت باید بر اساس فاصله حدضرر محاسبه شود.\n"
         + "⚠️ بک‌تست و امتیازها تضمین عملکرد آینده نیستند؛ اجرای سفارش و اندازه موقعیت را خودتان کنترل کنید.\n"
     )
 
@@ -2779,11 +2802,13 @@ async def professional_crypto_analysis(symbol):
 
     if candidate == "BUY":
         reasons = list(dict.fromkeys(
-            sum((tfs[k].get("reasons_buy") or []) for k in ("15m", "1H", "4H", "1D", "1W") if k in tfs)
+            reason for k in ("15m", "1H", "4H", "1D", "1W") if k in tfs
+            for reason in (tfs[k].get("reasons_buy") or [])
         ))[:8]
     elif candidate == "SELL":
         reasons = list(dict.fromkeys(
-            sum((tfs[k].get("reasons_sell") or []) for k in ("15m", "1H", "4H", "1D", "1W") if k in tfs)
+            reason for k in ("15m", "1H", "4H", "1D", "1W") if k in tfs
+            for reason in (tfs[k].get("reasons_sell") or [])
         ))[:8]
     else:
         reasons = ["شرایط هم‌زمان روند، ساختار و تأیید چندتایم‌فریمی برای ورود کافی نیست"]
@@ -2828,36 +2853,103 @@ async def professional_crypto_analysis(symbol):
     try:
         prompt_analysis = await asyncio.wait_for(_universal_crypto_prompt_analysis(s, tfs), timeout=35)
         out["prompt_analysis"] = prompt_analysis
-        # The requested strategy is the final signal gate for EVERY crypto symbol.
-        out["signal_candidate"] = prompt_analysis.get("candidate", "WAIT")
-        if out["signal_candidate"] in ("BUY", "SELL"):
-            out["price"] = prompt_analysis["entry"]
-            out["stop"] = prompt_analysis["stop"]
-            out["targets"] = [prompt_analysis["target1"], prompt_analysis["target2"],
-                              prompt_analysis["target2"]]
-            out["rr"] = prompt_analysis["rr"]
-            out["reasons_buy"] = (
-                ["شرایط استراتژی جامع: RSI اشباع فروش، حجم روزانه بالاتر از میانگین ۱۴روزه، "
-                 "واگرایی مثبت RSI/MACD و قیمت بالای MA50 روزانه"]
-                if out["signal_candidate"] == "BUY" else []
-            )
-            out["reasons_sell"] = (
-                ["شرایط استراتژی جامع: RSI اشباع خرید، واگرایی منفی، افت حجم و نشانه جهش/هیجان قیمت"]
-                if out["signal_candidate"] == "SELL" else []
-            )
-            out["signal_score"] = max(_safe_float(out.get("signal_score")), 75.0)
-        else:
-            out["stop"] = 0.0
-            out["targets"] = [0.0, 0.0, 0.0]
-            out["rr"] = 0.0
-        out["backtest"] = prompt_analysis.get("backtest")
+        # The independent strict strategy is corroborating evidence only.
+        # It must not erase a valid multi-timeframe setup merely because its
+        # rare oversold/divergence pattern is absent.
+        secondary_candidate = prompt_analysis.get("candidate", "WAIT")
+        out["secondary_strategy_candidate"] = secondary_candidate
+        out["secondary_strategy_agrees"] = bool(
+            out.get("signal_candidate") in ("BUY", "SELL")
+            and secondary_candidate == out.get("signal_candidate")
+        )
+        if (out.get("signal_candidate") in ("BUY", "SELL")
+                and secondary_candidate in ("BUY", "SELL")
+                and secondary_candidate != out.get("signal_candidate")):
+            out["signal_candidate"] = "WAIT"
+            out["reasons"] = list(out.get("reasons") or []) + [
+                "تعارض جهت بین موتور چندتایم‌فریمی و استراتژی مستقل؛ سیگنال تا رفع تعارض متوقف شد"
+            ]
+            out["reasons_buy"] = []
+            out["reasons_sell"] = []
+        elif out.get("signal_candidate") in ("BUY", "SELL") and out["secondary_strategy_agrees"]:
+            out["signal_score"] = min(100.0, _safe_float(out.get("signal_score")) + 3.0)
+        secondary_backtest = prompt_analysis.get("backtest")
+        if secondary_backtest and secondary_backtest.get("available"):
+            out["backtest"] = secondary_backtest
+        # Otherwise retain the independent 1H walk-forward report computed above.
+
     except Exception as e:
         log.exception("Universal crypto strategy overlay failed %s: %s", s, e)
         out["prompt_analysis"] = {"data_complete": False, "missing": ["دریافت/محاسبه داده"]}
-        out["signal_candidate"] = "WAIT"
+        out["secondary_strategy_candidate"] = "UNAVAILABLE"
+        out["secondary_strategy_agrees"] = False
+        # Keep the primary multi-timeframe result; a failed secondary report
+        # is a data-quality warning, not a reason to manufacture WAIT.
+        out["data_quality_warning"] = "استراتژی مستقل در دسترس نبود؛ خروجی اصلی بر پایه تحلیل چندتایم‌فریمی است."
+
+    # Dynamic execution levels use the 1H execution frame, real ATR and nearby
+    # market structure. Avoid fixed percentage stops that ignore each coin's volatility.
+    exec_tf = tfs.get("1H") or main
+    entry_price = _safe_float(exec_tf.get("price"), _safe_float(out.get("price")))
+    atr_exec = max(_safe_float(exec_tf.get("atr")), entry_price * 0.0001) if entry_price > 0 else 0.0
+    support_exec = _safe_float(exec_tf.get("support"))
+    resistance_exec = _safe_float(exec_tf.get("resistance"))
+    out["entry_price"] = entry_price
+    out["execution_timeframe"] = "1H"
+    out["risk_pct"] = 0.0
+    if out.get("signal_candidate") == "BUY" and entry_price > 0 and atr_exec > 0:
+        base_stop = entry_price - 1.5 * atr_exec
+        if 0 < support_exec < entry_price and (entry_price - support_exec) <= 2.5 * atr_exec:
+            stop = min(base_stop, support_exec - 0.10 * atr_exec)
+        else:
+            stop = base_stop
+        risk = entry_price - stop
+        risk_pct = risk / entry_price * 100 if entry_price else 0.0
+        if risk <= 0 or risk_pct < 0.20 or risk_pct > 6.0:
+            out["signal_candidate"] = "WAIT"
+            out["reasons"] = list(out.get("reasons") or []) + ["فاصله حد ضرر با نوسان واقعی بازار سازگار نیست؛ ورود متوقف شد"]
+            out["reasons_buy"] = []
+        else:
+            out["stop"] = stop
+            out["targets"] = [entry_price + 1.5*risk, entry_price + 2.5*risk, entry_price + 3.5*risk]
+            out["rr"] = 2.5
+            out["risk_pct"] = risk_pct
+    elif out.get("signal_candidate") == "SELL" and entry_price > 0 and atr_exec > 0:
+        base_stop = entry_price + 1.5 * atr_exec
+        if resistance_exec > entry_price and (resistance_exec - entry_price) <= 2.5 * atr_exec:
+            stop = max(base_stop, resistance_exec + 0.10 * atr_exec)
+        else:
+            stop = base_stop
+        risk = stop - entry_price
+        risk_pct = risk / entry_price * 100 if entry_price else 0.0
+        if risk <= 0 or risk_pct < 0.20 or risk_pct > 6.0:
+            out["signal_candidate"] = "WAIT"
+            out["reasons"] = list(out.get("reasons") or []) + ["فاصله حد ضرر با نوسان واقعی بازار سازگار نیست؛ ورود متوقف شد"]
+            out["reasons_sell"] = []
+        else:
+            out["stop"] = stop
+            out["targets"] = [entry_price - 1.5*risk, entry_price - 2.5*risk, entry_price - 3.5*risk]
+            out["rr"] = 2.5
+            out["risk_pct"] = risk_pct
+    if out.get("signal_candidate") == "WAIT":
         out["stop"] = 0.0
         out["targets"] = [0.0, 0.0, 0.0]
         out["rr"] = 0.0
+        out["entry_stage"] = "WAIT"
+
+    # Explicit market-regime and data-coverage diagnostics.
+    daily_tf = tfs.get("1D", {})
+    four_hour_tf = tfs.get("4H", {})
+    out["market_regime"] = (
+        "BULLISH" if daily_tf.get("trend") in ("BULLISH", "BULLISH_WEAK")
+        and four_hour_tf.get("trend") in ("BULLISH", "BULLISH_WEAK")
+        else "BEARISH" if daily_tf.get("trend") in ("BEARISH", "BEARISH_WEAK")
+        and four_hour_tf.get("trend") in ("BEARISH", "BEARISH_WEAK")
+        else "MIXED"
+    )
+    out["data_coverage"] = {tf: int(bar_counts.get(tf, 0)) for tf in bars}
+    out["confidence_score"] = _safe_float(out.get("probability"), 50.0)
+    out["confidence_calibrated"] = False
 
     # Exchange microstructure is a secondary filter, never a standalone signal.
     ob = None
@@ -2874,16 +2966,26 @@ async def professional_crypto_analysis(symbol):
             out["signal_candidate"] = "WAIT"
             out["stop"] = 0.0; out["targets"] = [0.0, 0.0, 0.0]; out["rr"] = 0.0
             out["reasons"] = list(out.get("reasons") or []) + ["اسپرد اردربوک نوبیتکس زیاد است؛ ورود به‌صرفه نیست"]
-        elif out.get("signal_candidate") == "BUY" and imbalance < -0.35:
+        elif out.get("signal_candidate") == "BUY" and imbalance < -0.55:
             out["signal_candidate"] = "WAIT"
             out["stop"] = 0.0; out["targets"] = [0.0, 0.0, 0.0]; out["rr"] = 0.0
             out["reasons_buy"] = []
             out["reasons"] = list(out.get("reasons") or []) + ["فشار سفارش‌های فروش در اردربوک بر خرید غالب است"]
-        elif out.get("signal_candidate") == "SELL" and imbalance > 0.35:
+        elif out.get("signal_candidate") == "SELL" and imbalance > 0.55:
             out["signal_candidate"] = "WAIT"
             out["stop"] = 0.0; out["targets"] = [0.0, 0.0, 0.0]; out["rr"] = 0.0
             out["reasons_sell"] = []
             out["reasons"] = list(out.get("reasons") or []) + ["فشار سفارش‌های خرید در اردربوک بر فروش غالب است"]
+        elif out.get("signal_candidate") == "BUY" and imbalance < -0.25:
+            out["reasons"] = list(out.get("reasons") or []) + ["عدم‌تعادل متوسط اردربوک به نفع فروش است؛ ورود با احتیاط"]
+        elif out.get("signal_candidate") == "SELL" and imbalance > 0.25:
+            out["reasons"] = list(out.get("reasons") or []) + ["عدم‌تعادل متوسط اردربوک به نفع خرید است؛ ورود با احتیاط"]
+
+    if out.get("signal_candidate") == "WAIT":
+        out["stop"] = 0.0
+        out["targets"] = [0.0, 0.0, 0.0]
+        out["rr"] = 0.0
+        out["entry_stage"] = "WAIT"
 
     ANALYSIS_CACHE.set(cache_key_a, out)
     return out
@@ -3181,12 +3283,12 @@ def signal_text(a):
     levels = ""
     if status in ("BUY", "SELL"):
         levels = (
-            f"\n💰 ورود: <b>{_format_price(a['symbol'], a['price'])}</b>\n"
+            f"\n💰 ورود مرجع ۱ساعته: <b>{_format_price(a['symbol'], a.get('entry_price', a['price']))}</b>\n"
             f"🛑 حد ضرر: <b>{_format_price(a['symbol'], a['stop'])}</b>\n"
             f"🎯 TP1: <b>{_format_price(a['symbol'], a['targets'][0])}</b>\n"
             f"🎯 TP2: <b>{_format_price(a['symbol'], a['targets'][1])}</b>\n"
             f"🎯 TP3: <b>{_format_price(a['symbol'], a['targets'][2])}</b>\n"
-            f"⚖️ R/R: <b>1:{a['rr']:.2f}</b>\n"
+            f"⚖️ R/R: <b>1:{a['rr']:.2f}</b> | ریسک فاصله حدضرر: <b>{_safe_float(a.get('risk_pct')):.2f}%</b>\n"
         )
     return (
         f"📡 <b>سیگنال معاملاتی {escape(a['symbol'])}</b>\n\n"
@@ -3196,7 +3298,7 @@ def signal_text(a):
         f"🧠 امتیاز اطمینان محاسباتی (کالیبره‌نشده): <b>{a['probability']:.0f}%</b>\n"
         f"🔁 تأیید متوالی: <b>{a['confirmations']}/{SIGNAL_CONFIRMATIONS_REQUIRED}</b> ({SIGNAL_CONFIRM_TIMEFRAME})\n"
         f"💪 قدرت تکنیکال: <b>{a['strength']:.0f}%</b>\n"
-        f"📈 روند: <b>{a['trend']}</b> | RSI: <b>{a['rsi']:.1f}</b> | ADX: <b>{a['adx']:.1f}</b>\n"
+        f"📈 روند: <b>{a['trend']}</b> | رژیم بازار: <b>{a.get('market_regime', 'MIXED')}</b> | RSI: <b>{a['rsi']:.1f}</b> | ADX: <b>{a['adx']:.1f}</b>\n"
         + (f"📚 اردربوک نوبیتکس: عدم‌تعادل {a['orderbook']['imbalance']*100:+.1f}% | اسپرد {a['orderbook']['spread_pct']:.3f}%\n\n" if a.get("orderbook") else "📚 اردربوک: داده در دسترس نیست\n\n")
         + f"🧩 منطق {direction_note}:\n{reasons_text}\n"
         f"{levels}\n"
@@ -3214,17 +3316,20 @@ def _short_term_scan_metrics(x, ta):
     ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
     ch14 = _safe_float(x.get("price_change_percentage_14d_in_currency"))
     volume = _safe_float(x.get("total_volume"))
-    rank = int(x.get("market_cap_rank") or 99999)  # Nobitex quote-volume rank
-    ath_change = _safe_float(x.get("ath_change_percentage"))
-    turnover = min(0.30, max(0.01, 0.30 / max(1.0, rank ** 0.5)))
+    rank = int(x.get("liquidity_rank") or x.get("market_cap_rank") or 99999)
+    drawdown_250d = _safe_float(x.get("drawdown_250d_pct"))
+    # Percentile of real 24h USDT quote volume among Nobitex USDT pairs.
+    # Keep the legacy `turnover` key for compatibility, but it is a liquidity score,
+    # not a turnover ratio or a fabricated market-cap metric.
+    turnover = _clamp(_safe_float(x.get("liquidity_score"), 0.0), 0.0, 1.0)
 
     spark = ((x.get("sparkline_in_7d") or {}).get("price") or [])
-    volatility = 0.0
-    if len(spark) >= 24:
+    volatility = _safe_float(x.get("realized_volatility_1h"), 0.0)
+    if volatility <= 0 and len(spark) >= 24:
         ps = pd.Series(spark, dtype=float).replace([float("inf"), float("-inf")], float('nan')).dropna()
         rets = ps.pct_change().dropna() * 100
         if len(rets) >= 12:
-            volatility = float(rets.tail(72).std())
+            volatility = float(rets.tail(168).std())
 
     score = 50.0
     reasons = []
@@ -3248,15 +3353,13 @@ def _short_term_scan_metrics(x, ta):
         score += 5; reasons.append("رتبه حجم معاملات نوبیتکس مناسب است")
     elif turnover < 0.02:
         score -= 8; reasons.append("رتبه حجم معاملات نوبیتکس پایین است")
-    if rank <= 5: score += 5
-    elif rank <= 15: score += 3
-    elif rank > 25: score -= 4
-    if -25 <= ath_change <= -5:
-        score += 5; reasons.append("فاصله مناسب از سقف تاریخی")
-    elif ath_change < -90:
-        score -= 5; reasons.append("افت بسیار عمیق از سقف دوره")
-    elif ath_change > -5:
-        score -= 4; reasons.append("نزدیک سقف تاریخی")
+    # Liquidity percentile above already includes the rank information; do not double-count it.
+    if -25 <= drawdown_250d <= -5:
+        score += 4; reasons.append("فاصله متعادل از سقف ۲۵۰روزه")
+    elif drawdown_250d < -60:
+        score -= 4; reasons.append("افت عمیق از سقف ۲۵۰روزه؛ ریسک ساختاری بالاتر")
+    elif drawdown_250d > -3:
+        score -= 3; reasons.append("نزدیک سقف ۲۵۰روزه؛ فضای رشد کوتاه‌مدت محدودتر")
 
     strength = float(ta.get("strength", 50)) if ta else 50.0
     if ta:
@@ -3318,7 +3421,8 @@ def _short_term_scan_metrics(x, ta):
     return {
         "score": score, "probability": probability, "strength": strength,
         "setup": setup, "risk": risk, "reasons": reasons[:5],
-        "volatility": volatility, "turnover": turnover, "ath_change": ath_change,
+        "volatility": volatility, "turnover": turnover, "liquidity_score": turnover,
+        "drawdown_250d": drawdown_250d, "volume_24h_usdt": _safe_float(x.get("volume_24h_usdt", volume)),
         "rank": rank, "price": price,
         "ch1": ch1, "ch24": ch24, "ch7": ch7, "ch14": ch14,
         "ta": ta,
@@ -3457,7 +3561,7 @@ async def _market_alert_scan():
         ch1 = _safe_float(x.get("price_change_percentage_1h_in_currency"))
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
-        turnover = min(0.30, max(0.01, 0.30 / max(1.0, float(x.get("market_cap_rank") or 999) ** 0.5)))
+        turnover = _clamp(_safe_float(x.get("liquidity_score"), 0.0), 0.0, 1.0)
         # Rank for early formation, not coins that have already pumped.
         # Seek the first acceleration phase: modest positive 1h momentum while
         # 24h/7d performance is still contained. Do not let a large turnover
@@ -4456,7 +4560,7 @@ async def short_term_growth_scan():
             continue
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
-        turnover = min(0.30, max(0.01, 0.30 / max(1.0, float(x.get("market_cap_rank") or 999) ** 0.5)))
+        turnover = _clamp(_safe_float(x.get("liquidity_score"), 0.0), 0.0, 1.0)
         # Prefer quiet accumulation / first momentum, penalize late vertical moves.
         ch1 = _safe_float(x.get("price_change_percentage_1h_in_currency"))
         rough_score = 50 + _clamp(ch1 * 1.10, -4, 4) + _clamp(ch24 * 0.10, -3, 3) + _clamp(ch7 * 0.035, -3, 3)
@@ -4551,7 +4655,7 @@ async def short_term_growth_menu(update, context):
                 f"💪 قدرت تکنیکال: <b>{m['strength']:.0f}%</b> | 🧠 امتیاز مدل (کالیبره‌نشده): <b>{m['probability']:.0f}%</b>\n"
                 f"📈 روند: {trend} | RSI: {rsi:.1f}\n"
                 f"⚡ 1h: {m['ch1']:+.2f}% | 24h: {m['ch24']:+.2f}% | 7d: {m['ch7']:+.2f}%\n"
-                f"💧 شاخص نقدشوندگی تخمینی: {m['turnover']*100:.1f}% | رتبه حجم نوبیتکس: #{m['rank']} | ریسک: <b>{escape(m['risk'])}</b>\n"
+                f"💧 صدک نقدشوندگی بر اساس حجم USDT: {m['turnover']*100:.1f}% | رتبه حجم نوبیتکس: #{m['rank']} | ریسک: <b>{escape(m['risk'])}</b>\n"
                 f"💵 قیمت: {_format_price(item['symbol'], m['price'])}\n"
                 f"🧩 " + "، ".join(escape(r) for r in m["reasons"][:4])
             )
@@ -4636,7 +4740,7 @@ async def _cycle_bottom_and_growth_scan(rows=None):
         symbol = norm_symbol(x.get("symbol") or "")
         if not symbol or symbol in {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "USDS"}:
             continue
-        ath_drop = _safe_float(x.get("ath_change_percentage"))
+        ath_drop = _safe_float(x.get("drawdown_250d_pct", x.get("ath_change_percentage")))
         atl_change = _safe_float(x.get("atl_change_percentage"), 999)
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
@@ -4694,8 +4798,8 @@ async def _cycle_bottom_and_growth_scan(rows=None):
         trend = str(ta.get("trend") or "NEUTRAL")
         rsi = _safe_float(ta.get("rsi"), 50)
         signal = str(ta.get("signal_candidate") or "WAIT")
-        # Opportunity lists must be selected by the same universal prompt engine;
-        # a trend/price-rank candidate without a prompt BUY is not advertised as a buy.
+        # Opportunity lists require the primary multi-timeframe BUY decision;
+        # the independent strict strategy is only corroborating evidence.
         if signal != "BUY":
             continue
         late_entry = (bool(ta.get("late_move_risk"))
@@ -4726,7 +4830,7 @@ async def _cycle_bottom_and_growth_scan(rows=None):
 def _cycle_growth_report(data):
     lines = ["🧭 <b>فرصت‌های کف اصلاحی و رشد احتمالی</b>",
              "این فهرست نامزد پایش است، نه ادعای تشخیص کف قطعی یا تضمین رشد.", ""]
-    labels = (("bottom", "🪙 <b>اصلاح عمیق با نشانه‌های تثبیت</b>", "افت از سقف تاریخی"),
+    labels = (("bottom", "🪙 <b>اصلاح عمیق با نشانه‌های تثبیت</b>", "افت از سقف ۲۵۰روزه"),
               ("growth", "🚀 <b>رمزارزهای دارای مومنتوم رشد</b>", "تغییر ۷روزه"))
     for key, title, metric in labels:
         lines.append(title)
@@ -4739,7 +4843,7 @@ def _cycle_growth_report(data):
             ta = item["ta"]
             signal = "🟢 خرید تکنیکال" if item["signal"] == "BUY" else "🟡 فقط پایش"
             if key == "bottom":
-                measure = f"فاصله از سقف دوره: {item['ath_drop']:.1f}%"
+                measure = f"فاصله از سقف ۲۵۰روزه: {item['ath_drop']:.1f}%"
             else:
                 measure = f"۷روزه: {item['ch7']:+.1f}%"
             lines.append(f"• <b>{escape(item['symbol'])}</b> — {signal} | {measure} | RSI {_safe_float(ta.get('rsi'), 50):.1f} | قدرت {_safe_float(ta.get('strength')):.0f}%")
