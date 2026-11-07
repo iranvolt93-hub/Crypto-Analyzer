@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Crypto / Global Gold / Iran 18K Gold Telegram Analyzer
-Railway production build — v17.2 (live OKX WebSocket + indicator correctness + MTF safety release)
+Nobitex market-data build — v18.0 (Nobitex OHLCV + stricter multi-timeframe confirmation)
 """
 
 import os
@@ -87,16 +87,10 @@ MARKET_SCAN_SECONDS = max(300, int(os.getenv("MARKET_SCAN_SECONDS", "600")))
 MARKET_SCAN_DEEP = max(5, min(12, int(os.getenv("MARKET_SCAN_DEEP", "8"))))
 MARKET_SCAN_CACHE = None
 SHORT_TERM_SCAN_CACHE = None
-OKX_BASE_URL = os.getenv("OKX_BASE_URL", "https://www.okx.com").rstrip("/")
-OKX_WS_URL = os.getenv("OKX_WS_URL", "wss://ws.okx.com:8443/ws/v5/public").strip()
-OKX_WS_ENABLED = os.getenv("OKX_WS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
-OKX_WS_STALE_SECONDS = max(5, int(os.getenv("OKX_WS_STALE_SECONDS", "20")))
-OKX_WS_SYMBOLS = set()
-OKX_WS_PRICES = {}
-OKX_WS_TASK = None
-OKX_WS_STATUS = {"connected": False, "last_message": None, "last_error": None}
-OKX_CANDLE_CACHE_SECONDS = max(20, int(os.getenv("OKX_CANDLE_CACHE_SECONDS", "60")))
-OKX_MAX_CONCURRENCY = max(2, min(8, int(os.getenv("OKX_MAX_CONCURRENCY", "6"))))
+NOBITEX_BASE_URL = os.getenv("NOBITEX_BASE_URL", "https://apiv2.nobitex.ir").rstrip("/")
+NOBITEX_QUOTE = "IRT"  # Keep every crypto OHLC series on the Toman-quoted IRT market
+NOBITEX_CANDLE_CACHE_SECONDS = max(20, int(os.getenv("NOBITEX_CANDLE_CACHE_SECONDS", "60")))
+NOBITEX_MAX_CONCURRENCY = max(2, min(8, int(os.getenv("NOBITEX_MAX_CONCURRENCY", "4"))))
 
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "ثبت نشده").strip()
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "پشتیبان").strip()
@@ -166,13 +160,13 @@ class LRUTTLCache:
 CACHE = LRUTTLCache(maxsize=int(os.getenv("CACHE_MAX_ENTRIES", "2000")))
 PRICE_CACHE = LRUTTLCache(maxsize=int(os.getenv("PRICE_CACHE_MAX", "500")))
 ANALYSIS_CACHE = LRUTTLCache(maxsize=int(os.getenv("ANALYSIS_CACHE_MAX", "300")))
-OKX_CANDLE_CACHE = LRUTTLCache(maxsize=int(os.getenv("OKX_CANDLE_MAX", "600")))
+NOBITEX_CANDLE_CACHE = LRUTTLCache(maxsize=int(os.getenv("NOBITEX_CANDLE_MAX", "600")))
 GOLD18_CACHE = None
 XAU_CACHE = None
 
 _DB_PREPARED = False
 _DB_PREPARE_LOCK = asyncio.Lock()
-_OKX_SEM = asyncio.Semaphore(OKX_MAX_CONCURRENCY)
+_NOBITEX_SEM = asyncio.Semaphore(NOBITEX_MAX_CONCURRENCY)
 
 MAIN_MENU = [
     ["🪙 افزودن دارایی", "📋 واچ‌لیست"],
@@ -821,125 +815,113 @@ def asset_type(symbol):
     return "gold" if s == "XAU" else "gold18" if s == "GOLD18" else "crypto"
 
 async def crypto_search(query):
+    """Resolve a crypto ticker only when a matching Nobitex spot market exists."""
     raw = (query or "").strip()
     if not raw:
         return []
     direct = norm_symbol(raw)
-    if direct in COINS:
-        return [(direct, COINS[direct], direct)]
-
-    # Search both the user's original text and its normalized ticker/name form.
-    # This covers common pairs (e.g. PEPE/USDT) and avoids depending on one query.
-    terms = []
-    for term in (raw, direct, raw.replace("/", " ").replace("-", " ")):
-        term = term.strip()
-        if term and term.casefold() not in {x.casefold() for x in terms}:
-            terms.append(term)
-
-    found, seen = [], set()
-    for term in terms[:3]:
-        data = await http_json(
-            "https://api.coingecko.com/api/v3/search",
-            {"query": term}, ttl=60, retries=2
-        )
-        for coin in (data or {}).get("coins", [])[:30]:
-            sym = norm_symbol(coin.get("symbol") or "")
-            cid = str(coin.get("id") or "").strip()
-            name = str(coin.get("name") or sym).strip()
-            if not sym or not cid or cid in seen:
-                continue
-            seen.add(cid)
-            found.append({
-                "symbol": sym, "id": cid, "name": name,
-                "rank": int(coin.get("market_cap_rank") or 10**9),
-                "exact_symbol": sym.casefold() == direct.casefold(),
-                "exact_name": name.casefold() == raw.casefold(),
-            })
-        # Avoid needless extra requests if we already have exact ticker matches.
-        if any(x["exact_symbol"] for x in found):
-            break
-
-    # The search endpoint can occasionally return no rows (or be throttled).
-    # Fall back to the cached public coin directory for exact ticker/name matches.
-    if not found:
-        directory = await http_json(
-            "https://api.coingecko.com/api/v3/coins/list",
-            {"include_platform": "false"}, ttl=21600, retries=2
-        )
-        query_symbol = direct.casefold()
-        query_name = raw.casefold().strip()
-        fallback = []
-        for coin in directory or []:
-            sym = norm_symbol(coin.get("symbol") or "")
-            cid = str(coin.get("id") or "").strip()
-            name = str(coin.get("name") or sym).strip()
-            if not sym or not cid:
-                continue
-            if sym.casefold() == query_symbol or name.casefold() == query_name or cid.casefold() == query_name:
-                fallback.append((sym, cid, name))
-        # Exact symbol matches first; keep multiple same-ticker assets selectable.
-        fallback.sort(key=lambda x: (x[0].casefold() != query_symbol, x[2].casefold()))
-        return fallback[:20]
-
-    found.sort(key=lambda x: (
-        not x["exact_symbol"], not x["exact_name"], x["rank"], x["name"].casefold()
-    ))
-    return [(x["symbol"], x["id"], x["name"]) for x in found[:20]]
+    rows = await market_universe()
+    matches = [x for x in rows if x.get("symbol", "").casefold() == direct.casefold()]
+    if not matches:
+        # Search by known display names only after the ticker is normalized.
+        matches = [x for x in rows if str(x.get("name", "")).casefold() == raw.casefold()]
+    return [(x["symbol"], x["market_symbol"], x.get("name", x["symbol"])) for x in matches[:20]]
 
 async def crypto_data(symbol, coin_id=None):
+    """Hourly OHLCV history from Nobitex; all values are in the market quote unit."""
     s = norm_symbol(symbol)
-    cid = coin_id or COINS.get(s)
-    if not cid:
-        res = await crypto_search(s)
-        if not res:
-            return None
-        s, cid, _ = res[0]
-
-    data = await http_json(
-        f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart",
-        {"vs_currency":"usd","days":"30","interval":"hourly"},
-        ttl=CACHE_SECONDS
-    )
-    if not data or not data.get("prices"):
+    df = await nobitex_candles(s, "1H", 500)
+    if df is None or len(df) < 50:
         return None
-
-    prices = pd.Series([float(x[1]) for x in data["prices"]], dtype=float)
-    vols = pd.Series([float(x[1]) for x in data.get("total_volumes", [])], dtype=float)
-    return s, prices, vols
+    return s, df["close"].astype(float).reset_index(drop=True), df["volume"].astype(float).reset_index(drop=True)
 
 async def market_universe():
+    """Build a liquid Nobitex market universe and enrich top markets with local OHLC returns."""
     global MARKET_SCAN_CACHE
     now = time.monotonic()
     if MARKET_SCAN_CACHE and now - MARKET_SCAN_CACHE[0] < MARKET_SCAN_SECONDS:
         return MARKET_SCAN_CACHE[1]
 
-    all_rows, seen = [], set()
-    for page in range(1, MARKET_SCAN_PAGES + 1):
-        data = await http_json(
-            "https://api.coingecko.com/api/v3/coins/markets",
-            {
-                "vs_currency":"usd", "order":"market_cap_desc",
-                "per_page":MARKET_SCAN_PER_PAGE, "page":page,
-                "sparkline":"false",
-                "price_change_percentage":"1h,24h,7d,14d,30d,200d,1y",
-            }, ttl=MARKET_SCAN_SECONDS, retries=2
-        )
-        if not data:
-            break
-        for x in data:
-            cid = x.get("id")
-            if not cid or cid in seen:
-                continue
-            seen.add(cid)
-            all_rows.append(x)
-        if len(data) < MARKET_SCAN_PER_PAGE:
-            break
-        await asyncio.sleep(0.35)
+    data = await http_json(f"{NOBITEX_BASE_URL}/market/stats", {"dstCurrency": "rls"}, ttl=MARKET_SCAN_SECONDS, retries=2)
+    stats = (data or {}).get("stats") or {}
+    rows = []
+    for key, item in stats.items():
+        if not isinstance(item, dict) or "-" not in key or item.get("isClosed") is True:
+            continue
+        base, quote = key.lower().split("-", 1)
+        if quote not in {"rls", "irt"}:
+            continue
+        sym = base.upper()
+        if not sym or sym in {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE"}:
+            continue
+        # Stats dstCurrency=rls is explicitly Rial. Normalize it to Toman.
+        raw_price = _safe_float(item.get("latest") or item.get("dayClose"))
+        price = raw_price / 10.0 if quote == "rls" else raw_price
+        quote_volume = _safe_float(item.get("volumeDst")) / (10.0 if quote == "rls" else 1.0)
+        base_volume = _safe_float(item.get("volumeSrc"))
+        if price <= 0 or quote_volume <= 0:
+            continue
+        rows.append({
+            "id": f"{sym.lower()}-{quote}", "symbol": sym, "name": sym,
+            "market_symbol": f"{sym}{NOBITEX_QUOTE}",
+            "current_price": price, "total_volume": quote_volume,
+            "volume_src": base_volume, "market_cap": 0.0,
+            "market_cap_rank": 0,
+            "price_change_percentage_1h_in_currency": 0.0,
+            "price_change_percentage_24h_in_currency": _safe_float(item.get("dayChange")),
+            "price_change_percentage_7d_in_currency": 0.0,
+            "price_change_percentage_14d_in_currency": 0.0,
+            "price_change_percentage_30d_in_currency": 0.0,
+            "price_change_percentage_200d_in_currency": 0.0,
+            "price_change_percentage_1y_in_currency": 0.0,
+            "ath_change_percentage": 0.0, "atl_change_percentage": 0.0,
+            "day_high": _safe_float(item.get("dayHigh")) / (10.0 if quote == "rls" else 1.0),
+            "day_low": _safe_float(item.get("dayLow")) / (10.0 if quote == "rls" else 1.0),
+            "day_open": _safe_float(item.get("dayOpen")) / (10.0 if quote == "rls" else 1.0),
+            "source": "Nobitex",
+        })
 
-    MARKET_SCAN_CACHE = (now, all_rows)
-    log.info("MARKET SCAN universe=%s pages=%s", len(all_rows), MARKET_SCAN_PAGES)
-    return all_rows
+    # Prefer IRT markets; never mix IRT and USDT candles in one analysis.
+    rows.sort(key=lambda x: (x["market_symbol"].endswith("IRT"), x["total_volume"]), reverse=True)
+    unique, seen = [], set()
+    for row in rows:
+        if row["symbol"] in seen:
+            continue
+        seen.add(row["symbol"])
+        unique.append(row)
+    unique.sort(key=lambda x: x["total_volume"], reverse=True)
+    for rank, row in enumerate(unique, 1):
+        row["market_cap_rank"] = rank  # local liquidity rank, not global market-cap rank
 
+    # 25 × (1H + 1D) requests stay below the documented public OHLC request budget.
+    candidates = unique[:12]
+    sem = asyncio.Semaphore(4)
+    async def enrich(row):
+        async with sem:
+            try:
+                h1, d1 = await asyncio.gather(
+                    nobitex_candles(row["symbol"], "1H", 3),
+                    nobitex_candles(row["symbol"], "1D", 250),
+                )
+                if h1 is not None and len(h1) >= 2:
+                    row["price_change_percentage_1h_in_currency"] = (float(h1.close.iloc[-1]) / float(h1.close.iloc[-2]) - 1) * 100
+                    row["current_price"] = float(h1.close.iloc[-1])
+                if d1 is not None and len(d1) >= 2:
+                    c = d1.close.astype(float)
+                    for days, field in ((7,"price_change_percentage_7d_in_currency"),(14,"price_change_percentage_14d_in_currency"),(30,"price_change_percentage_30d_in_currency"),(200,"price_change_percentage_200d_in_currency")):
+                        if len(c) > days:
+                            row[field] = (float(c.iloc[-1]) / float(c.iloc[-days-1]) - 1) * 100
+                    peak = float(d1.high.max()) if len(d1) else 0
+                    if peak > 0:
+                        row["ath_change_percentage"] = (float(c.iloc[-1]) / peak - 1) * 100
+                    row["sparkline_in_7d"] = {"price": c.tail(7).tolist()}
+            except Exception as exc:
+                log.warning("Nobitex market enrichment failed %s: %s", row["symbol"], exc)
+    await asyncio.gather(*(enrich(row) for row in candidates), return_exceptions=True)
+
+    MARKET_SCAN_CACHE = (now, unique)
+    log.info("NOBITEX MARKET SCAN markets=%s enriched=%s", len(unique), len(candidates))
+    return unique
 
 def _clamp(v, lo=0, hi=100):
     return max(lo, min(hi, float(v)))
@@ -962,7 +944,7 @@ def _market_growth_score(x, ta=None):
     ch30 = _safe_float(x.get("price_change_percentage_30d_in_currency"))
     vol = _safe_float(x.get("total_volume"))
     mcap = _safe_float(x.get("market_cap"))
-    if not mcap or not vol:
+    if vol <= 0:
         return None
 
     changes = [ch1, ch24, ch7, ch14, ch30]
@@ -976,8 +958,10 @@ def _market_growth_score(x, ta=None):
     score += _clamp(ch7 * 0.40, -8, 8)
     score += _clamp(ch14 * 0.20, -5, 5)
     score += _clamp(ch30 * 0.12, -5, 5)
-    turnover = vol / mcap
-    score += _clamp((turnover - 0.05) * 80, -5, 8)
+    # Nobitex does not publish circulating supply/market cap in public stats.
+    # Use exchange quote-volume rank as a transparent liquidity proxy.
+    rank = int(x.get("market_cap_rank") or 999)
+    score += _clamp((26 - rank) * 0.18, -4, 4)
     if ch24 > 6: score -= 10
     if ch24 > 12: score -= 10
     if ch7 > 18: score -= 10
@@ -996,7 +980,7 @@ def _market_growth_score(x, ta=None):
 
 def _growth_probability(score, x):
     rank = float(x.get("market_cap_rank") or 10000)
-    rank_bonus = _clamp(10 - (rank / 1000), -5, 10)
+    rank_bonus = _clamp(10 - (rank / 25), -5, 10)
     return _clamp(50 + (score - 50) * 0.75 + rank_bonus, 5, 95)
 
 async def growth_scan():
@@ -1434,159 +1418,29 @@ async def asset_data(symbol, coin_id=None):
         return await gold18_data()
     return await crypto_data(s, coin_id=coin_id)
 
-async def okx_ws_worker():
-    """Maintain a reconnecting public OKX ticker stream; no API key is required."""
-    if not OKX_WS_ENABLED:
-        log.info("OKX WebSocket disabled by configuration")
-        return
-    backoff = 2
-    while True:
-        ws = None
-        try:
-            session = await get_session()
-            ws = await session.ws_connect(
-                OKX_WS_URL, heartbeat=20, receive_timeout=45,
-                timeout=aiohttp.ClientTimeout(total=20), max_msg_size=2**20,
-            )
-            OKX_WS_STATUS.update(connected=True, last_error=None)
-            log.info("OKX public WebSocket connected")
-            subscribed = set()
-            backoff = 2
-            while not ws.closed:
-                pending = sorted(OKX_WS_SYMBOLS - subscribed)
-                if pending:
-                    args = [{"channel": "tickers", "instId": inst} for inst in pending]
-                    # OKX accepts bounded subscribe batches.
-                    for offset in range(0, len(args), 50):
-                        await ws.send_json({"op": "subscribe", "args": args[offset:offset+50]})
-                    subscribed.update(pending)
-                try:
-                    msg = await ws.receive(timeout=2)
-                except asyncio.TimeoutError:
-                    continue
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    try:
-                        payload = json.loads(msg.data)
-                    except Exception:
-                        continue
-                    if payload.get("event") == "error":
-                        log.warning("OKX WS subscription error: %s", payload)
-                        continue
-                    arg = payload.get("arg") or {}
-                    if arg.get("channel") != "tickers":
-                        continue
-                    for row in payload.get("data") or []:
-                        try:
-                            inst = str(row.get("instId") or "").upper()
-                            last = float(row.get("last") or 0)
-                            open24 = float(row.get("open24h") or 0)
-                            if not inst or last <= 0:
-                                continue
-                            change24 = ((last / open24) - 1.0) * 100.0 if open24 > 0 else None
-                            OKX_WS_PRICES[inst] = {
-                                "price": last, "change24": change24,
-                                "received_at": time.monotonic(),
-                                "exchange_ts": row.get("ts"),
-                            }
-                            OKX_WS_STATUS.update(last_message=time.time())
-                        except (TypeError, ValueError):
-                            continue
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE,
-                                  aiohttp.WSMsgType.ERROR):
-                    raise ConnectionError(f"OKX WebSocket closed: {msg.type}")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            OKX_WS_STATUS.update(connected=False, last_error=str(exc)[:300])
-            log.warning("OKX WebSocket disconnected: %s; retry in %ss", exc, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(30, backoff * 2)
-        finally:
-            OKX_WS_STATUS["connected"] = False
-            if ws is not None and not ws.closed:
-                await ws.close()
-
-
-def okx_ws_price(symbol):
-    inst = f"{norm_symbol(symbol)}-USDT".upper()
-    item = OKX_WS_PRICES.get(inst)
-    if not item or time.monotonic() - item.get("received_at", 0) > OKX_WS_STALE_SECONDS:
-        return None
-    result = {
-        "symbol": norm_symbol(symbol), "price": float(item["price"]),
-        "unit": "دلار", "source": "OKX WebSocket زنده",
-        "live": True, "exchange_ts": item.get("exchange_ts"),
-    }
-    if item.get("change24") is not None:
-        result["change24"] = float(item["change24"])
-    return result
-
-
 async def current_price(symbol, coin_id=None):
     s = norm_symbol(symbol)
-    cache_key_price = (s, coin_id or COINS.get(s) or s)
-    # Prefer a fresh exchange stream tick over cached REST prices.
-    if s not in ("GOLD18", "XAU") and OKX_WS_ENABLED:
-        inst = f"{s}-USDT".upper()
-        OKX_WS_SYMBOLS.add(inst)
-        live = okx_ws_price(s)
-        if live:
-            PRICE_CACHE.set(cache_key_price, live)
-            return live
-        # Give the on-demand WebSocket subscription a brief chance to deliver.
-        for _ in range(4):
-            await asyncio.sleep(0.25)
-            live = okx_ws_price(s)
-            if live:
-                PRICE_CACHE.set(cache_key_price, live)
-                return live
-
-    item = PRICE_CACHE.get(cache_key_price, PRICE_CACHE_SECONDS)
-    if item and not item.get("live"):
-        return item
-
-    result = None
-
+    cache_key_price = (s, "nobitex")
+    cached = PRICE_CACHE.get(cache_key_price, PRICE_CACHE_SECONDS)
+    if cached is not None:
+        return cached
     if s == "GOLD18":
         data = await gold18_data()
-        if data:
-            result = {
-                "symbol": "GOLD18",
-                "price": float(data[1].iloc[-1]),
-                "unit": "تومان برای هر گرم طلای ۱۸ عیار ایران",
-                "source": "TGJU",
-            }
+        result = {"symbol": s, "price": float(data[1].iloc[-1]), "unit": "تومان برای هر گرم طلای ۱۸ عیار ایران", "source": "TGJU"} if data else None
     elif s == "XAU":
         value = await xau_tgju_price()
-        if value is not None:
-            result = {
-                "symbol": "XAU",
-                "price": float(value),
-                "unit": "دلار برای هر اونس",
-                "source": "TGJU",
-            }
+        result = {"symbol": s, "price": float(value), "unit": "دلار برای هر اونس", "source": "TGJU"} if value is not None else None
     else:
-        cid = coin_id or COINS.get(s)
-        if not cid:
-            res = await crypto_search(s)
-            if res:
-                s, cid, _ = res[0]
-        if cid:
-            data = await http_json(
-                "https://api.coingecko.com/api/v3/simple/price",
-                {"ids": cid, "vs_currencies": "usd", "include_24hr_change": "true"},
-                ttl=PRICE_CACHE_SECONDS
-            )
-            try:
-                it = data[cid]
-                result = {
-                    "symbol": s, "price": float(it["usd"]),
-                    "change24": float(it.get("usd_24h_change") or 0),
-                    "unit": "دلار", "source": "CoinGecko",
-                }
-            except Exception:
-                pass
-
+        data = await http_json(f"{NOBITEX_BASE_URL}/market/stats", {"srcCurrency": s.lower(), "dstCurrency": "rls"}, ttl=PRICE_CACHE_SECONDS, retries=2)
+        stats = (data or {}).get("stats") or {}
+        item = stats.get(f"{s.lower()}-rls") or stats.get(f"{s.lower()}-irt")
+        if item:
+            raw = _safe_float(item.get("latest") or item.get("dayClose"))
+            price = raw / 10.0 if f"{s.lower()}-rls" in stats else raw
+            result = {"symbol": s, "price": price, "change24": _safe_float(item.get("dayChange")),
+                      "unit": "تومان", "source": "Nobitex"}
+        else:
+            result = None
     if result:
         PRICE_CACHE.set(cache_key_price, result)
     return result
@@ -1601,7 +1455,8 @@ def format_live_price(item):
     elif item["symbol"] == "XAU":
         value = f"{p:,.2f}"
     else:
-        value = f"{p:,.8f}".rstrip("0").rstrip(".")
+        number = f"{p:,.0f}" if p >= 1000 else (f"{p:,.4f}".rstrip("0").rstrip(".") if p >= 1 else f"{p:,.8f}".rstrip("0").rstrip("."))
+        value = number + " تومان"
     text = (
         f"💰 <b>{s}</b>\n"
         f"قیمت فعلی: <b>{value}</b>\n"
@@ -1615,50 +1470,74 @@ def format_live_price(item):
 
 
 # ============================================================
-# PROFESSIONAL OHLCV (OKX) — v17
+# PROFESSIONAL OHLCV (NOBITEX) — v18
 # ============================================================
 
-async def okx_candles(symbol, bar="1H", limit=240):
+async def nobitex_candles(symbol, bar="1H", limit=240):
+    """Nobitex OHLC candles. Returned price series use IRT (Toman) consistently."""
     s = norm_symbol(symbol)
-    inst = f"{s}-USDT"
-    key = (inst, bar, int(limit))
-    cached = OKX_CANDLE_CACHE.get(key, OKX_CANDLE_CACHE_SECONDS)
+    resolution = {"5m":"5", "15m":"15", "1H":"60", "4H":"240", "1D":"D", "D":"D"}.get(bar, str(bar))
+    if bar == "1W":
+        # Weekly candles are not natively offered; derive them from daily candles.
+        daily = await nobitex_candles(s, "1D", min(500, max(240, int(limit))))
+        if daily is None or len(daily) < 200:
+            return None
+        weekly = daily.set_index(pd.to_datetime(daily["ts"], unit="s", utc=True)).resample("W-SUN").agg(
+            {"open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"}
+        ).dropna().reset_index(names="ts")
+        weekly["ts"] = (weekly["ts"].astype("int64") // 10**9).astype(int)
+        return weekly.tail(min(500, int(limit))).reset_index(drop=True) if len(weekly) >= 200 else None
+
+    market_symbol = f"{s}{NOBITEX_QUOTE}"
+    key = ("NOBITEX", market_symbol, resolution, int(limit))
+    cached = NOBITEX_CANDLE_CACHE.get(key, NOBITEX_CANDLE_CACHE_SECONDS)
     if cached is not None:
         return cached.copy()
-
-    async with _OKX_SEM:
-        data = await http_json(
-            f"{OKX_BASE_URL}/api/v5/market/candles",
-            {"instId": inst, "bar": bar, "limit": str(min(300, int(limit)))},
-            ttl=OKX_CANDLE_CACHE_SECONDS, retries=2,
-        )
-    rows = (data or {}).get("data") or []
-    parsed = []
-    for row in rows:
-        if len(row) < 6:
-            continue
-        try:
-            parsed.append({
-                "ts": int(row[0]),
-                "open": float(row[1]), "high": float(row[2]),
-                "low": float(row[3]), "close": float(row[4]),
-                "volume": float(row[5]),
-                "confirm": int(row[8]) if len(row) > 8 and str(row[8]).isdigit() else 0,
-            })
-        except Exception:
-            continue
-    if not parsed:
+    params = {"symbol": market_symbol, "resolution": resolution,
+              "to": str(int(time.time())), "countback": str(min(500, max(2, int(limit))))}
+    async with _NOBITEX_SEM:
+        data = await http_json(f"{NOBITEX_BASE_URL}/market/udf/history", params,
+                               ttl=NOBITEX_CANDLE_CACHE_SECONDS, retries=2)
+    if not data or data.get("s") != "ok":
+        # Some markets are listed only against RLS; use their explicitly Rial ticker,
+        # then normalize all OHLC prices to Toman before analysis.
+        if NOBITEX_QUOTE == "IRT":
+            params["symbol"] = f"{s}RLS"
+            async with _NOBITEX_SEM:
+                data = await http_json(f"{NOBITEX_BASE_URL}/market/udf/history", params,
+                                       ttl=NOBITEX_CANDLE_CACHE_SECONDS, retries=1)
+            price_factor = 0.1
+        else:
+            price_factor = 1.0
+    else:
+        price_factor = 1.0
+    if not data or data.get("s") != "ok":
         return None
-
-    df = pd.DataFrame(parsed).drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-    # OKX marks the currently forming candle with confirm=0. Never use it
-    # for indicators or signal confirmation.
-    df = df[df["confirm"] == 1].copy().reset_index(drop=True)
-    if len(df) < 200:
-        log.warning("OKX confirmed candle history too short for EMA200 %s %s: %s", inst, bar, len(df))
+    try:
+        ts, oo, hh, ll, cc, vv = (data.get(k) or [] for k in ("t","o","h","l","c","v"))
+        n = min(map(len, (ts,oo,hh,ll,cc,vv)))
+        if n < 2:
+            return None
+        df = pd.DataFrame({"ts":ts[:n], "open":oo[:n], "high":hh[:n], "low":ll[:n], "close":cc[:n], "volume":vv[:n]})
+        for col in ("open","high","low","close"):
+            df[col] = pd.to_numeric(df[col], errors="coerce") * price_factor
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
+        df = df.dropna().drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+        seconds = {"1":"60", "5":"300", "15":"900", "30":"1800", "60":"3600", "180":"10800", "240":"14400", "360":"21600", "720":"43200", "D":"86400"}.get(resolution, 3600)
+        # Exclude the currently forming candle; indicators only see closed bars.
+        now = int(time.time())
+        df = df[(df["ts"].astype(int) + seconds) <= now].copy().reset_index(drop=True)
+        required_bars = min(200, max(2, int(limit)))
+        if len(df) < required_bars:
+            log.warning("Nobitex confirmed candle history short %s %s: %s/%s", market_symbol, resolution, len(df), required_bars)
+            return None
+        df["confirm"] = 1
+        NOBITEX_CANDLE_CACHE.set(key, df.copy())
+        return df.tail(min(500, int(limit))).reset_index(drop=True)
+    except Exception:
+        log.exception("Nobitex OHLC parse failed %s %s", market_symbol, resolution)
         return None
-    OKX_CANDLE_CACHE.set(key, df.copy())
-    return df
 
 def _wilder_smooth(series, period=14):
     """Wilder smoothing seeded with the first period's simple average."""
@@ -2053,7 +1932,7 @@ def _tf_decision(symbol, df, timeframe):
         "reasons_buy": list(dict.fromkeys(rb))[:8],
         "reasons_sell": list(dict.fromkeys(rs))[:8],
         "stop": stop, "targets": targets, "rr": rr,
-        "history_points": len(df), "data_source": "OKX OHLCV professional",
+        "history_points": len(df), "data_source": "Nobitex OHLCV professional",
     }
 
 
@@ -2090,11 +1969,16 @@ def _adx(p, period=14):
     return adx, dip, dim
 
 def _format_price(symbol, value):
-    if symbol == "GOLD18": return f"{value:,.0f}"
-    if symbol == "XAU": return f"{value:,.2f}"
-    if abs(value) >= 1000: return f"{value:,.2f}"
-    if abs(value) >= 1: return f"{value:,.4f}"
-    return f"{value:,.8f}".rstrip("0").rstrip(".")
+    value = _safe_float(value)
+    if symbol == "GOLD18": return f"{value:,.0f} تومان"
+    if symbol == "XAU": return f"{value:,.2f} دلار"
+    if abs(value) >= 1000:
+        number = f"{value:,.0f}"
+    elif abs(value) >= 1:
+        number = f"{value:,.4f}".rstrip("0").rstrip(".")
+    else:
+        number = f"{value:,.8f}".rstrip("0").rstrip(".")
+    return number + " تومان"
 
 def technical_analysis(symbol, prices, volumes=None):
     p = pd.to_numeric(pd.Series(prices), errors="coerce")
@@ -2262,7 +2146,7 @@ def technical_analysis(symbol, prices, volumes=None):
         "adx_method": "close-only directional proxy",
         "data_quality_warning": "این تحلیل از قیمت بسته‌شدن استفاده می‌کند؛ ADX/DI آن جایگزین ADX استاندارد مبتنی بر OHLC نیست.",
         "signal": "WAIT", "confirmed": False, "confirmations": 0,
-        "data_source": "TGJU (close-only)" if symbol in ("GOLD18", "XAU") else "CoinGecko (close-only)",
+        "data_source": "TGJU (close-only)" if symbol in ("GOLD18", "XAU") else "Nobitex (close-only fallback)",
     }
 
 # ============================================================
@@ -2341,7 +2225,7 @@ def backtest_text(result, symbol):
         return f"🧪 بک‌تست: <b>قابل گزارش نیست</b>{pts_text}\nعلت: {escape(str(result.get('reason', 'تاریخچه کافی نیست')))}\n"
     is_gold = symbol in ("GOLD18", "XAU")
     source_line = ("منبع: اسنپ‌شات‌های ذخیره‌شده TGJU (قیمت نقطه‌ای؛ نه کندل OHLC)\n"
-                   if is_gold else "منبع: کندل‌های بسته‌شده ۱ساعته OKX\n")
+                   if is_gold else "منبع: کندل‌های بسته‌شده ۱ساعته نوبیتکس\n")
     if is_gold:
         minutes_per_point = max(1, GOLD_HISTORY_INTERVAL_SECONDS // 60)
         horizon_label = f"اسنپ‌شات TGJU (~{minutes_per_point} دقیقه/نقطه → افق ≈ {result['horizon'] * minutes_per_point} دقیقه)"
@@ -2537,9 +2421,9 @@ def _crypto_backtest_six_months(df, symbol, fee_pct=0.10):
 async def _universal_crypto_prompt_analysis(symbol, tfs):
     """Apply the requested advanced strategy to every supported crypto symbol."""
     fetched = await asyncio.gather(
-        okx_candles(symbol, "1H", 240),
-        okx_candles(symbol, "4H", 240),
-        okx_candles(symbol, "1D", 240),
+        nobitex_candles(symbol, "1H", 240),
+        nobitex_candles(symbol, "4H", 240),
+        nobitex_candles(symbol, "1D", 240),
         return_exceptions=True,
     )
     frames = {}
@@ -2705,6 +2589,30 @@ def universal_crypto_prompt_report(a):
     )
 
 
+async def nobitex_orderbook_metrics(symbol):
+    """Top-20 orderbook imbalance and spread; public endpoint, no API token."""
+    market_symbol = f"{norm_symbol(symbol)}{NOBITEX_QUOTE}"
+    data = await http_json(f"{NOBITEX_BASE_URL}/v3/orderbook/{market_symbol}", ttl=10, retries=1)
+    if not data or data.get("status") != "ok":
+        return None
+    bids, asks = data.get("bids") or [], data.get("asks") or []
+    if not bids or not asks:
+        return None
+    try:
+        bid_value = sum(float(p) * float(q) for p, q in bids[:20])
+        ask_value = sum(float(p) * float(q) for p, q in asks[:20])
+        total = bid_value + ask_value
+        best_bid, best_ask = float(bids[0][0]), float(asks[0][0])
+        mid = (best_bid + best_ask) / 2
+        if total <= 0 or mid <= 0 or best_ask < best_bid:
+            return None
+        return {"imbalance": (bid_value - ask_value) / total,
+                "spread_pct": (best_ask - best_bid) / mid * 100,
+                "bid_value": bid_value, "ask_value": ask_value}
+    except (TypeError, ValueError, IndexError, ZeroDivisionError):
+        return None
+
+
 async def professional_crypto_analysis(symbol):
     s = norm_symbol(symbol)
     cache_key_a = ("prof", s)
@@ -2712,10 +2620,10 @@ async def professional_crypto_analysis(symbol):
     if cached is not None:
         return cached
 
-    bars = {"5m": 240, "15m": 240, "1H": 240, "4H": 240, "1D": 240, "1W": 240}
+    bars = {"5m": 240, "15m": 240, "1H": 240, "4H": 240, "1D": 240}
 
     async def one(tf, limit):
-        return tf, await okx_candles(symbol, tf, limit)
+        return tf, await nobitex_candles(symbol, tf, limit)
 
     pairs = await asyncio.gather(*(one(tf, n) for tf, n in bars.items()), return_exceptions=True)
 
@@ -2866,18 +2774,18 @@ async def professional_crypto_analysis(symbol):
         "early_timeframes": len(early_tfs),
         "execution_timeframes": len(entry_tfs),
         "early_buy_weight": early_buy_weight * 100,
-        "data_source": "OKX OHLCV professional multi-timeframe",
+        "data_source": "Nobitex OHLCV professional multi-timeframe (IRT/Toman)",
         "history_points": sum(v["history_points"] for v in tfs.values()),
     })
     try:
-        hist_1h = await okx_candles(symbol, "1H", 240)
+        hist_1h = await nobitex_candles(symbol, "1H", 240)
         out["backtest"] = walk_forward_backtest(
             hist_1h["close"] if hist_1h is not None and "close" in hist_1h else [],
             horizon=6,
         )
     except Exception as e:
         log.warning("backtest history unavailable %s: %s", symbol, e)
-        out["backtest"] = {"available": False, "reason": "کندل تاریخی کافی از OKX دریافت نشد"}
+        out["backtest"] = {"available": False, "reason": "کندل تاریخی کافی از نوبیتکس دریافت نشد"}
 
     try:
         prompt_analysis = await asyncio.wait_for(_universal_crypto_prompt_analysis(s, tfs), timeout=35)
@@ -2912,6 +2820,32 @@ async def professional_crypto_analysis(symbol):
         out["stop"] = 0.0
         out["targets"] = [0.0, 0.0, 0.0]
         out["rr"] = 0.0
+
+    # Exchange microstructure is a secondary filter, never a standalone signal.
+    ob = None
+    if out.get("signal_candidate") in ("BUY", "SELL"):
+        try:
+            ob = await asyncio.wait_for(nobitex_orderbook_metrics(s), timeout=8)
+        except Exception as exc:
+            log.warning("Nobitex orderbook unavailable %s: %s", s, exc)
+    out["orderbook"] = ob
+    if ob:
+        imbalance = _safe_float(ob.get("imbalance"))
+        spread = _safe_float(ob.get("spread_pct"))
+        if spread > 0.80:
+            out["signal_candidate"] = "WAIT"
+            out["stop"] = 0.0; out["targets"] = [0.0, 0.0, 0.0]; out["rr"] = 0.0
+            out["reasons"] = list(out.get("reasons") or []) + ["اسپرد اردربوک نوبیتکس زیاد است؛ ورود به‌صرفه نیست"]
+        elif out.get("signal_candidate") == "BUY" and imbalance < -0.35:
+            out["signal_candidate"] = "WAIT"
+            out["stop"] = 0.0; out["targets"] = [0.0, 0.0, 0.0]; out["rr"] = 0.0
+            out["reasons_buy"] = []
+            out["reasons"] = list(out.get("reasons") or []) + ["فشار سفارش‌های فروش در اردربوک بر خرید غالب است"]
+        elif out.get("signal_candidate") == "SELL" and imbalance > 0.35:
+            out["signal_candidate"] = "WAIT"
+            out["stop"] = 0.0; out["targets"] = [0.0, 0.0, 0.0]; out["rr"] = 0.0
+            out["reasons_sell"] = []
+            out["reasons"] = list(out.get("reasons") or []) + ["فشار سفارش‌های خرید در اردربوک بر فروش غالب است"]
 
     ANALYSIS_CACHE.set(cache_key_a, out)
     return out
@@ -2990,36 +2924,17 @@ def confirm_market_alert(symbol, candidate, price, observation_key):
 
 async def crypto_market_context(symbol):
     sym = norm_symbol(symbol)
-    cid = COINS.get(sym)
-    if not cid:
+    rows = await market_universe()
+    x = next((r for r in rows if r.get("symbol") == sym), None)
+    if not x:
         return None
-    rows = await http_json(
-        "https://api.coingecko.com/api/v3/coins/markets",
-        {"vs_currency": "usd", "ids": cid, "price_change_percentage": "24h,7d,30d"},
-        ttl=90, retries=2,
-    )
-    if not rows or not isinstance(rows, list):
-        return None
-    x = rows[0]
-    try:
-        price = _safe_float(x.get("current_price"))
-        if price <= 0:
-            return None
-        return {
-            "price": price,
-            "market_cap": _safe_float(x.get("market_cap")),
+    return {"price": _safe_float(x.get("current_price")), "market_cap": 0,
             "volume_24h": _safe_float(x.get("total_volume")),
             "rank": int(x.get("market_cap_rank") or 0),
-            "change_24h": _safe_float(x.get("price_change_percentage_24h_in_currency", x.get("price_change_percentage_24h"))),
-            "change_7d": _safe_float(x.get("price_change_percentage_7d_in_currency", x.get("price_change_percentage_7d"))),
-            "change_30d": _safe_float(x.get("price_change_percentage_30d_in_currency", x.get("price_change_percentage_30d"))),
-            "circulating_supply": _safe_float(x.get("circulating_supply")),
-            "max_supply": _safe_float(x.get("max_supply")),
-            "source": "CoinGecko",
-        }
-    except Exception:
-        log.exception("market context parse failed: %s", sym)
-        return None
+            "change_24h": _safe_float(x.get("price_change_percentage_24h_in_currency")),
+            "change_7d": _safe_float(x.get("price_change_percentage_7d_in_currency")),
+            "change_30d": _safe_float(x.get("price_change_percentage_30d_in_currency")),
+            "circulating_supply": 0, "max_supply": 0, "source": "Nobitex"}
 
 async def analyze(symbol, coin_id=None):
     s = norm_symbol(symbol)
@@ -3028,11 +2943,9 @@ async def analyze(symbol, coin_id=None):
     if cached is not None:
         return cached
 
-    # OKX symbols are not a universal asset directory. For a CoinGecko result
-    # whose id differs from the built-in mapping, use that exact id's history
-    # instead of silently analyzing a different token with the same ticker.
-    use_okx = (not coin_id) or (coin_id == COINS.get(s))
-    if s not in ("GOLD18", "XAU") and use_okx:
+    # All crypto symbols are resolved against Nobitex markets; legacy coin IDs
+    # are ignored so the same ticker cannot silently switch data providers.
+    if s not in ("GOLD18", "XAU"):
         result = await professional_crypto_analysis(s)
         if result:
             confirmed_signal, confirmed, confirmations = confirm_signal(
@@ -3082,20 +2995,20 @@ def _market_context_text(ctx):
     def money(v):
         v = _safe_float(v)
         if v >= 1_000_000_000:
-            return f"${v/1_000_000_000:.2f}B"
+            return f"{v/1_000_000_000:.2f} میلیارد تومان"
         if v >= 1_000_000:
-            return f"${v/1_000_000:.2f}M"
+            return f"{v/1_000_000:.2f} میلیون تومان"
         if v >= 1_000:
-            return f"${v/1_000:.2f}K"
-        return f"${v:.2f}"
+            return f"{v/1_000:.2f} هزار تومان"
+        return f"{v:.0f} تومان"
     rank = f"#{ctx['rank']}" if ctx.get("rank") else "نامشخص"
     supply = ctx.get("circulating_supply", 0)
     supply_text = f"{supply:,.0f}" if supply else "نامشخص"
     max_supply = ctx.get("max_supply", 0)
     max_text = f"{max_supply:,.0f}" if max_supply else "نامحدود/نامشخص"
     return (
-        "🌐 <b>نمای کلی بازار (CoinGecko)</b>\n"
-        f"رتبه: {rank} | ارزش بازار: {money(ctx.get('market_cap'))} | حجم ۲۴ساعته: {money(ctx.get('volume_24h'))}\n"
+        "🌐 <b>نمای کلی بازار نوبیتکس</b>\n"
+        f"رتبه نقدشوندگی نوبیتکس: {rank} | ارزش بازار: در API عمومی موجود نیست | حجم ۲۴ساعته: {money(ctx.get('volume_24h'))} تومان\n"
         f"تغییر: ۲۴ساعت {ctx.get('change_24h', 0):+.2f}% | ۷روز {ctx.get('change_7d', 0):+.2f}% | ۳۰روز {ctx.get('change_30d', 0):+.2f}%\n"
         f"عرضه در گردش: {supply_text} | حداکثر عرضه: {max_text}\n"
     )
@@ -3108,19 +3021,18 @@ def analysis_text(a):
                 f"💰 قیمت فعلی: <b>{_format_price(a['symbol'], a['price'])}</b>\n"
                 f"📚 تاریخچه قابل استفاده: {a['history_points']} نقطه از {GOLD_MIN_HISTORY_POINTS} نقطه لازم\n\n"
                 "⏳ برای محاسبه اندیکاتورها هنوز تاریخچه واقعی کافی جمع نشده است.")
-    unit = "تومان" if a["symbol"] == "GOLD18" else "دلار"
     trend_fa = {"BULLISH":"صعودی قوی","BULLISH_WEAK":"صعودی ضعیف",
                 "BEARISH":"نزولی قوی","BEARISH_WEAK":"نزولی ضعیف",
                 "NEUTRAL":"خنثی"}.get(a["trend"], a["trend"])
-    source = a.get("data_source") or ("TGJU (close-only)" if a["symbol"] in ("GOLD18","XAU") else "CoinGecko (close-only)")
+    source = a.get("data_source") or ("TGJU (close-only)" if a["symbol"] in ("GOLD18","XAU") else "Nobitex OHLCV")
     is_close_only = a["symbol"] in ("GOLD18", "XAU") or "close-only" in source
     adx_label = "ADX≈" if is_close_only else "ADX"
     if a["symbol"] in ("GOLD18", "XAU"):
         candle_note = "⏱ داده‌های نقطه‌ای TGJU (تقریباً هر ۵ دقیقه؛ کندل OHLC واقعی نیست)\n"
     elif is_close_only:
-        candle_note = "⏱ داده‌های قیمت CoinGecko؛ کندل OHLC کامل در دسترس نیست\n"
+        candle_note = "⏱ داده‌های بسته‌شده OHLCV نوبیتکس (واحد قیمت: تومان)\n"
     else:
-        candle_note = "⏱ کندل‌های بسته‌شده OKX در چند تایم‌فریم (نمای اصلی 4H)\n"
+        candle_note = "⏱ کندل‌های بسته‌شده نوبیتکس در چند تایم‌فریم (نمای اصلی 4H)\n"
 
     mtf = a.get("mtf") or {}
     mtf_text = ""
@@ -3186,7 +3098,7 @@ def analysis_text(a):
 
     return (
         f"📊 <b>داشبورد تحلیل تکنیکال {escape(a['symbol'])}</b>\n\n"
-        f"💰 قیمت: <b>{_format_price(a['symbol'], a['price'])} {unit}</b>\n"
+        f"💰 قیمت: <b>{_format_price(a['symbol'], a['price'])}</b>\n"
         f"📈 ساختار روند اصلی: <b>{trend_fa}</b>\n\n"
         + mtf_text
         + f"EMA9: {_format_price(a['symbol'], a['ema9'])} | EMA21: {_format_price(a['symbol'], a['ema21'])}\n"
@@ -3202,8 +3114,9 @@ def analysis_text(a):
         + mtf_agreement_line
         + f"🔬 وضعیت ساختار: {'قوی' if a['strength'] >= 75 else 'متوسط' if a['strength'] >= 55 else 'ضعیف'}\n"
         + f"📚 تعداد داده: {a['history_points']} | منبع: {escape(source)}\n"
+        + (f"📚 اردربوک نوبیتکس: عدم‌تعادل {a['orderbook']['imbalance']*100:+.1f}% | اسپرد {a['orderbook']['spread_pct']:.3f}%\n" if a.get("orderbook") else "📚 اردربوک نوبیتکس: داده در دسترس نیست\n")
         + (f"⚠️ {escape(a['data_quality_warning'])}\n" if a.get("data_quality_warning") else "")
-        + ("📥 تاریخچه رمزارز از کندل‌های تاریخی OKX دریافت شده است؛ تایم‌فریم‌های در دسترس بسته به نماد/محدودیت منبع ممکن است متفاوت باشد.\n"
+        + ("📥 تاریخچه رمزارز از کندل‌های تاریخی نوبیتکس دریافت شده است؛ تایم‌فریم‌های در دسترس بسته به نماد/محدودیت منبع ممکن است متفاوت باشد.\n"
            if a.get("mtf") else "")
         + (_market_context_text(a.get("market_context")) if a["symbol"] not in ("GOLD18", "XAU") else "")
         + ("\nℹ️ آمار بازار تکمیلی است و جایگزین بررسی بنیادی پروژه، اخبار و توکنومیک نیست.\n"
@@ -3245,8 +3158,9 @@ def signal_text(a):
         f"🧠 امتیاز اطمینان محاسباتی (کالیبره‌نشده): <b>{a['probability']:.0f}%</b>\n"
         f"🔁 تأیید متوالی: <b>{a['confirmations']}/{SIGNAL_CONFIRMATIONS_REQUIRED}</b> ({SIGNAL_CONFIRM_TIMEFRAME})\n"
         f"💪 قدرت تکنیکال: <b>{a['strength']:.0f}%</b>\n"
-        f"📈 روند: <b>{a['trend']}</b> | RSI: <b>{a['rsi']:.1f}</b> | ADX: <b>{a['adx']:.1f}</b>\n\n"
-        f"🧩 منطق {direction_note}:\n{reasons_text}\n"
+        f"📈 روند: <b>{a['trend']}</b> | RSI: <b>{a['rsi']:.1f}</b> | ADX: <b>{a['adx']:.1f}</b>\n"
+        + (f"📚 اردربوک نوبیتکس: عدم‌تعادل {a['orderbook']['imbalance']*100:+.1f}% | اسپرد {a['orderbook']['spread_pct']:.3f}%\n\n" if a.get("orderbook") else "📚 اردربوک: داده در دسترس نیست\n\n")
+        + f"🧩 منطق {direction_note}:\n{reasons_text}\n"
         f"{levels}\n"
         + backtest_text(a.get("backtest"), a["symbol"])
         + universal_crypto_prompt_report(a)
@@ -3262,10 +3176,9 @@ def _short_term_scan_metrics(x, ta):
     ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
     ch14 = _safe_float(x.get("price_change_percentage_14d_in_currency"))
     volume = _safe_float(x.get("total_volume"))
-    mcap = _safe_float(x.get("market_cap"))
-    rank = int(x.get("market_cap_rank") or 99999)
+    rank = int(x.get("market_cap_rank") or 99999)  # Nobitex quote-volume rank
     ath_change = _safe_float(x.get("ath_change_percentage"))
-    turnover = (volume / mcap) if mcap > 0 else 0
+    turnover = min(0.30, max(0.01, 0.30 / max(1.0, rank ** 0.5)))
 
     spark = ((x.get("sparkline_in_7d") or {}).get("price") or [])
     volatility = 0.0
@@ -3292,18 +3205,18 @@ def _short_term_scan_metrics(x, ta):
     elif ch7 > 20:
         score -= 5; reasons.append("بخش قابل‌توجهی از حرکت هفتگی انجام شده")
     if turnover >= 0.25:
-        score += 8; reasons.append("نقدشوندگی و گردش معاملات بالا")
+        score += 8; reasons.append("رتبه حجم معاملات نوبیتکس در محدوده برتر است")
     elif turnover >= 0.10:
-        score += 5; reasons.append("گردش معاملات مناسب")
+        score += 5; reasons.append("رتبه حجم معاملات نوبیتکس مناسب است")
     elif turnover < 0.02:
-        score -= 8; reasons.append("نقدشوندگی پایین")
-    if rank <= 50: score += 5
-    elif rank <= 200: score += 3
-    elif rank > 1000: score -= 4
+        score -= 8; reasons.append("رتبه حجم معاملات نوبیتکس پایین است")
+    if rank <= 5: score += 5
+    elif rank <= 15: score += 3
+    elif rank > 25: score -= 4
     if -25 <= ath_change <= -5:
         score += 5; reasons.append("فاصله مناسب از سقف تاریخی")
     elif ath_change < -90:
-        score -= 5; reasons.append("افت بسیار عمیق از ATH")
+        score -= 5; reasons.append("افت بسیار عمیق از سقف دوره")
     elif ath_change > -5:
         score -= 4; reasons.append("نزدیک سقف تاریخی")
 
@@ -3357,7 +3270,7 @@ def _short_term_scan_metrics(x, ta):
 
     if volatility > 6 or (ta and _safe_float(ta.get("rsi"), 50) > 78):
         risk = "زیاد"
-    elif rank > 1000 or turnover < 0.03:
+    elif rank > 20:
         risk = "زیاد"
     elif volatility > 3.5:
         risk = "متوسط"
@@ -3501,13 +3414,12 @@ async def _market_alert_scan():
     for x in rows:
         price = _safe_float(x.get("current_price"))
         volume = _safe_float(x.get("total_volume"))
-        mcap = _safe_float(x.get("market_cap"))
-        if price <= 0 or volume <= 0 or mcap <= 0:
+        if price <= 0 or volume <= 0:
             continue
         ch1 = _safe_float(x.get("price_change_percentage_1h_in_currency"))
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
-        turnover = volume / mcap
+        turnover = min(0.30, max(0.01, 0.30 / max(1.0, float(x.get("market_cap_rank") or 999) ** 0.5)))
         # Rank for early formation, not coins that have already pumped.
         # Seek the first acceleration phase: modest positive 1h momentum while
         # 24h/7d performance is still contained. Do not let a large turnover
@@ -4499,12 +4411,11 @@ async def short_term_growth_scan():
     for x in rows:
         price = _safe_float(x.get("current_price"))
         volume = _safe_float(x.get("total_volume"))
-        mcap = _safe_float(x.get("market_cap"))
-        if price <= 0 or volume <= 0 or mcap <= 0:
+        if price <= 0 or volume <= 0:
             continue
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
-        turnover = volume / mcap
+        turnover = min(0.30, max(0.01, 0.30 / max(1.0, float(x.get("market_cap_rank") or 999) ** 0.5)))
         # Prefer quiet accumulation / first momentum, penalize late vertical moves.
         ch1 = _safe_float(x.get("price_change_percentage_1h_in_currency"))
         rough_score = 50 + _clamp(ch1 * 1.10, -4, 4) + _clamp(ch24 * 0.10, -3, 3) + _clamp(ch7 * 0.035, -3, 3)
@@ -4568,7 +4479,7 @@ async def short_term_growth_menu(update, context):
         return
     status = await update.message.reply_text(
         "🚀 <b>شکار رشد کوتاه‌مدت</b>\n\n"
-        f"🌐 تا {MARKET_SCAN_PAGES * MARKET_SCAN_PER_PAGE:,} دارایی بازار غربال می‌شود.\n"
+        f"🌐 تا ۲۵ بازار فعال نوبیتکس بر اساس حجم معاملات غربال می‌شود.\n"
         "📊 تحلیل چندتایم‌فریمی و نقدشوندگی بررسی می‌شود.\n"
         "⏳ ممکن است اسکن اولیه کمی زمان ببرد...",
         parse_mode=ParseMode.HTML,
@@ -4577,7 +4488,7 @@ async def short_term_growth_menu(update, context):
         items = await asyncio.wait_for(short_term_growth_scan(), timeout=90)
         if not items:
             await status.edit_text(
-                "❌ این بار نامزد قابل ارزیابی پیدا نشد. ممکن است منبع داده محدود شده یا کندل‌های OKX برای دارایی‌ها در دسترس نباشد.\n"
+                "❌ این بار نامزد قابل ارزیابی پیدا نشد. ممکن است API نوبیتکس یا کندل‌های این بازار در دسترس نباشد.\n"
                 "۳۰ تا ۶۰ ثانیه بعد دوباره تلاش کنید.",
             )
             return
@@ -4599,8 +4510,8 @@ async def short_term_growth_menu(update, context):
                 f"💪 قدرت تکنیکال: <b>{m['strength']:.0f}%</b> | 🧠 امتیاز مدل (کالیبره‌نشده): <b>{m['probability']:.0f}%</b>\n"
                 f"📈 روند: {trend} | RSI: {rsi:.1f}\n"
                 f"⚡ 1h: {m['ch1']:+.2f}% | 24h: {m['ch24']:+.2f}% | 7d: {m['ch7']:+.2f}%\n"
-                f"💧 حجم/ارزش بازار: {m['turnover']*100:.1f}% | رتبه: #{m['rank']} | ریسک: <b>{escape(m['risk'])}</b>\n"
-                f"💵 قیمت: ${m['price']:.8g}\n"
+                f"💧 شاخص نقدشوندگی تخمینی: {m['turnover']*100:.1f}% | رتبه حجم نوبیتکس: #{m['rank']} | ریسک: <b>{escape(m['risk'])}</b>\n"
+                f"💵 قیمت: {_format_price(item['symbol'], m['price'])}\n"
                 f"🧩 " + "، ".join(escape(r) for r in m["reasons"][:4])
             )
             await update.message.reply_text(block, parse_mode=ParseMode.HTML)
@@ -4621,7 +4532,7 @@ async def growth_scan_menu(update, context):
         return
     await update.message.reply_text(
         "🔎 در حال اسکن بازار...\n\n"
-        f"🌐 حداکثر {MARKET_SCAN_PAGES * MARKET_SCAN_PER_PAGE:,} دارایی بررسی می‌شود.\n"
+        f"🌐 تا ۲۵ بازار فعال نوبیتکس بر اساس حجم معاملات بررسی می‌شود.\n"
         "⏳"
     )
     try:
@@ -4636,7 +4547,7 @@ async def growth_scan_menu(update, context):
                 f"<b>{i}. {escape(x['symbol'])}</b> — {escape(x['name'])}\n"
                 f"📈 امتیاز رشد: <b>{x['growth_score']:.0f}%</b> | 💪 تکنیکال: <b>{x['strength']:.0f}%</b>\n"
                 f"🧠 امتیاز مدل (کالیبره‌نشده): <b>{x['probability']:.0f}%</b> | 24h: {x['ch24']:+.2f}% | 7d: {x['ch7']:+.2f}%{rsi}\n"
-                f"💰 قیمت: ${x['price']:,.8f} | رتبه: #{x['rank']}\n"
+                f"💰 قیمت: {_format_price(x['symbol'], x['price'])} | رتبه نقدشوندگی: #{x['rank']}\n"
             )
         lines.append("⚠️ این رتبه‌بندی مدل تحلیلی است؛ تضمین سود نیست.")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -4679,8 +4590,7 @@ async def _cycle_bottom_and_growth_scan(rows=None):
     for x in rows:
         price = _safe_float(x.get("current_price"))
         volume = _safe_float(x.get("total_volume"))
-        mcap = _safe_float(x.get("market_cap"))
-        if price <= 0 or volume <= 0 or mcap <= 0 or volume / mcap < 0.01:
+        if price <= 0 or volume <= 0:
             continue
         symbol = norm_symbol(x.get("symbol") or "")
         if not symbol or symbol in {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "USDS"}:
@@ -4788,12 +4698,12 @@ def _cycle_growth_report(data):
             ta = item["ta"]
             signal = "🟢 خرید تکنیکال" if item["signal"] == "BUY" else "🟡 فقط پایش"
             if key == "bottom":
-                measure = f"فاصله از ATH: {item['ath_drop']:.1f}%"
+                measure = f"فاصله از سقف دوره: {item['ath_drop']:.1f}%"
             else:
                 measure = f"۷روزه: {item['ch7']:+.1f}%"
             lines.append(f"• <b>{escape(item['symbol'])}</b> — {signal} | {measure} | RSI {_safe_float(ta.get('rsi'), 50):.1f} | قدرت {_safe_float(ta.get('strength')):.0f}%")
         lines.append("")
-    lines.append("⚠️ «اصلاح عمیق» به معنی ارزان‌بودن قطعی نیست؛ دارایی ممکن است افت بیشتری کند. رتبه‌بندی بر اساس داده در دسترس CoinGecko و تأیید تکنیکال OKX است.")
+    lines.append("⚠️ «اصلاح عمیق» به معنی ارزان‌بودن قطعی نیست؛ رتبه‌بندی بازار و OHLC بر اساس داده نوبیتکس است. رتبه نمایش‌داده‌شده رتبه حجم معاملات در نوبیتکس است، نه رتبه جهانی؛ سقف محاسبه‌شده نیز فقط سقف دوره کندل‌های دریافت‌شده است.")
     return "\n".join(lines)
 
 async def buy_opportunities_menu(update, context):
@@ -4803,7 +4713,7 @@ async def buy_opportunities_menu(update, context):
         return
     msg = await update.message.reply_text(
         "🔎 <b>موتور حرفه‌ای فرصت خرید</b>\n\n"
-        f"🌐 حداکثر {MARKET_SCAN_PAGES * MARKET_SCAN_PER_PAGE:,} دارایی غربال می‌شود.\n"
+        f"🌐 تا ۲۵ بازار فعال نوبیتکس بر اساس حجم معاملات غربال می‌شود.\n"
         "📊 EMA / RSI / MACD / ADX / ATR / مومنتوم / نقدشوندگی / ریسک / BTC بررسی می‌شود.\n"
         "⏳ در حال تحلیل بازار...",
         parse_mode=ParseMode.HTML,
@@ -5597,9 +5507,15 @@ async def text_router(update, context):
                 await update.message.reply_text(f"❌ خطا: {escape(str(e))}", parse_mode=ParseMode.HTML)
             return
 
-    if norm_symbol(text) in COINS or norm_symbol(text) in ("XAU", "GOLD18"):
+    if norm_symbol(text) in ("XAU", "GOLD18"):
         await process_add_asset(update, context, text)
         return
+    try:
+        if await crypto_search(text):
+            await process_add_asset(update, context, text)
+            return
+    except Exception:
+        log.exception("Nobitex symbol lookup failed for user input")
 
     await update.message.reply_text("❓ گزینه نامعتبر است. از منوی پایین استفاده کنید.",
                                     reply_markup=main_kb(uid))
@@ -6093,26 +6009,24 @@ def dashboard_main():
 # ============================================================
 
 async def live_status_command(update, context):
-    """Show public exchange stream health for Railway diagnostics."""
-    connected = bool(OKX_WS_STATUS.get("connected"))
-    last = OKX_WS_STATUS.get("last_message")
-    age = (max(0, int(time.time() - last)) if last else None)
-    fresh = sum(
-        1 for item in OKX_WS_PRICES.values()
-        if time.monotonic() - item.get("received_at", 0) <= OKX_WS_STALE_SECONDS
+    """Check public Nobitex market-data API health."""
+    data = await http_json(f"{NOBITEX_BASE_URL}/market/stats", {"srcCurrency":"btc", "dstCurrency":"rls"}, ttl=5, retries=1)
+    stats = (data or {}).get("stats") or {}
+    btc = stats.get("btc-rls") or stats.get("btc-irt")
+    if btc:
+        raw = _safe_float(btc.get("latest") or btc.get("dayClose"))
+        price = raw / 10.0 if "btc-rls" in stats else raw
+        status = "🟢 API نوبیتکس در دسترس است"
+        detail = f"\nقیمت BTC: <b>{price:,.0f} تومان</b>\nتغییر ۲۴ساعت: <b>{_safe_float(btc.get('dayChange')):+.2f}%</b>"
+    else:
+        status = "🔴 دریافت اطلاعات از API نوبیتکس ناموفق بود"
+        detail = "\nاتصال شبکه، محدودیت IP یا وضعیت API را بررسی کنید."
+    await update.effective_message.reply_text(
+        "📡 <b>وضعیت منبع داده بازار</b>\n\n"
+        f"منبع رمزارز: <b>Nobitex Public API</b>\n{status}{detail}\n"
+        "قیمت و کندل‌های تحلیل از بازارهای نوبیتکس دریافت می‌شوند.",
+        parse_mode=ParseMode.HTML,
     )
-    status = "🟢 متصل" if connected else "🔴 قطع / در حال اتصال مجدد"
-    text = (
-        "📡 <b>وضعیت اتصال زنده بازار</b>\n\n"
-        f"وضعیت WebSocket: <b>{status}</b>\n"
-        f"دارایی‌های درخواست‌شده: <b>{len(OKX_WS_SYMBOLS)}</b>\n"
-        f"قیمت‌های زنده تازه: <b>{fresh}</b>\n"
-        f"آخرین پیام دریافتی: <b>{str(age) + ' ثانیه قبل' if age is not None else 'هنوز دریافت نشده'}</b>\n"
-        f"فعال‌بودن اتصال: <b>{'بله' if OKX_WS_ENABLED else 'خیر'}</b>"
-    )
-    if OKX_WS_STATUS.get("last_error"):
-        text += "\n\nآخرین خطا: <code>" + escape(str(OKX_WS_STATUS['last_error'])[:250]) + "</code>"
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def post_init(app):
@@ -6125,19 +6039,10 @@ async def post_init(app):
     app.create_task(alert_worker(app))
     app.create_task(backup_worker())
     app.create_task(market_snapshot_worker())
-    global OKX_WS_TASK
-    if OKX_WS_ENABLED:
-        OKX_WS_TASK = app.create_task(okx_ws_worker())
-    log.info("MARKET AI v2 started | v17.2 live OKX WebSocket=%s | cache=%s", OKX_WS_ENABLED, len(CACHE))
+    log.info("MARKET AI started | data_source=Nobitex | cache=%s", len(CACHE))
 
 async def post_shutdown(app):
-    global HTTP_SESSION, OKX_WS_TASK
-    if OKX_WS_TASK and not OKX_WS_TASK.done():
-        OKX_WS_TASK.cancel()
-        try:
-            await OKX_WS_TASK
-        except asyncio.CancelledError:
-            pass
+    global HTTP_SESSION
     if HTTP_SESSION and not HTTP_SESSION.closed:
         await HTTP_SESSION.close()
 
