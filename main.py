@@ -3253,9 +3253,16 @@ def analysis_text(a):
         if price > 0 else ""
     )
 
-    mtf_agreement_line = ""
-    if mtf:
-        mtf_agreement_line = f"🧭 هم‌جهتی تایم‌فریم‌ها: <b>{a.get('mtf_agreement', 0):.0f}%</b>\n"
+    # ─── PATCH v18.2: momentum fields — close-only path (gold) vs OHLCV path (crypto)
+if "r1" in a:
+    momentum_line = (
+        f"مومنتوم: 1 کندل {a.get('r1', 0):+.2f}% | 6 کندل {a.get('r6', 0):+.2f}% | "
+        f"24 کندل {a.get('r24', 0):+.2f}% | 72 کندل {a.get('r72', 0):+.2f}%\n"
+    )
+else:
+    momentum_line = (
+        f"مومنتوم: ROC5 {a.get('roc5', 0):+.2f}% | ROC20 {a.get('roc20', 0):+.2f}%\n"
+    )
 
     return (
         f"📊 <b>داشبورد تحلیل تکنیکال {escape(a['symbol'])}</b>\n\n"
@@ -3268,8 +3275,7 @@ def analysis_text(a):
         + f"MACD: {a['macd']:.5f} | Histogram: {a['macd_hist']:+.5f}\n"
         + f"Bollinger: <b>{a['bb_position']:.1f}%</b> | ATR: {_format_price(a['symbol'], a['atr'])} ({a['atr_pct']:.2f}%)\n"
         + level_text
-        + f"مومنتوم: 1 کندل {a.get('r1', 0):+.2f}% | 6 کندل {a.get('r6', 0):+.2f}% | "
-        + f"24 کندل {a.get('r24', 0):+.2f}% | 72 کندل {a.get('r72', 0):+.2f}%\n"
+        + momentum_line
         + f"{candle_note}\n"
         + f"💪 <b>قدرت تکنیکال: {a['strength']:.0f}%</b>\n"
         + mtf_agreement_line
