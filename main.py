@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Crypto / Global Gold / Iran 18K Gold Telegram Analyzer
-Nobitex market-data build — v18.0 (Nobitex OHLCV + stricter multi-timeframe confirmation)
+Nobitex market-data build — v18.1 (relaxed multi-timeframe confirmation,
+                                           weak-bull acceptance, fast-track,
+                                           signal blockers reporting)
 """
 
 import os
@@ -73,7 +75,10 @@ ALERT_RSI_MIN = max(40, min(60, int(os.getenv("ALERT_RSI_MIN", "48"))))
 ALERT_RSI_MAX = max(65, min(78, int(os.getenv("ALERT_RSI_MAX", "70"))))
 ALERT_MIN_TURNOVER = max(0.01, float(os.getenv("ALERT_MIN_TURNOVER", "0.05")))
 SIGNAL_CONFIRMATIONS_REQUIRED = max(2, int(os.getenv("SIGNAL_CONFIRMATIONS_REQUIRED", "2")))
-SIGNAL_CONFIRM_TIMEFRAME = os.getenv("SIGNAL_CONFIRM_TIMEFRAME", "4H").strip()
+# ─── PATCH v18.1: confirmation timeframe lowered from 4H to 1H.
+SIGNAL_CONFIRM_TIMEFRAME = os.getenv("SIGNAL_CONFIRM_TIMEFRAME", "1H").strip()
+# ─── PATCH v18.1: very strong signals confirmed immediately, no second-bucket wait.
+SIGNAL_FAST_TRACK_SCORE = max(75, min(100, int(os.getenv("SIGNAL_FAST_TRACK_SCORE", "82"))))
 
 ADX_MIN_TREND = max(15, min(30, int(os.getenv("ADX_MIN_TREND", "20"))))
 MIN_RR_RATIO = max(1.5, min(3.0, float(os.getenv("MIN_RR_RATIO", "1.8"))))
@@ -773,7 +778,7 @@ async def http_text(url, ttl=None):
     return None
 
 # ============================================================
-# ASSET HELPERS — v17 (accurate parsing)
+# ASSET HELPERS
 # ============================================================
 
 def norm_symbol(value):
@@ -783,7 +788,6 @@ def norm_symbol(value):
         "01234567890123456789"
     ))
     value = value.replace(" ", "").replace("‌", "").replace("_", "")
-    # Accept common exchange notation such as BTC/USDT, BTC-USDT and BTCUSDT.
     value = value.replace("\\", "/")
     if "/" in value:
         left, right = value.split("/", 1)
@@ -815,7 +819,6 @@ def asset_type(symbol):
     return "gold" if s == "XAU" else "gold18" if s == "GOLD18" else "crypto"
 
 async def crypto_search(query):
-    """Resolve a crypto ticker only when a matching Nobitex spot market exists."""
     raw = (query or "").strip()
     if not raw:
         return []
@@ -823,12 +826,10 @@ async def crypto_search(query):
     rows = await market_universe()
     matches = [x for x in rows if x.get("symbol", "").casefold() == direct.casefold()]
     if not matches:
-        # Search by known display names only after the ticker is normalized.
         matches = [x for x in rows if str(x.get("name", "")).casefold() == raw.casefold()]
     return [(x["symbol"], x["market_symbol"], x.get("name", x["symbol"])) for x in matches[:20]]
 
 async def crypto_data(symbol, coin_id=None):
-    """Hourly OHLCV history from Nobitex; all values are in the market quote unit."""
     s = norm_symbol(symbol)
     df = await nobitex_candles(s, "1H", 500)
     if df is None or len(df) < 50:
@@ -836,7 +837,6 @@ async def crypto_data(symbol, coin_id=None):
     return s, df["close"].astype(float).reset_index(drop=True), df["volume"].astype(float).reset_index(drop=True)
 
 async def market_universe():
-    """Build a liquid Nobitex market universe and enrich top markets with local OHLC returns."""
     global MARKET_SCAN_CACHE
     now = time.monotonic()
     if MARKET_SCAN_CACHE and now - MARKET_SCAN_CACHE[0] < MARKET_SCAN_SECONDS:
@@ -854,7 +854,6 @@ async def market_universe():
         sym = base.upper()
         if not sym or sym in {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE"}:
             continue
-        # Nobitex USDT market stats are already denominated in Tether.
         raw_price = _safe_float(item.get("latest") or item.get("dayClose"))
         price = raw_price
         quote_volume = _safe_float(item.get("volumeDst"))
@@ -882,7 +881,6 @@ async def market_universe():
             "source": "Nobitex",
         })
 
-    # Only USDT-quoted spot markets enter the analysis universe.
     rows.sort(key=lambda x: x["total_volume"], reverse=True)
     unique, seen = [], set()
     for row in rows:
@@ -893,11 +891,10 @@ async def market_universe():
     unique.sort(key=lambda x: x["total_volume"], reverse=True)
     total_markets = len(unique)
     for rank, row in enumerate(unique, 1):
-        row["market_cap_rank"] = rank  # legacy field: local quote-volume rank, not market cap
+        row["market_cap_rank"] = rank
         row["liquidity_rank"] = rank
         row["liquidity_score"] = (1.0 - (rank - 1) / max(1, total_markets - 1)) if total_markets else 0.0
 
-    # Enrich a broader liquid USDT shortlist with hourly volatility and daily regime.
     candidates = unique[:25]
     sem = asyncio.Semaphore(4)
     async def enrich(row):
@@ -921,7 +918,6 @@ async def market_universe():
                             row[field] = (float(c.iloc[-1]) / float(c.iloc[-days-1]) - 1) * 100
                     peak = float(d1.high.max()) if len(d1) else 0
                     if peak > 0:
-                        # This is a 250-day high drawdown, not an all-time-high metric.
                         row["drawdown_250d_pct"] = (float(c.iloc[-1]) / peak - 1) * 100
             except Exception as exc:
                 log.warning("Nobitex market enrichment failed %s: %s", row["symbol"], exc)
@@ -951,7 +947,6 @@ def _market_growth_score(x, ta=None):
     ch14 = _safe_float(x.get("price_change_percentage_14d_in_currency"))
     ch30 = _safe_float(x.get("price_change_percentage_30d_in_currency"))
     vol = _safe_float(x.get("total_volume"))
-    mcap = _safe_float(x.get("market_cap"))
     if vol <= 0:
         return None
 
@@ -966,8 +961,6 @@ def _market_growth_score(x, ta=None):
     score += _clamp(ch7 * 0.40, -8, 8)
     score += _clamp(ch14 * 0.20, -5, 5)
     score += _clamp(ch30 * 0.12, -5, 5)
-    # Nobitex does not publish circulating supply/market cap in public stats.
-    # Use the percentile of actual USDT quote volume as a transparent liquidity proxy.
     rank = int(x.get("liquidity_rank") or x.get("market_cap_rank") or 999)
     liquidity = _clamp(_safe_float(x.get("liquidity_score"), 0.0), 0.0, 1.0)
     score += _clamp((liquidity - 0.5) * 8.0, -4, 4)
@@ -977,7 +970,8 @@ def _market_growth_score(x, ta=None):
     if ch7 > 30: score -= 10
     if ch24 < -20 and ch7 < -20: score -= 8
     if ta:
-        if ta.get("late_move_risk") or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20:
+        # ─── PATCH v18.1: relaxed late-move threshold (was 1.20).
+        if ta.get("late_move_risk") or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.50:
             score -= 22
         score += _clamp((ta.get("strength",50)-50)*0.18, -8, 8)
         if ta.get("trend") in ("BULLISH", "BULLISH_WEAK"): score += 5
@@ -988,7 +982,6 @@ def _market_growth_score(x, ta=None):
     return _clamp(score, 0, 100)
 
 def _growth_probability(score, x):
-    # Uncalibrated model confidence index, not a statistical win probability.
     liquidity = _clamp(_safe_float(x.get("liquidity_score"), 0.0), 0.0, 1.0)
     liquidity_adjustment = (liquidity - 0.5) * 10.0
     return _clamp(50 + (score - 50) * 0.75 + liquidity_adjustment, 5, 95)
@@ -1019,11 +1012,12 @@ async def growth_scan():
         x, ta = item
         if not ta:
             continue
+        # ─── PATCH v18.1: relaxed anti-chase.
         if (ta.get("late_move_risk")
-                or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20
-                or _safe_float(ta.get("rsi"), 50) >= 68
-                or _safe_float(x.get("price_change_percentage_24h_in_currency")) > 6
-                or _safe_float(x.get("price_change_percentage_7d_in_currency")) > 18):
+                or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.50
+                or _safe_float(ta.get("rsi"), 50) >= 72
+                or _safe_float(x.get("price_change_percentage_24h_in_currency")) > 8
+                or _safe_float(x.get("price_change_percentage_7d_in_currency")) > 22):
             continue
         score = _market_growth_score(x, ta) or 50.0
         out.append({
@@ -1383,7 +1377,6 @@ async def gold18_data():
     if len(history) == 0:
         history = pd.Series([price], dtype=float)
     elif abs(float(history.iloc[-1]) - float(price)) > 1e-12:
-        # Use the freshly fetched quote for analysis without forcing an extra DB row.
         history = pd.concat([history, pd.Series([price], dtype=float)], ignore_index=True)
     result = ("GOLD18", history, pd.Series(dtype=float))
     GOLD18_CACHE = (now, result)
@@ -1479,16 +1472,13 @@ def format_live_price(item):
 
 
 # ============================================================
-# PROFESSIONAL OHLCV (NOBITEX) — v18
+# PROFESSIONAL OHLCV (NOBITEX)
 # ============================================================
 
 async def nobitex_candles(symbol, bar="1H", limit=240):
-    """Fetch closed USDT OHLCV bars from Nobitex, paging backward when needed."""
     s = norm_symbol(symbol)
     resolution = {"5m":"5", "15m":"15", "1H":"60", "4H":"240", "1D":"D", "D":"D"}.get(bar, str(bar))
     if bar == "1W":
-        # Weekly candles are derived from daily data; a shorter history is enough
-        # for the weekly trend context and avoids rejecting newer listed markets.
         daily = await nobitex_candles(s, "1D", min(500, max(240, int(limit))))
         if daily is None or len(daily) < 50:
             return None
@@ -1505,8 +1495,6 @@ async def nobitex_candles(symbol, bar="1H", limit=240):
     if cached is not None:
         return cached.copy()
 
-    # UDF history supports countback. Request the maximum page and move the
-    # `to` cursor backward if the exchange returns fewer bars than requested.
     all_rows = []
     cursor_to = int(time.time())
     seen_oldest = None
@@ -1558,9 +1546,6 @@ async def nobitex_candles(symbol, bar="1H", limit=240):
         seconds = {"1":"60", "5":"300", "15":"900", "30":"1800", "60":"3600", "180":"10800", "240":"14400", "360":"21600", "720":"43200", "D":"86400"}.get(resolution, 3600)
         now = int(time.time())
         df = df[(df["ts"].astype(int) + int(seconds)) <= now].copy().reset_index(drop=True)
-        # Minimum history is timeframe-aware. EMA200 remains optional and is
-        # never fabricated from EMA50; shorter histories still support RSI,
-        # MACD, EMA50, ATR, ADX, VWAP and structure analysis.
         min_by_resolution = {"5":60, "15":60, "60":80, "240":80, "D":50}
         min_required = min(min_by_resolution.get(resolution, 60), desired)
         if len(df) < min_required:
@@ -1578,7 +1563,6 @@ async def nobitex_candles(symbol, bar="1H", limit=240):
         return None
 
 def _wilder_smooth(series, period=14):
-    """Wilder smoothing seeded with the first period's simple average."""
     values = pd.to_numeric(pd.Series(series), errors="coerce").astype(float).tolist()
     out = [float("nan")] * len(values)
     if period < 1 or len(values) < period:
@@ -1723,7 +1707,6 @@ def _market_structure(df, lookback=80):
     }
 
 def _divergence(close, rsi, window=50):
-    """Detect regular RSI/MACD divergence from two confirmed swing pivots."""
     c = pd.to_numeric(pd.Series(close).tail(window), errors="coerce").reset_index(drop=True)
     r = pd.to_numeric(pd.Series(rsi).tail(window), errors="coerce").reset_index(drop=True)
     valid = c.notna() & r.notna()
@@ -1732,7 +1715,6 @@ def _divergence(close, rsi, window=50):
         return "NONE"
     radius = 2
     lows, highs = [], []
-    # Exclude the last two bars: a pivot is not confirmed until right-side bars close.
     for i in range(radius, len(c) - radius):
         cwin = c.iloc[i-radius:i+radius+1]
         if float(c.iloc[i]) <= float(cwin.min()):
@@ -1750,7 +1732,6 @@ def _divergence(close, rsi, window=50):
     return "NONE"
 
 def _tf_decision(symbol, df, timeframe):
-    """v17: strict entry gates — trend==BULLISH, structure==BULLISH, ADX≥20, vol≥1.10, RR≥1.8"""
     min_history = {"5m":60, "15m":60, "1H":80, "4H":80, "1D":50, "1W":20}.get(timeframe, 60)
     if df is None or len(df) < min_history:
         log.warning("TF history insufficient symbol=%s tf=%s bars=%s required=%s",
@@ -1857,9 +1838,10 @@ def _tf_decision(symbol, df, timeframe):
     prev_close = float(c.iloc[-2]) if len(c) >= 2 else current
     prev_e21 = _safe_float(z["ema21"].iloc[-2], e21) if len(z["ema21"]) >= 2 else e21
     prev_extension = (prev_close - prev_e21) / atr if atr else 99.0
-    if extension > 1.35:
+    # ─── PATCH v18.1: relaxed EMA21 extension penalties (was 1.35 / -2.0).
+    if extension > 1.75:
         bull -= 12; rb.append("قیمت از EMA21 فاصله گرفته؛ ورود تعقیبی پرریسک است")
-    if extension < -2.0:
+    if extension < -2.5:
         bear -= 9; rs.append("قیمت از EMA21 بیش از حد نزولی کشیده شده")
 
     recent_res = float(h.iloc[-21:-1].max()) if len(h) >= 21 else float(h.max())
@@ -1884,13 +1866,7 @@ def _tf_decision(symbol, df, timeframe):
     strength = _clamp(45 + max(bull, bear) * 0.70 + (8 if adx >= 25 else 0))
     signal_score = _clamp(50 + abs(edge) * 1.15)
 
-    # Early-entry detector: prefer the first controlled pullback/turn before
-    # a fully mature trend. This is deliberately separate from a late breakout.
-    # It requires improving momentum, a non-bearish structure and price near EMA21.
     ema21_distance_atr = extension
-    # EARLY means a controlled first reclaim/pullback near EMA21, not an already
-    # extended green candle. Requiring the previous close near/below EMA21
-    # prevents a mature rally from being relabelled as an early entry.
     reclaim_or_pullback = (
         (-0.35 <= ema21_distance_atr <= 0.75)
         and (prev_extension <= 0.45 or (prev_close <= prev_e21 and current > e21))
@@ -1911,35 +1887,59 @@ def _tf_decision(symbol, df, timeframe):
         and not fakeout_risk
         and not breakout_up
     )
-    # Hard anti-chasing: reject stretched price, overbought RSI, or an impulse
-    # candle that has already travelled too far from its short-term mean.
+    # ─── PATCH v18.1: relaxed late-move thresholds (was 1.25 / 68 / 5.0).
     late_move_risk = (
-        ema21_distance_atr > 1.25
-        or rsi >= 68
-        or roc5 >= 5.0
+        ema21_distance_atr > 1.75
+        or rsi >= 72
+        or roc5 >= 7.0
         or (breakout_up and not breakout_confirmed)
     )
+    # ─── PATCH v18.1: primary fix — accept BULLISH_WEAK trend and TRANSITION structure,
+    #                   and slightly lower bull/edge/vol/rsi gates.
     standard_buy_ok = (
-        bull >= 65 and edge >= 22 and
-        trend == "BULLISH" and
-        structure["structure"] == "BULLISH" and
-        45 < rsi < 66 and
+        bull >= 55 and edge >= 15 and
+        trend in ("BULLISH", "BULLISH_WEAK") and
+        structure["structure"] in ("BULLISH", "TRANSITION") and
+        42 < rsi < 68 and
         adx >= ADX_MIN_TREND and
-        vol_ratio >= 1.10 and
-        ema21_distance_atr <= 1.20 and
+        vol_ratio >= 1.00 and
+        ema21_distance_atr <= 1.50 and
         not fakeout_risk and not late_move_risk
     )
     buy_ok = standard_buy_ok or (early_entry and bull >= 38 and edge >= 8)
+    # ─── PATCH v18.1: symmetric relaxation for SELL.
     sell_ok = (
-        bear >= 65 and edge <= -22 and
-        trend == "BEARISH" and
-        structure["structure"] == "BEARISH" and
-        32 < rsi < 55 and
+        bear >= 55 and edge <= -15 and
+        trend in ("BEARISH", "BEARISH_WEAK") and
+        structure["structure"] in ("BEARISH", "TRANSITION") and
+        30 < rsi < 58 and
         adx >= ADX_MIN_TREND and
-        vol_ratio >= 1.10 and
+        vol_ratio >= 1.00 and
         not fakeout_risk
     )
     candidate = "BUY" if buy_ok else "SELL" if sell_ok else "WAIT"
+
+    # ─── PATCH v18.1: expose blockers so the user understands WHY it's WAIT.
+    blockers = []
+    if candidate == "WAIT":
+        if trend not in ("BULLISH", "BULLISH_WEAK"):
+            blockers.append(f"روند {trend} (نیازمند صعودی)")
+        if structure["structure"] not in ("BULLISH", "TRANSITION"):
+            blockers.append(f"ساختار {structure['structure']} (نیازمند صعودی)")
+        if adx < ADX_MIN_TREND:
+            blockers.append(f"ADX {adx:.1f} < {ADX_MIN_TREND}")
+        if vol_ratio < 1.00:
+            blockers.append(f"حجم {vol_ratio:.2f}× میانگین (نیازمند ≥1.00×)")
+        if not (42 < rsi < 68):
+            blockers.append(f"RSI {rsi:.1f} خارج بازه سالم (42–68)")
+        if late_move_risk:
+            blockers.append("حرکت دیرهنگام/کشیدگی قیمت از EMA21")
+        if fakeout_risk:
+            blockers.append("ریسک فیک‌اوت شکست")
+        if bull < 55 and bear < 55:
+            blockers.append(f"امتیاز خرید {bull:.0f} / فروش {bear:.0f} — تأیید ناکافی")
+        if edge < 15 and edge > -15:
+            blockers.append(f"اختلاف جهت‌ها {edge:+.0f} < 15")
 
     recent_low = float(l.tail(20).min()); recent_high = float(h.tail(20).max())
     if candidate == "BUY":
@@ -1958,6 +1958,7 @@ def _tf_decision(symbol, df, timeframe):
     rr = abs((targets[1] - current) / risk) if risk else 0.0
     if candidate != "WAIT" and rr < MIN_RR_RATIO:
         candidate = "WAIT"
+        blockers.append(f"R/R {rr:.2f} < {MIN_RR_RATIO}")
 
     return {
         "timeframe": timeframe, "price": current,
@@ -1980,13 +1981,13 @@ def _tf_decision(symbol, df, timeframe):
         "ema21_distance_atr": ema21_distance_atr,
         "prev_ema21_distance_atr": prev_extension,
         "late_move_risk": bool(late_move_risk),
-        "roc5": roc5, "roc20": roc20,
         "buy_score": bull, "sell_score": bear,
         "signal_candidate": candidate, "signal_score": signal_score,
         "strength": strength,
         "probability": _clamp(50 + abs(edge) * 0.72 + (7 if vol_ratio >= 1.15 else 0)),
         "reasons_buy": list(dict.fromkeys(rb))[:8],
         "reasons_sell": list(dict.fromkeys(rs))[:8],
+        "signal_blockers": blockers[:6],
         "stop": stop, "targets": targets, "rr": rr,
         "history_points": len(df), "data_source": "Nobitex OHLCV professional",
     }
@@ -2014,7 +2015,6 @@ def _atr(p, period=14):
     return _wilder_smooth(tr, period)
 
 def _adx(p, period=14):
-    """Close-only directional-strength proxy; not standard OHLC Wilder ADX."""
     move = p.diff()
     up = move.clip(lower=0); down = (-move).clip(lower=0); tr = move.abs()
     atr = _wilder_smooth(tr, period)
@@ -2165,7 +2165,9 @@ def technical_analysis(symbol, prices, volumes=None):
     second = min(buy_points, sell_points)
     direction = "BUY" if buy_points > sell_points else "SELL" if sell_points > buy_points else "WAIT"
     score = float(best)
-    candidate = direction if score >= SIGNAL_MIN_SCORE and (score - second) >= 25 else "WAIT"
+    # ─── PATCH v18.1: gold/close-only path gets a realistic threshold too.
+    gold_threshold = max(60, SIGNAL_MIN_SCORE - 15)
+    candidate = direction if score >= gold_threshold and (score - second) >= 15 else "WAIT"
 
     if candidate == "BUY":
         stop = current - max(atr * 1.5, current * 0.005)
@@ -2184,6 +2186,16 @@ def technical_analysis(symbol, prices, volumes=None):
 
     probability = float(max(5, min(95, 50 + (score - second) * 0.9)))
 
+    # ─── PATCH v18.1: expose blockers for gold too.
+    blockers = []
+    if candidate == "WAIT":
+        if score < gold_threshold:
+            blockers.append(f"امتیاز {score:.0f} < {gold_threshold}")
+        if (score - second) < 15:
+            blockers.append(f"اختلاف خرید/فروش {(score - second):.0f} < 15")
+        if trend not in ("BULLISH", "BULLISH_WEAK"):
+            blockers.append(f"روند {trend} (نیازمند صعودی)")
+
     return {
         "symbol": symbol, "price": current,
         "ema9": e9, "ema21": e21, "ema50": e50, "ema200": e200,
@@ -2195,6 +2207,7 @@ def technical_analysis(symbol, prices, volumes=None):
         "strength": strength, "signal_candidate": candidate, "signal_score": score,
         "buy_score": buy_points, "sell_score": sell_points,
         "probability": probability, "reasons_buy": reasons_buy, "reasons_sell": reasons_sell,
+        "signal_blockers": blockers,
         "stop": stop, "targets": targets, "rr": rr, "volume_confirm": vol_confirm,
         "ema200": e200 if ema200_available else None,
         "ema200_available": ema200_available,
@@ -2299,7 +2312,7 @@ def backtest_text(result, symbol):
 
 
 # ============================================================
-# UNIVERSAL CRYPTO ADVANCED ANALYSIS ENGINE — user strategy specification
+# UNIVERSAL CRYPTO ADVANCED ANALYSIS ENGINE
 # ============================================================
 
 UNIVERSAL_CRYPTO_ANALYSIS_SPEC = {
@@ -2316,7 +2329,6 @@ UNIVERSAL_CRYPTO_ANALYSIS_SPEC = {
 
 
 def _crypto_ichimoku_profile(df):
-    """Calculate Ichimoku and a volume-by-price approximation from real OHLCV."""
     if df is None or len(df) < 60:
         return {}
     h = pd.to_numeric(df["high"], errors="coerce")
@@ -2325,7 +2337,6 @@ def _crypto_ichimoku_profile(df):
     v = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     tenkan = (h.rolling(9).max() + l.rolling(9).min()) / 2
     kijun = (h.rolling(26).max() + l.rolling(26).min()) / 2
-    # Compare price with the cloud projected 26 candles ahead (shifted series).
     span_a = ((tenkan + kijun) / 2).shift(26)
     span_b = ((h.rolling(52).max() + l.rolling(52).min()) / 2).shift(26)
     price = float(c.iloc[-1])
@@ -2333,7 +2344,6 @@ def _crypto_ichimoku_profile(df):
     cloud_top, cloud_bottom = max(sa, sb), min(sa, sb)
     cloud_state = "ABOVE" if price > cloud_top else "BELOW" if price < cloud_bottom else "INSIDE"
 
-    # Approximate volume profile: volume is assigned to each candle's close.
     sample = pd.DataFrame({"price": c.tail(180), "volume": v.tail(180)}).dropna()
     sample = sample[sample["volume"] > 0]
     vp = {}
@@ -2365,7 +2375,6 @@ def _crypto_ichimoku_profile(df):
 
 
 def _crypto_pattern_scan(df):
-    """Conservative swing-pattern hints; patterns are never used alone as signals."""
     if df is None or len(df) < 45:
         return []
     x = df.tail(100).reset_index(drop=True)
@@ -2396,7 +2405,6 @@ def _crypto_pattern_scan(df):
 
 
 def _crypto_backtest_six_months(df, symbol, fee_pct=0.10):
-    """Daily OHLCV walk-forward simulation, using only information available at entry."""
     if df is None or len(df) < 100:
         return {"available": False, "reason": "کمتر از ۱۰۰ کندل روزانه موجود است"}
     x = df.tail(190).reset_index(drop=True).copy()
@@ -2423,7 +2431,6 @@ def _crypto_backtest_six_months(df, symbol, fee_pct=0.10):
             and v.iloc[i] < vol_avg14.iloc[i]
             and change7 >= 8.0
         )
-        # Entry is next day's open; 0.75% stop and 2.25% target (RR 3:1).
         direction = 1 if bullish else -1 if bearish else 0
         if not direction:
             i += 1
@@ -2475,7 +2482,6 @@ def _crypto_backtest_six_months(df, symbol, fee_pct=0.10):
 
 
 async def _universal_crypto_prompt_analysis(symbol, tfs):
-    """Apply the requested advanced strategy to every supported crypto symbol."""
     fetched = await asyncio.gather(
         nobitex_candles(symbol, "1H", 240),
         nobitex_candles(symbol, "4H", 240),
@@ -2530,7 +2536,6 @@ async def _universal_crypto_prompt_analysis(symbol, tfs):
         }
     m1, m4, md = metrics.get("1H", {}), metrics.get("4H", {}), metrics.get("1D", {})
     price = _safe_float(md.get("price"))
-    # The user's oversold/overbought criteria are intentionally strict.
     bullish_divergence = any(
         m.get(key) == "BULLISH"
         for m in (m1, m4, md)
@@ -2546,8 +2551,6 @@ async def _universal_crypto_prompt_analysis(symbol, tfs):
         and min(_safe_float(m1.get("rsi"), 50), _safe_float(m4.get("rsi"), 50)) < 30
         and daily_vol_ratio > 1.0 and bullish_divergence
     )
-    # X/social sentiment feeds are not connected: price expansion is only a proxy,
-    # never represented as a measured Fear & Greed or social-media reading.
     daily_change7 = ((price / float(daily_close.iloc[-8])) - 1) * 100 if len(daily_close) >= 8 and daily_close.iloc[-8] else 0
     fomo_proxy = daily_change7 >= 8
     bearish_condition = (
@@ -2559,7 +2562,6 @@ async def _universal_crypto_prompt_analysis(symbol, tfs):
     entry = price
     stop = target1 = target2 = rr = 0.0
     if candidate in ("BUY", "SELL") and price > 0:
-        # Fixed risk envelope respects the requested 0.5–1% stop and >=3:1 RR.
         stop_pct = 0.0075
         target_pct = 0.0225
         direction = 1 if candidate == "BUY" else -1
@@ -2646,7 +2648,6 @@ def universal_crypto_prompt_report(a):
 
 
 async def nobitex_orderbook_metrics(symbol):
-    """Top-20 orderbook imbalance and spread; public endpoint, no API token."""
     market_symbol = f"{norm_symbol(symbol)}{NOBITEX_QUOTE}"
     data = await http_json(f"{NOBITEX_BASE_URL}/v3/orderbook/{market_symbol}", ttl=10, retries=1)
     if not data or data.get("status") != "ok":
@@ -2700,8 +2701,6 @@ async def professional_crypto_analysis(symbol):
         except Exception:
             log.exception("TF engine error %s %s", symbol, tf)
 
-    # 1H execution context plus 4H and 1D regime confirmation are mandatory.
-    # 5m/15m are optional; their absence must not discard valid higher-TF analysis.
     mandatory_tfs = ("1H", "4H", "1D")
     missing_tfs = [tf for tf in mandatory_tfs if tf not in tfs]
     if missing_tfs:
@@ -2733,38 +2732,37 @@ async def professional_crypto_analysis(symbol):
         weights[k] for k in tfs
         if tfs[k].get("early_entry") and k in ("15m", "1H", "4H")
     )
-    # Mature setups need full 4H structure confirmation. Early setups may pass
-    # while 4H structure is forming, but daily/weekly bearish regimes still veto.
-    # Direction safety: a short-term bounce must never be promoted to a BUY
-    # while the 4H/daily/weekly regime is bearish (including weak-bear states).
     bearish_regime = ("BEARISH", "BEARISH_WEAK")
     bullish_regime = ("BULLISH", "BULLISH_WEAK")
+    # ─── PATCH v18.1: accept BULLISH_WEAK trend and TRANSITION structure in vetoes.
     early_buy_veto = (
         trend4 in bearish_regime or structure4 == "BEARISH"
         or trend1d in bearish_regime or structure1d == "BEARISH"
         or trend1w in bearish_regime
-        or bullish_trend_weight < 0.45
+        or bullish_trend_weight < 0.40
     )
     mature_buy_veto = (
-        trend4 != "BULLISH" or structure4 != "BULLISH"
+        trend4 not in bullish_regime
+        or structure4 not in ("BULLISH", "TRANSITION")
         or trend1d in bearish_regime or structure1d == "BEARISH"
-        or trend1w in bearish_regime or bullish_trend_weight < 0.60
+        or trend1w in bearish_regime or bullish_trend_weight < 0.50
     )
     buy_veto = mature_buy_veto and (early_buy_weight < 0.25 or early_buy_veto)
-    # Symmetric protection: do not issue SELL into a confirmed higher-timeframe
-    # bullish regime. Weak-bull states count as bullish too.
+    # ─── PATCH v18.1: symmetric relaxation for SELL.
     sell_veto = (
-        trend4 not in bearish_regime or structure4 != "BEARISH"
+        trend4 not in bearish_regime
+        or structure4 not in ("BEARISH", "TRANSITION")
         or trend1d in bullish_regime or structure1d == "BULLISH"
-        or trend1w in bullish_regime or bearish_trend_weight < 0.60
+        or trend1w in bullish_regime or bearish_trend_weight < 0.55
     )
 
     entry_tfs = [tfs[k] for k in ("15m", "1H", "4H") if k in tfs]
     early_tfs = [v for v in entry_tfs if v.get("early_entry")]
     late_tfs = [v for v in entry_tfs if v.get("late_move_risk")]
+    # ─── PATCH v18.1: relaxed aggregate late-move threshold (was 1.25 / 68).
     aggregate_late_risk = bool(late_tfs) or any(
-        _safe_float(v.get("ema21_distance_atr"), 99) > 1.25
-        or _safe_float(v.get("rsi"), 50) >= 68
+        _safe_float(v.get("ema21_distance_atr"), 99) > 1.75
+        or _safe_float(v.get("rsi"), 50) >= 72
         for v in entry_tfs
     )
     aggregate_early_entry = len(early_tfs) >= 2 and not aggregate_late_risk
@@ -2774,16 +2772,17 @@ async def professional_crypto_analysis(symbol):
     )
 
     candidate = "WAIT"
-    mature_buy = bull >= 65 and edge >= 22 and buy_agreement >= 0.55 and not mature_buy_veto
+    # ─── PATCH v18.1: lower gates for mature and early BUY (was 65/22/0.55 and 48/12/0.25/0.20).
+    mature_buy = bull >= 55 and edge >= 15 and buy_agreement >= 0.45 and not mature_buy_veto
     early_buy = (
-        bull >= 48 and edge >= 12
-        and early_buy_weight >= 0.25
-        and buy_agreement >= 0.20
+        bull >= 42 and edge >= 10
+        and early_buy_weight >= 0.20
+        and buy_agreement >= 0.15
         and not early_buy_veto
     )
     if (mature_buy or early_buy) and not buy_veto and not aggregate_late_risk and bull > bear and edge > 0:
         candidate = "BUY"
-    elif bear >= 65 and edge <= -22 and sell_agreement >= 0.55 and not sell_veto and bear > bull:
+    elif bear >= 55 and edge <= -15 and sell_agreement >= 0.45 and not sell_veto and bear > bull:
         candidate = "SELL"
 
     agreement = buy_agreement if candidate == "BUY" else sell_agreement if candidate == "SELL" else max(buy_agreement, sell_agreement)
@@ -2814,7 +2813,6 @@ async def professional_crypto_analysis(symbol):
         reasons = ["شرایط هم‌زمان روند، ساختار و تأیید چندتایم‌فریمی برای ورود کافی نیست"]
 
     out = dict(main)
-    # The aggregate execution-timeframe flags above are also surfaced for the UI.
     out.update({
         "symbol": norm_symbol(symbol),
         "signal_candidate": candidate,
@@ -2840,6 +2838,21 @@ async def professional_crypto_analysis(symbol):
         "data_source": "Nobitex OHLCV professional multi-timeframe (USDT)",
         "history_points": sum(v["history_points"] for v in tfs.values()),
     })
+    # ─── PATCH v18.1: aggregate per-timeframe blockers when WAIT.
+    if candidate == "WAIT":
+        agg = []
+        for tf_name in ("15m", "1H", "4H", "1D"):
+            v = tfs.get(tf_name)
+            if not v:
+                continue
+            for b in (v.get("signal_blockers") or [])[:2]:
+                agg.append(f"{tf_name}: {b}")
+        if trend4 not in bullish_regime and structure4 in ("BEARISH",):
+            agg.append(f"رژیم 4H: {trend4}/{structure4}")
+        if aggregate_late_risk:
+            agg.append("کشیدگی قیمت از EMA21 در چند تایم‌فریم")
+        out["signal_blockers"] = list(dict.fromkeys(agg))[:6]
+
     try:
         hist_1h = await nobitex_candles(symbol, "1H", 240)
         out["backtest"] = walk_forward_backtest(
@@ -2853,9 +2866,6 @@ async def professional_crypto_analysis(symbol):
     try:
         prompt_analysis = await asyncio.wait_for(_universal_crypto_prompt_analysis(s, tfs), timeout=35)
         out["prompt_analysis"] = prompt_analysis
-        # The independent strict strategy is corroborating evidence only.
-        # It must not erase a valid multi-timeframe setup merely because its
-        # rare oversold/divergence pattern is absent.
         secondary_candidate = prompt_analysis.get("candidate", "WAIT")
         out["secondary_strategy_candidate"] = secondary_candidate
         out["secondary_strategy_agrees"] = bool(
@@ -2876,19 +2886,13 @@ async def professional_crypto_analysis(symbol):
         secondary_backtest = prompt_analysis.get("backtest")
         if secondary_backtest and secondary_backtest.get("available"):
             out["backtest"] = secondary_backtest
-        # Otherwise retain the independent 1H walk-forward report computed above.
-
     except Exception as e:
         log.exception("Universal crypto strategy overlay failed %s: %s", s, e)
         out["prompt_analysis"] = {"data_complete": False, "missing": ["دریافت/محاسبه داده"]}
         out["secondary_strategy_candidate"] = "UNAVAILABLE"
         out["secondary_strategy_agrees"] = False
-        # Keep the primary multi-timeframe result; a failed secondary report
-        # is a data-quality warning, not a reason to manufacture WAIT.
         out["data_quality_warning"] = "استراتژی مستقل در دسترس نبود؛ خروجی اصلی بر پایه تحلیل چندتایم‌فریمی است."
 
-    # Dynamic execution levels use the 1H execution frame, real ATR and nearby
-    # market structure. Avoid fixed percentage stops that ignore each coin's volatility.
     exec_tf = tfs.get("1H") or main
     entry_price = _safe_float(exec_tf.get("price"), _safe_float(out.get("price")))
     atr_exec = max(_safe_float(exec_tf.get("atr")), entry_price * 0.0001) if entry_price > 0 else 0.0
@@ -2937,7 +2941,6 @@ async def professional_crypto_analysis(symbol):
         out["rr"] = 0.0
         out["entry_stage"] = "WAIT"
 
-    # Explicit market-regime and data-coverage diagnostics.
     daily_tf = tfs.get("1D", {})
     four_hour_tf = tfs.get("4H", {})
     out["market_regime"] = (
@@ -2951,7 +2954,6 @@ async def professional_crypto_analysis(symbol):
     out["confidence_score"] = _safe_float(out.get("probability"), 50.0)
     out["confidence_calibrated"] = False
 
-    # Exchange microstructure is a secondary filter, never a standalone signal.
     ob = None
     if out.get("signal_candidate") in ("BUY", "SELL"):
         try:
@@ -2992,7 +2994,7 @@ async def professional_crypto_analysis(symbol):
 
 
 # ============================================================
-# SIGNAL CONFIRMATION — v17
+# SIGNAL CONFIRMATION
 # ============================================================
 
 def _timeframe_bucket(timeframe):
@@ -3000,7 +3002,7 @@ def _timeframe_bucket(timeframe):
     bucket = int(time.time() // tf_seconds)
     return f"{timeframe}:{bucket}"
 
-def confirm_signal(symbol, candidate, price, timeframe=None):
+def confirm_signal(symbol, candidate, price, timeframe=None, signal_score=None):
     timeframe = timeframe or SIGNAL_CONFIRM_TIMEFRAME
     if candidate == "WAIT":
         with db() as c:
@@ -3009,6 +3011,24 @@ def confirm_signal(symbol, candidate, price, timeframe=None):
 
     observation_key = _timeframe_bucket(timeframe)
     iso_now = now_iso()
+
+    # ─── PATCH v18.1: fast-track — very strong signals confirmed immediately,
+    #                  without waiting for a second timeframe bucket.
+    if signal_score is not None and _safe_float(signal_score) >= SIGNAL_FAST_TRACK_SCORE:
+        with db() as c:
+            c.execute("""
+                INSERT INTO signal_state(symbol,candidate,confirmations,last_candidate_at,last_price,updated_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    candidate=excluded.candidate,
+                    confirmations=excluded.confirmations,
+                    last_candidate_at=excluded.last_candidate_at,
+                    last_price=excluded.last_price,
+                    updated_at=excluded.updated_at
+            """, (symbol, candidate, SIGNAL_CONFIRMATIONS_REQUIRED,
+                  observation_key, float(price), iso_now))
+        return candidate, True, SIGNAL_CONFIRMATIONS_REQUIRED
+
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         row = c.execute("SELECT * FROM signal_state WHERE symbol=?", (symbol,)).fetchone()
@@ -3083,13 +3103,13 @@ async def analyze(symbol, coin_id=None):
     if cached is not None:
         return cached
 
-    # All crypto symbols are resolved against Nobitex markets; legacy coin IDs
-    # are ignored so the same ticker cannot silently switch data providers.
     if s not in ("GOLD18", "XAU"):
         result = await professional_crypto_analysis(s)
         if result:
+            # ─── PATCH v18.1: pass signal_score to enable fast-track.
             confirmed_signal, confirmed, confirmations = confirm_signal(
-                s, result["signal_candidate"], result["price"], SIGNAL_CONFIRM_TIMEFRAME
+                s, result["signal_candidate"], result["price"], SIGNAL_CONFIRM_TIMEFRAME,
+                signal_score=result.get("signal_score")
             )
             result["signal"] = confirmed_signal
             result["confirmed"] = confirmed
@@ -3115,7 +3135,8 @@ async def analyze(symbol, coin_id=None):
     if not result:
         return None
     confirmed_signal, confirmed, confirmations = confirm_signal(
-        s, result["signal_candidate"], result["price"], SIGNAL_CONFIRM_TIMEFRAME
+        s, result["signal_candidate"], result["price"], SIGNAL_CONFIRM_TIMEFRAME,
+        signal_score=result.get("signal_score")
     )
     result["signal"] = confirmed_signal
     result["confirmed"] = confirmed
@@ -3278,6 +3299,11 @@ def signal_text(a):
     candidate_fa = signal_fa(candidate)
     reasons = a.get("reasons_buy") if candidate == "BUY" else a.get("reasons_sell") if candidate == "SELL" else []
     reasons_text = "\n".join("• " + escape(x) for x in (reasons or [])[:6]) or "• تأیید کافی برای اقدام وجود ندارد"
+    # ─── PATCH v18.1: show blockers to the user on WAIT.
+    blockers = a.get("signal_blockers") or []
+    blockers_text = ""
+    if status == "WAIT" and blockers:
+        blockers_text = "\n🚧 <b>موانع ورود:</b>\n" + "\n".join("• " + escape(x) for x in blockers[:5]) + "\n"
     direction_note = "خرید" if candidate == "BUY" else "فروش" if candidate == "SELL" else "انتظار"
     setup = "🟢" if status == "BUY" else "🔴" if status == "SELL" else "🟡"
     levels = ""
@@ -3301,7 +3327,8 @@ def signal_text(a):
         f"📈 روند: <b>{a['trend']}</b> | رژیم بازار: <b>{a.get('market_regime', 'MIXED')}</b> | RSI: <b>{a['rsi']:.1f}</b> | ADX: <b>{a['adx']:.1f}</b>\n"
         + (f"📚 اردربوک نوبیتکس: عدم‌تعادل {a['orderbook']['imbalance']*100:+.1f}% | اسپرد {a['orderbook']['spread_pct']:.3f}%\n\n" if a.get("orderbook") else "📚 اردربوک: داده در دسترس نیست\n\n")
         + f"🧩 منطق {direction_note}:\n{reasons_text}\n"
-        f"{levels}\n"
+        + blockers_text
+        + f"{levels}\n"
         + backtest_text(a.get("backtest"), a["symbol"])
         + universal_crypto_prompt_report(a)
         + "⚠️ این یک خروجی مدل تحلیلی است و سود قطعی یا تضمین‌شده نیست."
@@ -3318,9 +3345,6 @@ def _short_term_scan_metrics(x, ta):
     volume = _safe_float(x.get("total_volume"))
     rank = int(x.get("liquidity_rank") or x.get("market_cap_rank") or 99999)
     drawdown_250d = _safe_float(x.get("drawdown_250d_pct"))
-    # Percentile of real 24h USDT quote volume among Nobitex USDT pairs.
-    # Keep the legacy `turnover` key for compatibility, but it is a liquidity score,
-    # not a turnover ratio or a fabricated market-cap metric.
     turnover = _clamp(_safe_float(x.get("liquidity_score"), 0.0), 0.0, 1.0)
 
     spark = ((x.get("sparkline_in_7d") or {}).get("price") or [])
@@ -3353,7 +3377,6 @@ def _short_term_scan_metrics(x, ta):
         score += 5; reasons.append("رتبه حجم معاملات نوبیتکس مناسب است")
     elif turnover < 0.02:
         score -= 8; reasons.append("رتبه حجم معاملات نوبیتکس پایین است")
-    # Liquidity percentile above already includes the rank information; do not double-count it.
     if -25 <= drawdown_250d <= -5:
         score += 4; reasons.append("فاصله متعادل از سقف ۲۵۰روزه")
     elif drawdown_250d < -60:
@@ -3387,7 +3410,8 @@ def _short_term_scan_metrics(x, ta):
         if e9 > e21 > e50: score += 3; reasons.append("چیدمان EMA صعودی")
         if ta.get("early_entry"):
             score += 8; reasons.append("ورود زودهنگام نزدیک EMA21؛ پیش از کشیدگی قیمت")
-        if ta.get("late_move_risk") or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20:
+        # ─── PATCH v18.1: relaxed anti-chase threshold (was 1.20).
+        if ta.get("late_move_risk") or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.50:
             score -= 22; reasons.append("حرکت از نقطه ورود مناسب عبور کرده؛ خرید تعقیبی ممنوع")
 
     if 0.5 <= volatility <= 3.0:
@@ -3476,8 +3500,6 @@ def _alert_candidate_ok(item, btc_metrics):
     rr = _safe_float(ta.get("rr"))
     adx = _safe_float(ta.get("adx"), 0)
 
-    # BTC is retained as macro context, but must not veto an otherwise valid
-    # asset-specific setup. Each asset passes its own trend/structure/risk gates.
     rsi = _safe_float(ta.get("rsi"), 50)
     early_entry = bool(ta.get("early_entry"))
     if early_entry:
@@ -3503,6 +3525,7 @@ def _alert_candidate_ok(item, btc_metrics):
 
     if signal_candidate != "BUY":
         return False
+    # ─── PATCH v18.1: accept BULLISH_WEAK and TRANSITION structure.
     if early_entry:
         if trend not in ("BULLISH", "BULLISH_WEAK", "NEUTRAL"):
             return False
@@ -3511,17 +3534,17 @@ def _alert_candidate_ok(item, btc_metrics):
         if _safe_float(ta.get("ema21_distance_atr"), 99) > 0.90:
             return False
     else:
-        if trend != "BULLISH" or ta.get("structure") != "BULLISH":
+        if trend not in ("BULLISH", "BULLISH_WEAK") or ta.get("structure") not in ("BULLISH", "TRANSITION"):
             return False
     if risk == "زیاد":
         return False
     if ch24 < -1.5 or ch7 < -4.0:
         return False
-    # Hard anti-chasing guard: do not issue a fresh buy after a vertical move.
-    if (ch24 > 6.0 or ch7 > 18.0 or ch1 > 3.0
+    # ─── PATCH v18.1: relaxed anti-chase gates.
+    if (ch24 > 8.0 or ch7 > 22.0 or ch1 > 5.0
             or ta.get("late_move_risk")
-            or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20
-            or rsi >= 68):
+            or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.50
+            or rsi >= 72):
         return False
     if turnover < max(0.02, MIN_TURNOVER_SIGNAL):
         return False
@@ -3537,9 +3560,10 @@ def _alert_candidate_ok(item, btc_metrics):
         + signal_score * 0.15
         + min(100, rr * 30) * 0.10
     )
-    if weighted < (64 if early_entry else 72):
+    # ─── PATCH v18.1: lower weighted gates.
+    if weighted < (58 if early_entry else 64):
         return False
-    if signal_score < (54 if early_entry else 60):
+    if signal_score < (48 if early_entry else 54):
         return False
     return True
 
@@ -3562,10 +3586,6 @@ async def _market_alert_scan():
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
         turnover = _clamp(_safe_float(x.get("liquidity_score"), 0.0), 0.0, 1.0)
-        # Rank for early formation, not coins that have already pumped.
-        # Seek the first acceleration phase: modest positive 1h momentum while
-        # 24h/7d performance is still contained. Do not let a large turnover
-        # score promote a coin that has already made its move.
         rough_score = 50 + _clamp(ch1 * 1.10, -4, 4)
         rough_score += _clamp(ch24 * 0.10, -3, 3) + _clamp(ch7 * 0.035, -3, 3)
         rough_score += _clamp((turnover - .05) * 45, -5, 6)
@@ -3573,10 +3593,11 @@ async def _market_alert_scan():
         if -2.0 <= ch24 <= 4.5: rough_score += 4
         if -5.0 <= ch7 <= 12.0: rough_score += 4
         if ch1 > 3.0: rough_score -= 10
-        if ch24 > 6.0: rough_score -= 14
-        if ch24 > 10.0: rough_score -= 10
-        if ch7 > 18.0: rough_score -= 12
-        if ch7 > 30.0: rough_score -= 10
+        # ─── PATCH v18.1: relaxed rough screening cutoffs.
+        if ch24 > 8.0: rough_score -= 14
+        if ch24 > 12.0: rough_score -= 10
+        if ch7 > 22.0: rough_score -= 12
+        if ch7 > 35.0: rough_score -= 10
         if ch24 < -12.0: rough_score -= 5
         if ch7 < -25.0: rough_score -= 5
         rough.append((rough_score, x))
@@ -4538,7 +4559,7 @@ async def alert_callback(update, context):
     await q.message.edit_text("🔔 هشدار سیگنال: " + ("فعال" if new else "خاموش"))
 
 
-    # ============================================================
+# ============================================================
 # GROWTH SCAN (short-term)
 # ============================================================
 
@@ -4561,7 +4582,6 @@ async def short_term_growth_scan():
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
         ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
         turnover = _clamp(_safe_float(x.get("liquidity_score"), 0.0), 0.0, 1.0)
-        # Prefer quiet accumulation / first momentum, penalize late vertical moves.
         ch1 = _safe_float(x.get("price_change_percentage_1h_in_currency"))
         rough_score = 50 + _clamp(ch1 * 1.10, -4, 4) + _clamp(ch24 * 0.10, -3, 3) + _clamp(ch7 * 0.035, -3, 3)
         rough_score += _clamp((turnover - .05) * 45, -5, 6)
@@ -4569,10 +4589,11 @@ async def short_term_growth_scan():
         if -2.0 <= ch24 <= 4.5: rough_score += 4
         if -5.0 <= ch7 <= 12.0: rough_score += 4
         if ch1 > 3.0: rough_score -= 10
-        if ch24 > 6.0: rough_score -= 14
-        if ch24 > 10.0: rough_score -= 10
-        if ch7 > 18.0: rough_score -= 12
-        if ch7 > 30.0: rough_score -= 10
+        # ─── PATCH v18.1: relaxed rough cutoffs.
+        if ch24 > 8.0: rough_score -= 14
+        if ch24 > 12.0: rough_score -= 10
+        if ch7 > 22.0: rough_score -= 12
+        if ch7 > 35.0: rough_score -= 10
         if ch24 < -12.0: rough_score -= 5
         if ch7 < -25.0: rough_score -= 5
         rough.append((rough_score, x))
@@ -4598,11 +4619,12 @@ async def short_term_growth_scan():
         m = _short_term_scan_metrics(x, ta)
         if not m:
             continue
+        # ─── PATCH v18.1: relaxed anti-chase.
         if (ta.get("late_move_risk")
-                or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20
-                or _safe_float(ta.get("rsi"), 50) >= 68
-                or _safe_float(x.get("price_change_percentage_24h_in_currency")) > 6
-                or _safe_float(x.get("price_change_percentage_7d_in_currency")) > 18):
+                or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.50
+                or _safe_float(ta.get("rsi"), 50) >= 72
+                or _safe_float(x.get("price_change_percentage_24h_in_currency")) > 8
+                or _safe_float(x.get("price_change_percentage_7d_in_currency")) > 22):
             continue
         result.append({
             "id": x.get("id"), "symbol": norm_symbol(x.get("symbol") or ""),
@@ -4798,20 +4820,19 @@ async def _cycle_bottom_and_growth_scan(rows=None):
         trend = str(ta.get("trend") or "NEUTRAL")
         rsi = _safe_float(ta.get("rsi"), 50)
         signal = str(ta.get("signal_candidate") or "WAIT")
-        # Opportunity lists require the primary multi-timeframe BUY decision;
-        # the independent strict strategy is only corroborating evidence.
         if signal != "BUY":
             continue
+        # ─── PATCH v18.1: relaxed late-entry gates.
         late_entry = (bool(ta.get("late_move_risk"))
-                      or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.20
-                      or rsi >= 68)
+                      or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.50
+                      or rsi >= 72)
         if late_entry:
             continue
         if lane == "bottom":
-            if trend not in ("BULLISH", "BULLISH_WEAK") or not (32 <= rsi <= 64):
+            if trend not in ("BULLISH", "BULLISH_WEAK") or not (30 <= rsi <= 66):
                 continue
         else:
-            if trend not in ("BULLISH", "BULLISH_WEAK") or not (42 <= rsi <= 64):
+            if trend not in ("BULLISH", "BULLISH_WEAK") or not (40 <= rsi <= 68):
                 continue
         out[lane].append({"symbol": norm_symbol(x.get("symbol") or ""),
                           "name": x.get("name") or norm_symbol(x.get("symbol") or ""),
@@ -4953,7 +4974,7 @@ async def alert_worker(app):
                     qualified[symbol] = item
                     m = item["m"]
                     ta = m.get("ta") or {}
-                    candidate = "BUY" if ta.get("trend") == "BULLISH" else "WAIT"
+                    candidate = "BUY" if ta.get("trend") in ("BULLISH", "BULLISH_WEAK") else "WAIT"
                     confirmed, confirmations, cycle_id = confirm_market_alert(
                         symbol, candidate, m["price"], observation_key
                     )
@@ -4983,7 +5004,6 @@ async def alert_worker(app):
                       AND COALESCE(s.plan,'')<>?
                 """, (now_iso(), TRIAL_PLAN)).fetchall()
 
-            # نسخه ۲: یک سیگنال جهانی برای هر نماد/چرخه ثبت می‌شود؛ نه یک رکورد برای هر کاربر.
             try:
                 v2_update_paper_positions(await market_universe())
                 for _sym, _item in qualified.items():
@@ -5052,7 +5072,7 @@ async def alert_worker(app):
                         else:
                             await app.bot.send_message(
                                 uid,
-                                "🔔 <b>فرصت خرید تأییدشده در کل بازار</b>\\n\\n" + signal_text(a),
+                                "🔔 <b>فرصت خرید تأییدشده در کل بازار</b>\n\n" + signal_text(a),
                                 parse_mode=ParseMode.HTML
                             )
                         daily_sent += 1
@@ -5694,7 +5714,6 @@ V2_CRITERIA = (
 )
 
 def v2_init_db():
-    """ساخت جداول نسخه ۲ بدون حذف یا بازنویسی جداول نسخه قبلی."""
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS v2_signal_history(
@@ -5761,7 +5780,6 @@ def v2_init_db():
         c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('v2_schema_version','2')")
 
 def v2_feature_snapshot(ta):
-    """تبدیل وضعیت اندیکاتورها به شواهد دودویی قابل یادگیری."""
     ta = ta or {}
     rsi = _safe_float(ta.get("rsi"), 50)
     return {
@@ -5774,7 +5792,6 @@ def v2_feature_snapshot(ta):
     }
 
 def v2_bayesian_stats():
-    """محاسبه نرخ موفقیت پسین معیارها با prior بتا(۲،۲)."""
     if not V2_ENABLED:
         return {}
     try:
@@ -5797,7 +5814,6 @@ def v2_bayesian_stats():
         return {}
 
 def v2_apply_adaptive_score(base_score, ta):
-    """اعمال تعدیل محدود بر اساس عملکرد واقعی معیارها؛ امتیاز خام حفظ می‌شود."""
     try:
         stats = v2_bayesian_stats()
         features = v2_feature_snapshot(ta)
@@ -5810,7 +5826,6 @@ def v2_apply_adaptive_score(base_score, ta):
                 continue
             rate = float(item.get("win_rate", 0.5))
             confidence = min(1.0, int(item.get("samples", 0)) / 30.0)
-            # معیار فقط وقتی فعال است از سابقه موفقیت خودش اثر می‌گیرد.
             weight = confidence * (0.5 + abs(rate - 0.5))
             deltas.append((rate - 0.5) * 8.0 * confidence)
             weights.append(weight)
@@ -5823,7 +5838,6 @@ def v2_apply_adaptive_score(base_score, ta):
         return float(base_score)
 
 def v2_register_signal(item, cycle_id=None):
-    """ثبت یک سیگنال تأییدشده و ایجاد معامله فرضی؛ از ثبت تکراری جلوگیری می‌کند."""
     if not V2_ENABLED:
         return False
     m = (item or {}).get("m") or {}
@@ -5879,7 +5893,6 @@ def v2_register_signal(item, cycle_id=None):
         return False
 
 def v2_resolve_learning(signal_key, exit_price, outcome, pnl_pct):
-    """ثبت نتیجه و به‌روزرسانی posterior معیارهایی که هنگام سیگنال فعال بوده‌اند."""
     try:
         with db() as c:
             row = c.execute(
@@ -5907,7 +5920,6 @@ def v2_resolve_learning(signal_key, exit_price, outcome, pnl_pct):
         log.exception("v2 learning resolution failed")
 
 def v2_update_paper_positions(market_rows):
-    """به‌روزرسانی معاملات فرضی با آخرین قیمت‌های اسکن؛ کارمزد رفت‌وبرگشت لحاظ می‌شود."""
     if not V2_ENABLED or not V2_PAPER_ENABLED:
         return
     prices = {}
@@ -5941,7 +5953,6 @@ def v2_update_paper_positions(market_rows):
                 reason = "TIME_EXIT"
             if not reason:
                 continue
-            # 0.20 درصد هزینه تخمینی مجموع ورود و خروج؛ قابل تنظیم از env.
             fee_pct = max(0.0, float(os.getenv("V2_PAPER_FEE_PCT", "0.20")))
             gross_pct = (exit_price / entry - 1.0) * 100.0
             net_pct = gross_pct - fee_pct
@@ -5958,7 +5969,6 @@ def v2_update_paper_positions(market_rows):
         log.exception("v2 paper position update failed")
 
 def v2_paper_summary():
-    """آمار معاملات فرضی بسته و باز را از دیتابیس استخراج می‌کند."""
     v2_init_db()
     with db() as c:
         total = int(c.execute("SELECT COUNT(*) FROM v2_paper_positions WHERE status='CLOSED'").fetchone()[0] or 0)
@@ -5973,7 +5983,6 @@ def v2_paper_summary():
             "open": opened, "pnl": pnl, "positions": rows}
 
 def v2_performance_text():
-    """گزارش فارسی عملکرد Paper Trading و دقت معیارهای یادگرفته‌شده."""
     summary = v2_paper_summary()
     stats = v2_bayesian_stats()
     lines = [
@@ -6000,7 +6009,6 @@ def v2_performance_text():
     return "\n".join(lines)
 
 async def performance_command(update, context):
-    """نمایش عملکرد یادگیری و معاملات فرضی در تلگرام."""
     if not is_admin(update.effective_user.id) and not has_paid_subscription(update.effective_user.id):
         await update.message.reply_text("🔒 گزارش عملکرد نسخه ۲ مخصوص مشترکین فعال است.")
         return
@@ -6011,7 +6019,6 @@ async def performance_command(update, context):
         await update.message.reply_text("گزارش عملکرد فعلاً در دسترس نیست.")
 
 def v2_signal_markdown(a):
-    """ساخت هشدار Markdown با سطوح معامله و لینک مستقیم TradingView."""
     symbol = norm_symbol(a.get("symbol") or "")
     entry = _safe_float(a.get("price"))
     stop = _safe_float(a.get("stop"))
@@ -6036,7 +6043,6 @@ def v2_signal_markdown(a):
     )
 
 def v2_walk_forward_optimize(prices, train_ratio=0.60, fee_pct=0.20, folds=4):
-    """بهینه‌سازی روی پنجره‌های گذشته و آزمون روی پنجره بعدی؛ بدون استفاده از آینده."""
     p = pd.to_numeric(pd.Series(prices), errors="coerce").dropna().astype(float).reset_index(drop=True)
     if len(p) < 240:
         return {"ok": False, "reason": "حداقل ۲۴۰ کندل برای walk-forward چندمرحله‌ای لازم است."}
@@ -6053,7 +6059,6 @@ def v2_walk_forward_optimize(prices, train_ratio=0.60, fee_pct=0.20, folds=4):
         ef = series.ewm(span=fast, adjust=False).mean()
         es = series.ewm(span=slow, adjust=False).mean()
         raw_signal = (rsi.between(low, high) & (ef > es)).astype(float)
-        # پوزیشن در کندل بعدی اجرا می‌شود تا look-ahead bias کاهش یابد.
         position = raw_signal.shift(1).fillna(0)
         asset_ret = series.pct_change().fillna(0)
         turnover = position.diff().abs().fillna(position.abs())
@@ -6114,7 +6119,6 @@ def v2_walk_forward_optimize(prices, train_ratio=0.60, fee_pct=0.20, folds=4):
     }
 
 def dashboard_main():
-    """داشبورد اختیاری Streamlit که با RUN_DASHBOARD=1 اجرا می‌شود."""
     try:
         import streamlit as st
     except ImportError as exc:
@@ -6154,7 +6158,6 @@ def dashboard_main():
 # ============================================================
 
 async def live_status_command(update, context):
-    """Check public Nobitex market-data API health."""
     data = await http_json(f"{NOBITEX_BASE_URL}/market/stats", {"srcCurrency":"btc", "dstCurrency":"usdt"}, ttl=5, retries=1)
     stats = (data or {}).get("stats") or {}
     btc = stats.get("btc-usdt")
