@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Crypto / Global Gold / Iran 18K Gold Telegram Analyzer
-Nobitex market-data build — v18.2 (watchlist smart buy/sell monitor, relaxed multi-timeframe confirmation,
-                                           weak-bull acceptance, fast-track,
-                                           signal blockers reporting)
+Nobitex market-data build — v19.0 (data-quality gates, strict time-bucket confirmation,
+                                           live-entry drift guard, uncalibrated-confidence labeling)
 """
 
 import os
@@ -881,14 +880,14 @@ async def market_universe():
             "volume_24h_usdt": quote_volume, "volume_src": base_volume,
             "market_cap": 0.0, "market_cap_rank": 0,
             "liquidity_score": 0.0,
-            "price_change_percentage_1h_in_currency": 0.0,
+            "price_change_percentage_1h_in_currency": None,
             "price_change_percentage_24h_in_currency": _safe_float(item.get("dayChange")),
-            "price_change_percentage_7d_in_currency": 0.0,
-            "price_change_percentage_14d_in_currency": 0.0,
-            "price_change_percentage_30d_in_currency": 0.0,
-            "price_change_percentage_200d_in_currency": 0.0,
-            "price_change_percentage_1y_in_currency": 0.0,
-            "ath_change_percentage": 0.0, "atl_change_percentage": 0.0,
+            "price_change_percentage_7d_in_currency": None,
+            "price_change_percentage_14d_in_currency": None,
+            "price_change_percentage_30d_in_currency": None,
+            "price_change_percentage_200d_in_currency": None,
+            "price_change_percentage_1y_in_currency": None,
+            "ath_change_percentage": None, "atl_change_percentage": None,
             "day_high": _safe_float(item.get("dayHigh")),
             "day_low": _safe_float(item.get("dayLow")),
             "day_open": _safe_float(item.get("dayOpen")),
@@ -905,7 +904,7 @@ async def market_universe():
     unique.sort(key=lambda x: x["total_volume"], reverse=True)
     total_markets = len(unique)
     for rank, row in enumerate(unique, 1):
-        row["market_cap_rank"] = rank
+        row["market_cap_rank"] = 0
         row["liquidity_rank"] = rank
         row["liquidity_score"] = (1.0 - (rank - 1) / max(1, total_markets - 1)) if total_markets else 0.0
 
@@ -955,6 +954,9 @@ def _market_growth_score(x, ta=None):
     p = _safe_float(x.get("current_price"))
     if p <= 0:
         return None
+    if (x.get("price_change_percentage_1h_in_currency") is None
+            or x.get("price_change_percentage_7d_in_currency") is None):
+        return None
     ch1 = _safe_float(x.get("price_change_percentage_1h_in_currency"))
     ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
     ch7 = _safe_float(x.get("price_change_percentage_7d_in_currency"))
@@ -964,10 +966,8 @@ def _market_growth_score(x, ta=None):
     if vol <= 0:
         return None
 
+    # A true 0% move is valid data; availability is checked above, not by non-zero values.
     changes = [ch1, ch24, ch7, ch14, ch30]
-    nonzero = sum(1 for c in changes if abs(c) > 0.001)
-    if nonzero < 2:
-        return None
 
     score = 50.0
     score += _clamp(ch1 * 2.0, -8, 8)
@@ -1762,16 +1762,20 @@ def _tf_decision(symbol, df, timeframe):
     rsi = _safe_float(z["rsi"].iloc[-1], 50)
     macd = _safe_float(z["macd"].iloc[-1]); macd_sig = _safe_float(z["macd_sig"].iloc[-1])
     hist = _safe_float(z["macd_hist"].iloc[-1]); prev_hist = _safe_float(z["macd_hist"].iloc[-2], hist)
-    atr = max(_safe_float(z["atr"].iloc[-1]), current * 0.005)
+    atr = max(_safe_float(z["atr"].iloc[-1]), current * 0.0001)
     atr_pct = atr / current * 100 if current else 0
     adx = _safe_float(z["adx"].iloc[-1])
     dip = _safe_float(z["plus_di"].iloc[-1]); dim = _safe_float(z["minus_di"].iloc[-1])
-    vwap = _safe_float(z["vwap"].iloc[-1], current)
+    vwap_raw = z["vwap"].iloc[-1]
+    vwap_valid = bool(pd.notna(vwap_raw) and _safe_float(vwap_raw) > 0)
+    vwap = _safe_float(vwap_raw, current)
     bb_u = _safe_float(z["bb_upper"].iloc[-1], current)
     bb_l = _safe_float(z["bb_lower"].iloc[-1], current)
     bb_m = _safe_float(z["bb_mid"].iloc[-1], current)
     bb_width = _safe_float(z["bb_width"].iloc[-1])
-    vol_ratio = _safe_float(v.iloc[-1] / z["vol_ma20"].iloc[-1], 1) if _safe_float(z["vol_ma20"].iloc[-1]) > 0 else 1
+    vol_ma20_value = _safe_float(z["vol_ma20"].iloc[-1])
+    vol_ratio = (_safe_float(v.iloc[-1] / vol_ma20_value, 0.0)
+                 if vol_ma20_value > 0 else 0.0)
     stoch_k = _safe_float(z["stoch_k"].iloc[-1], 50); stoch_d = _safe_float(z["stoch_d"].iloc[-1], 50)
     roc5 = _safe_float(z["roc5"].iloc[-1]); roc20 = _safe_float(z["roc20"].iloc[-1])
     structure = _market_structure(df)
@@ -1834,8 +1838,11 @@ def _tf_decision(symbol, df, timeframe):
     elif vol_ratio < 0.70:
         rb.append("حجم پایین؛ شکست نیازمند احتیاط است")
 
-    if current > vwap: bull += 3; rb.append("قیمت بالای VWAP")
-    else: bear += 3; rs.append("قیمت زیر VWAP")
+    if vwap_valid:
+        if current > vwap: bull += 3; rb.append("قیمت بالای VWAP")
+        else: bear += 3; rs.append("قیمت زیر VWAP")
+    else:
+        rb.append("VWAP به‌دلیل حجم نامعتبر/ناکافی از امتیازدهی حذف شد")
 
     if current > bb_m and current < bb_u: bull += 3
     elif current < bb_m and current > bb_l: bear += 3
@@ -3026,23 +3033,6 @@ def confirm_signal(symbol, candidate, price, timeframe=None, signal_score=None):
     observation_key = _timeframe_bucket(timeframe)
     iso_now = now_iso()
 
-    # ─── PATCH v18.1: fast-track — very strong signals confirmed immediately,
-    #                  without waiting for a second timeframe bucket.
-    if signal_score is not None and _safe_float(signal_score) >= SIGNAL_FAST_TRACK_SCORE:
-        with db() as c:
-            c.execute("""
-                INSERT INTO signal_state(symbol,candidate,confirmations,last_candidate_at,last_price,updated_at)
-                VALUES(?,?,?,?,?,?)
-                ON CONFLICT(symbol) DO UPDATE SET
-                    candidate=excluded.candidate,
-                    confirmations=excluded.confirmations,
-                    last_candidate_at=excluded.last_candidate_at,
-                    last_price=excluded.last_price,
-                    updated_at=excluded.updated_at
-            """, (symbol, candidate, SIGNAL_CONFIRMATIONS_REQUIRED,
-                  observation_key, float(price), iso_now))
-        return candidate, True, SIGNAL_CONFIRMATIONS_REQUIRED
-
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         row = c.execute("SELECT * FROM signal_state WHERE symbol=?", (symbol,)).fetchone()
@@ -3335,7 +3325,7 @@ def signal_text(a):
         f"{setup} وضعیت فعلی: <b>{status_fa}</b>\n"
         f"🔎 کاندیدا: <b>{candidate_fa}</b>\n"
         f"🎯 امتیاز سیگنال: <b>{a['signal_score']:.0f}%</b>\n"
-        f"🧠 امتیاز اطمینان محاسباتی (کالیبره‌نشده): <b>{a['probability']:.0f}%</b>\n"
+        f"🧠 شاخص اطمینان الگوریتمی (احتمال برد نیست): <b>{a['probability']:.0f}/100</b>\n"
         f"🔁 تأیید متوالی: <b>{a['confirmations']}/{SIGNAL_CONFIRMATIONS_REQUIRED}</b> ({SIGNAL_CONFIRM_TIMEFRAME})\n"
         f"💪 قدرت تکنیکال: <b>{a['strength']:.0f}%</b>\n"
         f"📈 روند: <b>{a['trend']}</b> | رژیم بازار: <b>{a.get('market_regime', 'MIXED')}</b> | RSI: <b>{a['rsi']:.1f}</b> | ADX: <b>{a['adx']:.1f}</b>\n"
@@ -3594,7 +3584,9 @@ async def _market_alert_scan():
     for x in rows:
         price = _safe_float(x.get("current_price"))
         volume = _safe_float(x.get("total_volume"))
-        if price <= 0 or volume <= 0:
+        if (price <= 0 or volume <= 0
+                or x.get("price_change_percentage_1h_in_currency") is None
+                or x.get("price_change_percentage_7d_in_currency") is None):
             continue
         ch1 = _safe_float(x.get("price_change_percentage_1h_in_currency"))
         ch24 = _safe_float(x.get("price_change_percentage_24h_in_currency"))
@@ -5122,21 +5114,17 @@ async def smart_trading_callback(update, context):
     )
 
 def _smart_signal_ready(a, side):
+    """Only accept the primary engine signal after independent time-bucket confirmation."""
     if not a or a.get("signal_candidate") != side:
         return False
-    # Fast path: accept the engine's confirmed signal, or agreement with its
-    # independent strategy overlay; this avoids waiting for a slow hourly bucket.
-    confirmed = a.get("signal") == side and bool(a.get("confirmed"))
-    independent = (
-        bool(a.get("secondary_strategy_agrees"))
-        and a.get("secondary_strategy_candidate") == side
-    )
-    if not (confirmed or independent):
+    if a.get("signal") != side or not bool(a.get("confirmed")):
         return False
     if _safe_float(a.get("signal_score")) < SMART_MIN_SIGNAL_SCORE:
         return False
     if _safe_float(a.get("probability"), 0) < SMART_MIN_PROBABILITY:
         return False
+    # The reported probability is an uncalibrated model-confidence score.
+    # Keep the threshold as a filter, never interpret it as a win probability.
     return True
 
 async def _smart_scan_symbol(symbol):
@@ -5310,6 +5298,17 @@ async def smart_trading_worker(app):
                         if not _smart_signal_ready(a, "BUY"):
                             continue
                         entry = price
+                        reference_entry = _safe_float(a.get("entry_price"), _safe_float(a.get("price")))
+                        exec_metrics = (a.get("mtf") or {}).get("1H") or a
+                        atr_reference = _safe_float(exec_metrics.get("atr"), 0.0)
+                        if reference_entry <= 0 or atr_reference <= 0:
+                            continue
+                        quote_drift = abs(entry - reference_entry)
+                        max_entry_drift = max(0.50 * atr_reference, reference_entry * 0.008)
+                        if quote_drift > max_entry_drift:
+                            log.info("smart entry skipped stale price %s drift=%.6f max=%.6f",
+                                     symbol, quote_drift, max_entry_drift)
+                            continue
                         raw_stop = _safe_float(a.get("stop"))
                         if raw_stop <= 0 or raw_stop >= entry:
                             continue
@@ -5336,6 +5335,7 @@ async def smart_trading_worker(app):
                             f"هدف اول: <b>{_format_price(symbol, target1)}</b>\n"
                             f"هدف دوم: <b>{_format_price(symbol, target2)}</b>\n"
                             f"امتیاز سیگنال: <b>{_safe_float(a.get('signal_score')):.0f}/100</b>\n"
+                            f"شاخص اطمینان (کالیبره‌نشده): <b>{_safe_float(a.get('probability')):.0f}/100</b>\n"
                             f"قدرت تحلیل: <b>{_safe_float(a.get('strength')):.0f}%</b>\n\n"
                             f"دلایل ورود:\n{reason_text or 'تأیید چندتایم‌فریمی'}\n\n"
                             "موقعیت مرجع برای پایش خودکار فروش ثبت شد. این ربات سفارش واقعی نمی‌گذارد؛ تصمیم و اجرای خرید با شماست."
@@ -6580,7 +6580,7 @@ async def post_init(app):
     app.create_task(smart_trading_worker(app))
     app.create_task(backup_worker())
     app.create_task(market_snapshot_worker())
-    log.info("MARKET AI started | data_source=Nobitex | cache=%s", len(CACHE))
+    log.info("MARKET AI v19.0 started | Nobitex OHLCV | strict signal confirmation | cache=%s", len(CACHE))
 
 async def post_shutdown(app):
     global HTTP_SESSION
@@ -6623,7 +6623,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, receipt_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
-    log.info("MARKET AI v2 polling started")
+    log.info("MARKET AI v19.0 polling started")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 if __name__ == "__main__":
