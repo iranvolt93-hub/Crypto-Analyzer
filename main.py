@@ -4069,10 +4069,10 @@ async def signals_menu(update, context):
         return
 
     msg = await update.message.reply_text(
-        "🔎 <b>اسکن خودکار بازار برای سیگنال معاملاتی</b>\n\n"
-        "واچ‌لیست شما شرط این بخش نیست؛ ربات بازار را بررسی می‌کند و "
-        "چند نامزد مناسب را برای ارزیابی نشان می‌دهد.\n"
-        "⏳ در حال دریافت داده و بررسی تایم‌فریم‌ها...",
+        "🔎 <b>اسکن بازار برای سیگنال‌های خرید تأییدشده</b>\n\n"
+        "تمام بازارهای تتریِ قابل دریافت بررسی می‌شوند؛ فقط ارزهایی نمایش داده می‌شوند "
+        "که از فیلترهای سخت‌گیرانه خرید عبور کرده و تأیید زمانی لازم را گرفته باشند.\n"
+        "⏳ در حال بررسی داده‌ها و تایم‌فریم‌ها...",
         parse_mode=ParseMode.HTML,
     )
     try:
@@ -4081,68 +4081,88 @@ async def signals_menu(update, context):
         )
         if not opportunities:
             await msg.edit_text(
-                "⏳ <b>فعلاً نامزد قابل بررسی پیدا نشد.</b>\n\n"
-                "بازارهای تتری دریافت شدند، اما در این نوبت هیچ دارایی از فیلترهای ورود عبور نکرد. "
-                "گزارش تعداد کندل‌ها و تایم‌فریم‌های ناقص در لاگ سرور ثبت شده است. کمی بعد دوباره تلاش کنید.",
+                "🟡 <b>در حال حاضر سیگنال خرید معتبر وجود ندارد.</b>\n\n"
+                "داده کافی برای تأیید خرید هیچ‌یک از بازارهای بررسی‌شده به دست نیامد. "
+                "هیچ وضعیت انتظار یا فروش در این بخش نمایش داده نمی‌شود.",
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        ranked = sorted(
-            [x for x in opportunities if x.get("m") and x.get("m", {}).get("ta")],
+        # Only strict BUY candidates are considered. Confirmation must persist
+        # across independent market-scan buckets; a single scan cannot create a buy.
+        buy_items = []
+        for item in opportunities:
+            if not item.get("m") or not (item.get("m") or {}).get("ta"):
+                continue
+            if not _alert_candidate_ok(item, btc_status):
+                continue
+            m = item["m"]
+            confirmed, confirmations, cycle_id = confirm_market_alert(
+                item["symbol"], "BUY", m.get("price", 0), observation_key
+            )
+            m.update({
+                "confirmed": confirmed,
+                "confirmations": confirmations,
+                "cycle_id": cycle_id,
+                "signal": "BUY" if confirmed else "WAIT",
+            })
+            if confirmed:
+                buy_items.append(item)
+
+        buy_items.sort(
             key=lambda x: (
-                1 if _alert_candidate_ok(x, btc_status) else 0,
                 _safe_float((x.get("m") or {}).get("score")),
                 _safe_float((x.get("m") or {}).get("strength")),
                 _safe_float((x.get("m") or {}).get("probability")),
-            ),
-            reverse=True,
-        )[:5]
-
+            ), reverse=True,
+        )
+        ranked = buy_items[:5]
         if not ranked:
             await msg.edit_text(
-                "⏳ <b>تحلیل کامل بازار نتیجه قابل اتکایی نداد.</b>\n\n"
-                "داده تاریخی کافی برای چند تایم‌فریم دریافت نشد؛ بعداً دوباره تلاش کنید.",
+                "🟡 <b>در حال حاضر سیگنال خرید تأییدشده وجود ندارد.</b>\n\n"
+                f"برای صدور سیگنال، شروط خرید باید در {SIGNAL_CONFIRMATIONS_REQUIRED} مشاهده مستقل "
+                "تأیید شوند. نامزدهای تأییدنشده، وضعیت انتظار و سیگنال فروش در این فهرست نمایش داده نمی‌شوند.\n"
+                "کمی بعد دوباره اسکن کنید یا منتظر هشدار خودکار بمانید.",
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        lines = ["📡 <b>نتیجه اسکن خودکار بازار</b>",
-                 "ربات بدون نیاز به واچ‌لیست، نامزدها را از بازار پیدا کرده است.", ""]
-        if not btc_status or not btc_status.get("ok"):
-            lines.append("₿ وضعیت BTC ضعیف یا نامطمئن است؛ ریسک کلان بالاتر است، اما هر دارایی مستقل و با فیلترهای خودش ارزیابی می‌شود.")
+        lines = [
+            "🟢 <b>سیگنال‌های خرید تأییدشده بازار</b>",
+            f"تعداد فرصت‌های واجد شرایط: <b>{len(buy_items)}</b> | نمایش: <b>{len(ranked)}</b>",
+            "فقط وضعیت خرید تأییدشده در این فهرست قرار می‌گیرد.",
+            "",
+        ]
+        if btc_status and btc_status.get("ok"):
+            lines.append("₿ وضعیت کلی BTC: مساعد")
         else:
-            lines.append("₿ وضعیت BTC مثبت است؛ با این حال هر دارایی مستقل و با فیلترهای خودش ارزیابی می‌شود.")
+            lines.append("₿ وضعیت کلی BTC: نامطمئن؛ ریسک کل بازار بالاتر است")
         lines.append("")
 
         keyboard_buttons = []
         for idx, item in enumerate(ranked, 1):
             m = item.get("m") or {}
             ta = m.get("ta") or {}
-            qualified = _alert_candidate_ok(item, btc_status)
-            label = "نامزد خرید" if qualified else "تحت نظر؛ هنوز تأیید خرید نیست"
-            trend_fa = {"BULLISH": "صعودی", "BULLISH_WEAK": "صعودی ضعیف",
-                        "BEARISH": "نزولی", "BEARISH_WEAK": "نزولی ضعیف",
-                        "NEUTRAL": "خنثی"}.get(ta.get("trend"), "نامشخص")
+            sym = norm_symbol(item.get("symbol") or "")
             lines.append(
-                f"{idx}. <b>{escape(item.get('symbol', '?'))}</b> — {label}\n"
+                f"{idx}. 🟢 <b>{escape(sym)}</b> — <b>خرید تأییدشده</b>\n"
+                f"   قیمت بررسی: <b>{_format_price(sym, m.get('price', 0))}</b>\n"
                 f"   امتیاز فرصت: {_safe_float(m.get('score')):.0f}% | "
                 f"قدرت تکنیکال: {_safe_float(m.get('strength')):.0f}%\n"
-                f"   روند: {trend_fa} | RSI: {_safe_float(ta.get('rsi'), 50):.1f} | "
-                f"ریسک: {escape(str(m.get('risk') or 'نامشخص'))}"
+                f"   RSI: {_safe_float(ta.get('rsi'), 50):.1f} | "
+                f"تأیید: {int(m.get('confirmations', 0))}/{SIGNAL_CONFIRMATIONS_REQUIRED}"
             )
-            sym = norm_symbol(item.get("symbol") or "")
             if sym:
                 keyboard_buttons.append([
-                    InlineKeyboardButton(f"📊 {sym}", callback_data=f"op:analysis:{sym}"),
-                    InlineKeyboardButton(f"📡 {sym}", callback_data=f"op:signal:{sym}"),
+                    InlineKeyboardButton(f"📊 تحلیل {sym}", callback_data=f"op:analysis:{sym}"),
+                    InlineKeyboardButton(f"📡 جزئیات خرید {sym}", callback_data=f"op:signal:{sym}"),
                 ])
+            lines.append("")
 
-        lines.extend([
-            "",
-            "📌 برای هر دارایی می‌توانید تحلیل کامل یا جزئیات سیگنال را باز کنید.",
-            "⚠️ امتیازها تضمین سود یا احتمال سودِ کالیبره‌شده نیستند؛ تا زمان تأیید، موارد «تحت نظر» سیگنال خرید محسوب نمی‌شوند.",
-        ])
+        lines.append(
+            "⚠️ این موارد از فیلتر و تأیید زمانی عبور کرده‌اند؛ بااین‌حال سود تضمین‌شده نیست. "
+            "پیش از ورود، قیمت لحظه‌ای، حد ضرر و نسبت سود به زیان را کنترل کنید."
+        )
         await msg.edit_text(
             "\n".join(lines),
             parse_mode=ParseMode.HTML,
@@ -4150,15 +4170,14 @@ async def signals_menu(update, context):
         )
     except asyncio.TimeoutError:
         await msg.edit_text(
-            "⏳ اسکن بازار بیش از ۹۰ ثانیه طول کشید و متوقف شد تا ربات معطل نماند. "
-            "کمی بعد دوباره تلاش کنید.",
+            "⏳ اسکن بازار بیش از ۹۰ ثانیه طول کشید و متوقف شد. هیچ سیگنال تأییدنشده‌ای نمایش داده نمی‌شود؛ کمی بعد دوباره تلاش کنید.",
             parse_mode=ParseMode.HTML,
         )
     except Exception:
-        log.exception("market-wide trading signal scan")
+        log.exception("market-wide buy-only signal scan")
         try:
             await msg.edit_text(
-                "⚠️ اسکن سیگنال کامل نشد؛ خطا در لاگ Railway ثبت شد. کمی بعد دوباره تلاش کنید.",
+                "⚠️ اسکن سیگنال خرید کامل نشد؛ خطا در لاگ سرور ثبت شد. کمی بعد دوباره تلاش کنید.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -5730,6 +5749,12 @@ async def selected_signal_callback(update, context):
             return
         coin_id = coin_id or user_asset_key(q.from_user.id, sym, atype)
         a = await asyncio.wait_for(analyze(norm_symbol(sym), coin_id=coin_id), timeout=45)
+        if not a or a.get("signal_candidate") != "BUY" or a.get("signal") != "BUY" or not a.get("confirmed"):
+            await q.message.reply_text(
+                "🟡 در حال حاضر برای این ارز سیگنال خرید تأییدشده وجود ندارد.\n"
+                "این بخش فقط خریدهای تأییدشده را نمایش می‌دهد؛ وضعیت انتظار یا فروش ارائه نمی‌شود."
+            )
+            return
         await q.message.reply_text(signal_text(a), parse_mode=ParseMode.HTML)
     except asyncio.TimeoutError:
         await q.message.reply_text("⏳ دریافت داده بیش از حد طول کشید. ۳۰ تا ۶۰ ثانیه دیگر دوباره تلاش کنید.")
@@ -5758,6 +5783,11 @@ async def opportunity_action_callback(update, context):
         a = await asyncio.wait_for(analyze(norm_symbol(sym)), timeout=45)
         if action == "analysis":
             await q.message.reply_text(analysis_text(a), parse_mode=ParseMode.HTML)
+        elif not a or a.get("signal_candidate") != "BUY" or a.get("signal") != "BUY" or not a.get("confirmed"):
+            await q.message.reply_text(
+                "🟡 در حال حاضر برای این ارز سیگنال خرید تأییدشده وجود ندارد.\n"
+                "این بخش فقط خریدهای تأییدشده را نمایش می‌دهد."
+            )
         else:
             await q.message.reply_text(signal_text(a), parse_mode=ParseMode.HTML)
     except asyncio.TimeoutError:
