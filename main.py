@@ -66,29 +66,29 @@ MAX_WATCHLIST = max(1, int(os.getenv("MAX_WATCHLIST", "100")))
 
 GOLD_HISTORY_INTERVAL_SECONDS = max(60, int(os.getenv("GOLD_HISTORY_INTERVAL_SECONDS", "300")))
 GOLD_MIN_HISTORY_POINTS = max(50, int(os.getenv("GOLD_MIN_HISTORY_POINTS", "50")))
-SIGNAL_MIN_SCORE = max(60, min(100, int(os.getenv("SIGNAL_MIN_SCORE", "76"))))
-ALERT_OPPORTUNITY_MIN = max(60, min(95, int(os.getenv("ALERT_OPPORTUNITY_MIN", "76"))))
-ALERT_STRENGTH_MIN = max(50, min(95, int(os.getenv("ALERT_STRENGTH_MIN", "60"))))
-ALERT_PROBABILITY_MIN = max(50, min(95, int(os.getenv("ALERT_PROBABILITY_MIN", "60"))))
-ALERT_RSI_MIN = max(30, min(55, int(os.getenv("ALERT_RSI_MIN", "42"))))
-ALERT_RSI_MAX = max(60, min(82, int(os.getenv("ALERT_RSI_MAX", "74"))))
-ALERT_MIN_TURNOVER = max(0.01, min(0.30, float(os.getenv("ALERT_MIN_TURNOVER", "0.03"))))
-SIGNAL_CONFIRMATIONS_REQUIRED = max(1, min(3, int(os.getenv("SIGNAL_CONFIRMATIONS_REQUIRED", "2"))))
+SIGNAL_MIN_SCORE = 76
+ALERT_OPPORTUNITY_MIN = 76
+ALERT_STRENGTH_MIN = 60
+ALERT_PROBABILITY_MIN = 60
+ALERT_RSI_MIN = 42
+ALERT_RSI_MAX = 74
+ALERT_MIN_TURNOVER = 0.03
+SIGNAL_CONFIRMATIONS_REQUIRED = 2
 # ─── PATCH v18.1: confirmation timeframe lowered from 4H to 1H.
-SIGNAL_CONFIRM_TIMEFRAME = os.getenv("SIGNAL_CONFIRM_TIMEFRAME", "1H").strip()
+SIGNAL_CONFIRM_TIMEFRAME = "1H"
 # ─── PATCH v18.1: very strong signals confirmed immediately, no second-bucket wait.
-SIGNAL_FAST_TRACK_SCORE = max(75, min(100, int(os.getenv("SIGNAL_FAST_TRACK_SCORE", "82"))))
+SIGNAL_FAST_TRACK_SCORE = 82
 
-ADX_MIN_TREND = max(12, min(30, int(os.getenv("ADX_MIN_TREND", "18"))))
-MIN_RR_RATIO = max(1.3, min(3.0, float(os.getenv("MIN_RR_RATIO", "1.6"))))
-MIN_TURNOVER_SIGNAL = max(0.01, min(0.30, float(os.getenv("MIN_TURNOVER_SIGNAL", "0.03"))))
+ADX_MIN_TREND = 18
+MIN_RR_RATIO = 1.6
+MIN_TURNOVER_SIGNAL = 0.03
 MAX_DAILY_SIGNALS_PER_USER = max(1, min(10, int(os.getenv("MAX_DAILY_SIGNALS_PER_USER", "2"))))
 
 MARKET_SCAN_PAGES = max(1, min(10, int(os.getenv("MARKET_SCAN_PAGES", "2"))))
 MARKET_SCAN_PER_PAGE = max(50, min(250, int(os.getenv("MARKET_SCAN_PER_PAGE", "250"))))
 MARKET_SCAN_TOP = max(5, min(30, int(os.getenv("MARKET_SCAN_TOP", "10"))))
 MARKET_SCAN_SECONDS = max(300, int(os.getenv("MARKET_SCAN_SECONDS", "600")))
-MARKET_SCAN_DEEP = max(5, min(25, int(os.getenv("MARKET_SCAN_DEEP", "20"))))
+MARKET_SCAN_DEEP = 20
 MARKET_SCAN_CACHE = None
 SHORT_TERM_SCAN_CACHE = None
 NOBITEX_BASE_URL = os.getenv("NOBITEX_BASE_URL", "https://apiv2.nobitex.ir").rstrip("/")
@@ -5035,8 +5035,8 @@ SMART_SCAN_CONCURRENCY = max(1, min(6, int(os.getenv("SMART_SCAN_CONCURRENCY", "
 SMART_REENTRY_COOLDOWN_SECONDS = max(300, int(os.getenv("SMART_REENTRY_COOLDOWN_SECONDS", "1800")))
 SMART_TRAIL_ACTIVATE_PCT = max(0.30, float(os.getenv("SMART_TRAIL_ACTIVATE_PCT", "0.80")))
 SMART_TRAIL_GIVEBACK_PCT = max(0.15, float(os.getenv("SMART_TRAIL_GIVEBACK_PCT", "0.35")))
-SMART_MIN_SIGNAL_SCORE = max(55, min(100, int(os.getenv("SMART_MIN_SIGNAL_SCORE", "68"))))
-SMART_MIN_PROBABILITY = max(45, min(100, int(os.getenv("SMART_MIN_PROBABILITY", "58"))))
+SMART_MIN_SIGNAL_SCORE = 68
+SMART_MIN_PROBABILITY = 58
 
 def smart_trading_status(uid):
     with db() as c:
