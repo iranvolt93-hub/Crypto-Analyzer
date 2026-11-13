@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Crypto / Global Gold / Iran 18K Gold Telegram Analyzer
-Nobitex market-data build — v19.0 (data-quality gates, strict time-bucket confirmation,
-                                           live-entry drift guard, uncalibrated-confidence labeling)
+Nobitex market-data build — v20.0 (weekly regime confirmation, expanded diagnostics,
+                                           strategy performance access, USDT-first analysis)
 """
 
 import os
@@ -178,6 +178,7 @@ MAIN_MENU = [
     ["📡 سیگنال معاملاتی", "🤖 معاملات هوشمند"],
     ["🎁 تست رایگان", "💳 خرید اشتراک"],
     ["👤 وضعیت اشتراک", "🔔 هشدارهای هوشمند"],
+    ["📈 عملکرد استراتژی", "📡 وضعیت API بازار"],
     ["📨 پشتیبانی", "ℹ️ راهنمای ربات"],
     ["👨‍💼 پنل مدیریت"],
 ]
@@ -2698,7 +2699,9 @@ async def professional_crypto_analysis(symbol):
     if cached is not None:
         return cached
 
-    bars = {"5m": 240, "15m": 240, "1H": 240, "4H": 240, "1D": 240}
+    # Weekly regime is now fetched explicitly. The weekly series is resampled
+    # from closed daily Nobitex candles; it is not a synthetic live estimate.
+    bars = {"5m": 240, "15m": 240, "1H": 240, "4H": 240, "1D": 240, "1W": 240}
 
     async def one(tf, limit):
         return tf, await nobitex_candles(symbol, tf, limit)
@@ -3700,6 +3703,7 @@ def main_kb(uid):
             "🤖 معاملات هوشمند": not has_paid,
             "📡 سیگنال معاملاتی": not has_paid,
             "🔔 هشدارهای هوشمند": not has_paid,
+            "📈 عملکرد استراتژی": not has_paid,
         }
         rows = [[label + (" 🔒" if locked_labels.get(label, False) else "")
                  for label in row] for row in rows]
@@ -5965,6 +5969,8 @@ async def text_router(update, context):
         "👤 وضعیت اشتراک": status_menu,
         "🔔 هشدارهای هوشمند": alerts_menu,
         "🔔 هشدارها": alerts_menu,
+        "📈 عملکرد استراتژی": performance_command,
+        "📡 وضعیت API بازار": live_status_command,
         "📨 پشتیبانی": support_prompt,
         "📨 ارتباط با پشتیبان": support_prompt,
         "ℹ️ راهنمای ربات": help_text,
@@ -6652,7 +6658,7 @@ async def post_init(app):
     app.create_task(smart_trading_worker(app))
     app.create_task(backup_worker())
     app.create_task(market_snapshot_worker())
-    log.info("MARKET AI v19.0 started | Nobitex OHLCV | strict signal confirmation | cache=%s", len(CACHE))
+    log.info("MARKET AI v20.0 started | Nobitex OHLCV | 1W regime enabled | strict signal confirmation | cache=%s", len(CACHE))
 
 async def post_shutdown(app):
     global HTTP_SESSION
@@ -6695,7 +6701,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, receipt_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
-    log.info("MARKET AI v19.0 polling started")
+    log.info("MARKET AI v20.0 polling started")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 if __name__ == "__main__":
