@@ -4,6 +4,13 @@ Crypto / Global Gold / Iran 18K Gold Telegram Analyzer
 Nobitex market-data build — v20.0 (weekly regime confirmation, expanded diagnostics,
                                            strategy performance access, USDT-first analysis)
 """
+from pro_analysis import (
+    detect_candlestick_patterns, detect_chart_patterns,
+    fibonacci_levels, pivot_points, pivot_point_multi,
+    cluster_support_resistance, volume_analysis,
+    correlation_with_btc, confluence_score,
+    position_sizing, risk_reward_targets,
+)
 
 import os
 import re
