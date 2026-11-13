@@ -66,29 +66,29 @@ MAX_WATCHLIST = max(1, int(os.getenv("MAX_WATCHLIST", "100")))
 
 GOLD_HISTORY_INTERVAL_SECONDS = max(60, int(os.getenv("GOLD_HISTORY_INTERVAL_SECONDS", "300")))
 GOLD_MIN_HISTORY_POINTS = max(50, int(os.getenv("GOLD_MIN_HISTORY_POINTS", "50")))
-SIGNAL_MIN_SCORE = max(70, min(100, int(os.getenv("SIGNAL_MIN_SCORE", "85"))))
-ALERT_OPPORTUNITY_MIN = max(85, min(100, int(os.getenv("ALERT_OPPORTUNITY_MIN", "85"))))
-ALERT_STRENGTH_MIN = max(72, min(100, int(os.getenv("ALERT_STRENGTH_MIN", "72"))))
-ALERT_PROBABILITY_MIN = max(70, min(100, int(os.getenv("ALERT_PROBABILITY_MIN", "70"))))
-ALERT_RSI_MIN = max(40, min(60, int(os.getenv("ALERT_RSI_MIN", "48"))))
-ALERT_RSI_MAX = max(65, min(78, int(os.getenv("ALERT_RSI_MAX", "70"))))
-ALERT_MIN_TURNOVER = max(0.01, float(os.getenv("ALERT_MIN_TURNOVER", "0.05")))
-SIGNAL_CONFIRMATIONS_REQUIRED = max(2, int(os.getenv("SIGNAL_CONFIRMATIONS_REQUIRED", "2")))
+SIGNAL_MIN_SCORE = max(60, min(100, int(os.getenv("SIGNAL_MIN_SCORE", "76"))))
+ALERT_OPPORTUNITY_MIN = max(60, min(95, int(os.getenv("ALERT_OPPORTUNITY_MIN", "76"))))
+ALERT_STRENGTH_MIN = max(50, min(95, int(os.getenv("ALERT_STRENGTH_MIN", "60"))))
+ALERT_PROBABILITY_MIN = max(50, min(95, int(os.getenv("ALERT_PROBABILITY_MIN", "60"))))
+ALERT_RSI_MIN = max(30, min(55, int(os.getenv("ALERT_RSI_MIN", "42"))))
+ALERT_RSI_MAX = max(60, min(82, int(os.getenv("ALERT_RSI_MAX", "74"))))
+ALERT_MIN_TURNOVER = max(0.01, min(0.30, float(os.getenv("ALERT_MIN_TURNOVER", "0.03"))))
+SIGNAL_CONFIRMATIONS_REQUIRED = max(1, min(3, int(os.getenv("SIGNAL_CONFIRMATIONS_REQUIRED", "2"))))
 # ─── PATCH v18.1: confirmation timeframe lowered from 4H to 1H.
 SIGNAL_CONFIRM_TIMEFRAME = os.getenv("SIGNAL_CONFIRM_TIMEFRAME", "1H").strip()
 # ─── PATCH v18.1: very strong signals confirmed immediately, no second-bucket wait.
 SIGNAL_FAST_TRACK_SCORE = max(75, min(100, int(os.getenv("SIGNAL_FAST_TRACK_SCORE", "82"))))
 
-ADX_MIN_TREND = max(15, min(30, int(os.getenv("ADX_MIN_TREND", "20"))))
-MIN_RR_RATIO = max(1.5, min(3.0, float(os.getenv("MIN_RR_RATIO", "1.8"))))
-MIN_TURNOVER_SIGNAL = max(0.02, min(0.30, float(os.getenv("MIN_TURNOVER_SIGNAL", "0.05"))))
+ADX_MIN_TREND = max(12, min(30, int(os.getenv("ADX_MIN_TREND", "18"))))
+MIN_RR_RATIO = max(1.3, min(3.0, float(os.getenv("MIN_RR_RATIO", "1.6"))))
+MIN_TURNOVER_SIGNAL = max(0.01, min(0.30, float(os.getenv("MIN_TURNOVER_SIGNAL", "0.03"))))
 MAX_DAILY_SIGNALS_PER_USER = max(1, min(10, int(os.getenv("MAX_DAILY_SIGNALS_PER_USER", "2"))))
 
 MARKET_SCAN_PAGES = max(1, min(10, int(os.getenv("MARKET_SCAN_PAGES", "2"))))
 MARKET_SCAN_PER_PAGE = max(50, min(250, int(os.getenv("MARKET_SCAN_PER_PAGE", "250"))))
 MARKET_SCAN_TOP = max(5, min(30, int(os.getenv("MARKET_SCAN_TOP", "10"))))
 MARKET_SCAN_SECONDS = max(300, int(os.getenv("MARKET_SCAN_SECONDS", "600")))
-MARKET_SCAN_DEEP = max(5, min(20, int(os.getenv("MARKET_SCAN_DEEP", "15"))))
+MARKET_SCAN_DEEP = max(5, min(25, int(os.getenv("MARKET_SCAN_DEEP", "20"))))
 MARKET_SCAN_CACHE = None
 SHORT_TERM_SCAN_CACHE = None
 NOBITEX_BASE_URL = os.getenv("NOBITEX_BASE_URL", "https://apiv2.nobitex.ir").rstrip("/")
@@ -1898,13 +1898,13 @@ def _tf_decision(symbol, df, timeframe):
         and structure["structure"] != "BEARISH"
         and e9 >= e21 * 0.995
         and reclaim_or_pullback
-        and 50 <= rsi <= 62
-        and roc5 > 0
-        and roc20 > -0.50
+        and 47 <= rsi <= 65
+        and roc5 > -0.10
+        and roc20 > -0.80
         and hist > prev_hist
         and dip >= dim
-        and adx >= 12
-        and vol_ratio >= 0.85
+        and adx >= 11
+        and vol_ratio >= 0.75
         and not fakeout_risk
         and not breakout_up
     )
@@ -1921,10 +1921,10 @@ def _tf_decision(symbol, df, timeframe):
         bull >= 55 and edge >= 15 and
         trend in ("BULLISH", "BULLISH_WEAK") and
         structure["structure"] in ("BULLISH", "TRANSITION") and
-        42 < rsi < 68 and
+        40 < rsi < 71 and
         adx >= ADX_MIN_TREND and
-        vol_ratio >= 1.00 and
-        ema21_distance_atr <= 1.50 and
+        vol_ratio >= 0.85 and
+        ema21_distance_atr <= 1.75 and
         not fakeout_risk and not late_move_risk
     )
     buy_ok = standard_buy_ok or (early_entry and bull >= 38 and edge >= 8)
@@ -2756,17 +2756,19 @@ async def professional_crypto_analysis(symbol):
     bearish_regime = ("BEARISH", "BEARISH_WEAK")
     bullish_regime = ("BULLISH", "BULLISH_WEAK")
     # ─── PATCH v18.1: accept BULLISH_WEAK trend and TRANSITION structure in vetoes.
+    # 4H remains the execution/regime anchor. A weak daily pullback is a caution,
+    # not an automatic veto; a clearly bearish daily structure still blocks entries.
     early_buy_veto = (
-        trend4 in bearish_regime or structure4 == "BEARISH"
-        or trend1d in bearish_regime or structure1d == "BEARISH"
-        or trend1w in bearish_regime
-        or bullish_trend_weight < 0.40
+        trend4 == "BEARISH" or structure4 == "BEARISH"
+        or trend1d == "BEARISH" or structure1d == "BEARISH"
+        or trend1w == "BEARISH"
+        or bullish_trend_weight < 0.35
     )
     mature_buy_veto = (
         trend4 not in bullish_regime
         or structure4 not in ("BULLISH", "TRANSITION")
-        or trend1d in bearish_regime or structure1d == "BEARISH"
-        or trend1w in bearish_regime or bullish_trend_weight < 0.50
+        or trend1d == "BEARISH" or structure1d == "BEARISH"
+        or trend1w == "BEARISH" or bullish_trend_weight < 0.45
     )
     buy_veto = mature_buy_veto and (early_buy_weight < 0.25 or early_buy_veto)
     # ─── PATCH v18.1: symmetric relaxation for SELL.
@@ -2781,12 +2783,20 @@ async def professional_crypto_analysis(symbol):
     early_tfs = [v for v in entry_tfs if v.get("early_entry")]
     late_tfs = [v for v in entry_tfs if v.get("late_move_risk")]
     # ─── PATCH v18.1: relaxed aggregate late-move threshold (was 1.25 / 68).
-    aggregate_late_risk = bool(late_tfs) or any(
-        _safe_float(v.get("ema21_distance_atr"), 99) > 1.75
-        or _safe_float(v.get("rsi"), 50) >= 72
-        for v in entry_tfs
+    # A single stretched timeframe should not cancel an otherwise clean setup.
+    # The execution timeframe (1H) or two simultaneous stretched frames are meaningful vetoes.
+    stretched_count = sum(
+        1 for v in entry_tfs
+        if (_safe_float(v.get("ema21_distance_atr"), 99) > 1.90
+            or _safe_float(v.get("rsi"), 50) >= 75
+            or bool(v.get("late_move_risk")))
     )
-    aggregate_early_entry = len(early_tfs) >= 2 and not aggregate_late_risk
+    one_hour_late = bool(tfs.get("1H") and (
+        _safe_float(tfs["1H"].get("ema21_distance_atr"), 99) > 2.10
+        or _safe_float(tfs["1H"].get("rsi"), 50) >= 77
+    ))
+    aggregate_late_risk = one_hour_late or stretched_count >= 2
+    aggregate_early_entry = len(early_tfs) >= 1 and not aggregate_late_risk
     aggregate_extension = max(
         (_safe_float(v.get("ema21_distance_atr"), 99) for v in entry_tfs),
         default=_safe_float(main.get("ema21_distance_atr"), 99),
@@ -2794,10 +2804,10 @@ async def professional_crypto_analysis(symbol):
 
     candidate = "WAIT"
     # ─── PATCH v18.1: lower gates for mature and early BUY (was 65/22/0.55 and 48/12/0.25/0.20).
-    mature_buy = bull >= 55 and edge >= 15 and buy_agreement >= 0.45 and not mature_buy_veto
+    mature_buy = bull >= 52 and edge >= 12 and buy_agreement >= 0.40 and not mature_buy_veto
     early_buy = (
-        bull >= 42 and edge >= 10
-        and early_buy_weight >= 0.20
+        bull >= 40 and edge >= 8
+        and early_buy_weight >= 0.15
         and buy_agreement >= 0.15
         and not early_buy_veto
     )
@@ -3032,6 +3042,11 @@ def confirm_signal(symbol, candidate, price, timeframe=None, signal_score=None):
 
     observation_key = _timeframe_bucket(timeframe)
     iso_now = now_iso()
+    fast_track = (
+        candidate in ("BUY", "SELL")
+        and _safe_float(signal_score) >= SIGNAL_FAST_TRACK_SCORE
+    )
+    required = 1 if fast_track else SIGNAL_CONFIRMATIONS_REQUIRED
 
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
@@ -3039,7 +3054,7 @@ def confirm_signal(symbol, candidate, price, timeframe=None, signal_score=None):
         if row and row["candidate"] == candidate:
             confirmations = int(row["confirmations"])
             if row["last_candidate_at"] != observation_key:
-                confirmations = min(SIGNAL_CONFIRMATIONS_REQUIRED, confirmations + 1)
+                confirmations = min(required, confirmations + 1)
         else:
             confirmations = 1
         c.execute("""
@@ -3052,7 +3067,7 @@ def confirm_signal(symbol, candidate, price, timeframe=None, signal_score=None):
                 last_price=excluded.last_price,
                 updated_at=excluded.updated_at
         """, (symbol, candidate, confirmations, observation_key, float(price), iso_now))
-    confirmed = confirmations >= SIGNAL_CONFIRMATIONS_REQUIRED
+    confirmed = confirmations >= required
     return (candidate if confirmed else "WAIT"), confirmed, confirmations
 
 def confirm_market_alert(symbol, candidate, price, observation_key):
@@ -3487,6 +3502,7 @@ async def _btc_market_status(rows):
             "candidate": cand, "adx": adx}
 
 def _alert_candidate_ok(item, btc_metrics):
+    """Balanced opportunity gate: preserve hard risk controls, relax redundant score gates."""
     m = item.get("m") or {}
     ta = m.get("ta") or {}
 
@@ -3499,21 +3515,57 @@ def _alert_candidate_ok(item, btc_metrics):
     ch1 = _safe_float(m.get("ch1"))
     ch24 = _safe_float(m.get("ch24"))
     ch7 = _safe_float(m.get("ch7"))
-    signal_candidate = str(ta.get("signal_candidate") or "WAIT")
+    candidate = str(ta.get("signal_candidate") or "WAIT")
     signal_score = _safe_float(ta.get("signal_score"))
     rr = _safe_float(ta.get("rr"))
     adx = _safe_float(ta.get("adx"), 0)
-
     rsi = _safe_float(ta.get("rsi"), 50)
     early_entry = bool(ta.get("early_entry"))
+    structure = str(ta.get("structure") or "UNKNOWN")
+    extension = _safe_float(ta.get("ema21_distance_atr"), 99)
+
+    # A signal must originate from the technical engine; this gate never invents BUYs.
+    if candidate != "BUY":
+        return False
+    if trend not in ("BULLISH", "BULLISH_WEAK", "NEUTRAL"):
+        return False
+    if structure == "BEARISH":
+        return False
+
+    # Reject genuinely dangerous/illiquid conditions, but do not label every rank>20
+    # as high risk when the market universe itself is already liquidity-ranked.
+    volatility = _safe_float(m.get("volatility"))
+    rank = int(m.get("rank") or 99999)
+    if volatility > 7.5 or rank > 25:
+        return False
+    if ch24 < -3.0 or ch7 < -8.0:
+        return False
+    if ch24 > 11.0 or ch7 > 28.0 or ch1 > 6.0:
+        return False
+    if extension > (1.75 if early_entry else 2.00):
+        return False
+    if rsi >= 77:
+        return False
+    if turnover < max(0.015, ALERT_MIN_TURNOVER):
+        return False
+    if adx < (11 if early_entry else max(14, ADX_MIN_TREND - 3)):
+        return False
+    if rr < max(1.35, MIN_RR_RATIO - 0.20):
+        return False
+    if signal_score < (45 if early_entry else 50):
+        return False
+
+    # Early-entry setups receive their own lower score band; mature setups remain stricter.
     if early_entry:
-        if score < min(ALERT_OPPORTUNITY_MIN, 76):
+        if score < max(66, ALERT_OPPORTUNITY_MIN - 8):
             return False
-        if strength < min(ALERT_STRENGTH_MIN, 58):
+        if strength < max(52, ALERT_STRENGTH_MIN - 8):
             return False
-        if probability < min(ALERT_PROBABILITY_MIN, 58):
+        if probability < max(52, ALERT_PROBABILITY_MIN - 8):
             return False
-        if not (43 <= rsi <= 63):
+        if not (40 <= rsi <= 68):
+            return False
+        if structure not in ("BULLISH", "TRANSITION", "NEUTRAL", "UNKNOWN"):
             return False
     else:
         if score < ALERT_OPPORTUNITY_MIN:
@@ -3524,39 +3576,33 @@ def _alert_candidate_ok(item, btc_metrics):
             return False
         if not (ALERT_RSI_MIN <= rsi <= ALERT_RSI_MAX):
             return False
-    if turnover < ALERT_MIN_TURNOVER:
-        return False
+        if trend not in ("BULLISH", "BULLISH_WEAK"):
+            return False
+        if structure not in ("BULLISH", "TRANSITION"):
+            return False
 
-    if signal_candidate != "BUY":
-        return False
-    # ─── PATCH v18.1: accept BULLISH_WEAK and TRANSITION structure.
-    if early_entry:
-        if trend not in ("BULLISH", "BULLISH_WEAK", "NEUTRAL"):
-            return False
-        if ta.get("structure") == "BEARISH":
-            return False
-        if _safe_float(ta.get("ema21_distance_atr"), 99) > 0.90:
-            return False
-    else:
-        if trend not in ("BULLISH", "BULLISH_WEAK") or ta.get("structure") not in ("BULLISH", "TRANSITION"):
-            return False
-    if risk == "زیاد":
-        return False
-    if ch24 < -1.5 or ch7 < -4.0:
-        return False
-    # ─── PATCH v18.1: relaxed anti-chase gates.
-    if (ch24 > 8.0 or ch7 > 22.0 or ch1 > 5.0
-            or ta.get("late_move_risk")
-            or _safe_float(ta.get("ema21_distance_atr"), 99) > 1.50
-            or rsi >= 72):
-        return False
-    if turnover < max(0.02, MIN_TURNOVER_SIGNAL):
-        return False
-    if adx < (12 if early_entry else ADX_MIN_TREND):
-        return False
-    if rr < MIN_RR_RATIO:
-        return False
+    # BTC is a risk regime filter, not an absolute market-wide kill switch.
+    # Unknown BTC data is neutral; clear BTC weakness raises the quality bar.
+    btc_headwind = bool(btc_metrics and not btc_metrics.get("ok"))
+    if btc_headwind:
+        btc_trend = str(btc_metrics.get("trend") or "")
+        btc_change_24 = _safe_float(btc_metrics.get("ch24"))
+        btc_change_7 = _safe_float(btc_metrics.get("ch7"))
+        severe_btc = (
+            btc_metrics.get("candidate") == "SELL"
+            or (btc_trend in ("BEARISH", "BEARISH_WEAK")
+                and (btc_change_24 <= -3.0 or btc_change_7 <= -6.0))
+        )
+        if severe_btc:
+            # Allow only exceptional relative-strength setups during a broad selloff.
+            if not (score >= 88 and strength >= 72 and signal_score >= 68
+                    and ch24 > 0 and ch7 > 0):
+                return False
+        else:
+            if score < ALERT_OPPORTUNITY_MIN + 4 or strength < ALERT_STRENGTH_MIN + 3:
+                return False
 
+    # Combined quality score avoids demanding that every independent metric be near-perfect.
     weighted = (
         score * 0.35
         + strength * 0.25
@@ -3564,12 +3610,7 @@ def _alert_candidate_ok(item, btc_metrics):
         + signal_score * 0.15
         + min(100, rr * 30) * 0.10
     )
-    # ─── PATCH v18.1: lower weighted gates.
-    if weighted < (58 if early_entry else 64):
-        return False
-    if signal_score < (48 if early_entry else 54):
-        return False
-    return True
+    return weighted >= (57 if early_entry else 61)
 
 async def _market_alert_scan():
     rows = await market_universe()
@@ -3610,7 +3651,8 @@ async def _market_alert_scan():
 
     rough.sort(key=lambda z: z[0], reverse=True)
     candidates = rough[:MARKET_SCAN_DEEP]
-    log.info("Nobitex alert scan quote=USDT markets=%s shortlist=%s", len(rows), len(candidates))
+    log.info("Nobitex alert scan quote=USDT markets=%s shortlist=%s deep_limit=%s",
+             len(rows), len(candidates), MARKET_SCAN_DEEP)
     result = []
 
     async def deep_alert_one(x):
@@ -4993,8 +5035,8 @@ SMART_SCAN_CONCURRENCY = max(1, min(6, int(os.getenv("SMART_SCAN_CONCURRENCY", "
 SMART_REENTRY_COOLDOWN_SECONDS = max(300, int(os.getenv("SMART_REENTRY_COOLDOWN_SECONDS", "1800")))
 SMART_TRAIL_ACTIVATE_PCT = max(0.30, float(os.getenv("SMART_TRAIL_ACTIVATE_PCT", "0.80")))
 SMART_TRAIL_GIVEBACK_PCT = max(0.15, float(os.getenv("SMART_TRAIL_GIVEBACK_PCT", "0.35")))
-SMART_MIN_SIGNAL_SCORE = max(60, min(100, int(os.getenv("SMART_MIN_SIGNAL_SCORE", "75"))))
-SMART_MIN_PROBABILITY = max(50, min(100, int(os.getenv("SMART_MIN_PROBABILITY", "65"))))
+SMART_MIN_SIGNAL_SCORE = max(55, min(100, int(os.getenv("SMART_MIN_SIGNAL_SCORE", "68"))))
+SMART_MIN_PROBABILITY = max(45, min(100, int(os.getenv("SMART_MIN_PROBABILITY", "58"))))
 
 def smart_trading_status(uid):
     with db() as c:
